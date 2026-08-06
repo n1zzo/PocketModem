@@ -111,6 +111,7 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
     modem_icon.set_pixel_size(32);
     let modem_status_label = gtk4::Label::new(Some("MODEM"));
     modem_status_label.add_css_class("status-text");
+    modem_status_label.add_css_class("modem-label");
     modem_status_box.append(&modem_icon);
     modem_status_box.append(&modem_label);
     modem_status_box.append(&modem_status_label);
@@ -294,9 +295,11 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
                 modem_label_clone.add_css_class("status-icon-red");
             }
             
-            let s_val = (state.smeter_bars as f64).max(1.0).min(9.0);
+            // Use RSSI directly scaled to 0-9 for S-meter (rssi 0-255 maps to S0-S9)
+            let smeter = ((state.rssi as f64) * 9.0 / 255.0).clamp(0.0, 9.0);
+            let s_val = smeter.max(1.0);  // At least S1 visible
             rssi_sbar_clone.set_value(s_val);
-            rssi_label_clone.set_markup(&format!("<span color='#44dd66'>S{}</span>", state.smeter_bars));
+            rssi_label_clone.set_markup(&format!("<span color='#44dd66'>S{}</span>", (smeter.round() as i32).max(1).min(9)));
         }
         glib::ControlFlow::Continue
     });
@@ -345,6 +348,9 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
             font-size: 14px;
             font-weight: bold;
             color: #FFB000;
+        }
+        .modem-label {
+            color: #666;
         }
         levelbar > trough {
             background: #2a2a2a;
