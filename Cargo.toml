@@ -1,0 +1,21 @@
+[package]
+name = "pocket-modem"
+version = "0.1.0"
+edition = "2021"
+authors = ["PocketModem Team"]
+license = "GPL-3.0-or-later"
+description = "GTK4 UI for PocketModem Radio - Native KV4P protocol"
+
+[dependencies]
+serialport = "4.6"
+glib = "0.18"
+gio = "0.19"
+gtk4 = "0.7"
+libadwaita = "0.5"
+
+[build-dependencies]
+cc = "1.0"
+
+[[bin]]
+name = "pocket-modem"
+path = "src/main.rs"

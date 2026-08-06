@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=PocketModem
+GenericName=RF Transceiver UI
+Comment=Turn your mobile Linux device into a powerful RF transceiver
+Exec=pocket-modem
+Icon=/usr/share/pixmaps/pocket-modem.png
+Terminal=false
+Type=Application
+Categories=Network;HamRadio;
+Keywords=radio;ham;kv4p;modem;fm;aprs;m17;transceiver;rf;pmos;phosh;
+StartupNotify=true
+
+# Phosh optimizations
+X-Phosh-ShowInWorkspaces=false
