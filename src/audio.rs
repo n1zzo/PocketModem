@@ -468,14 +468,9 @@ impl AudioManager {
     pub fn accumulate_and_start(&mut self, adpcm_data: &[u8]) {
         self.accumulate_rx_audio(adpcm_data);
         
-        // Start playback if we have enough buffered
-        // Use lower threshold: 2000 samples (~125ms at 16kHz input rate)
-        // This accounts for playback running at ~44100 Hz which drains faster
-        if !self.rx_enabled.load(Ordering::SeqCst) {
-            let buf_level = self.playback_buf.lock().unwrap().len();
-            if buf_level >= 2000 {
-                let _ = self.start_playback();
-            }
+        // Start playback if we have enough buffered (~125ms at 16kHz input)
+        if !self.rx_enabled.load(Ordering::SeqCst) && self.playback_buf.lock().unwrap().len() >= 2000 {
+            let _ = self.start_playback();
         }
     }
     
@@ -616,6 +611,14 @@ impl AudioManager {
     pub fn accumulate_rx_audio(&mut self, adpcm_data: &[u8]) {
         // Decode and buffer even before playback starts
         match self.decoder.decode_block(adpcm_data) {
+            Ok(mut pcm_samples) => {
+                // Apply de-emphasis if enabled
+                self.de_emphasis.lock().unwrap().process(&mut pcm_samples);
+                
+                // Store at native 16kHz (match Android app)
+                let mut buf = self.playback_buf.lock().unwrap();
+                buf.extend_from_slice(&pcm_samples);
+            }
             Ok(mut pcm_samples) => {
                 // Apply de-emphasis if enabled
                 self.de_emphasis.lock().unwrap().process(&mut pcm_samples);
