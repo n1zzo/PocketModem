@@ -632,6 +632,7 @@ fn create_ui(
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
     gesture.connect_pressed(move |_, _, _, _| {
+        eprintln!("[main] PTT pressed");
         // Start PTT
         if let Ok(mut r) = radio_ptt_press.lock() {
             let _ = r.ptt_on();
@@ -639,6 +640,8 @@ fn create_ui(
         // Start audio capture for TX
         if let Ok(mut a) = audio_ptt_press.lock() {
             let _ = a.start_capture();
+        } else {
+            eprintln!("[main] Failed to lock audio for capture");
         }
     });
     gesture.connect_released(move |_, _, _, _| {
@@ -747,10 +750,13 @@ fn create_ui(
             
             // Update audio status indicator
             if let Ok(a) = audio_clone.lock() {
-                if a.is_capturing() || a.is_playing() {
+                let capturing = a.is_capturing();
+                let playing = a.is_playing();
+                if capturing || playing {
                     audio_label_clone.set_text("●");
                     audio_label_clone.remove_css_class("status-icon-gray");
                     audio_label_clone.add_css_class("status-icon-green");
+                    eprintln!("[main] audio LED green: cap={}, play={}", capturing, playing);
                 } else {
                     audio_label_clone.set_text("○");
                     audio_label_clone.remove_css_class("status-icon-green");

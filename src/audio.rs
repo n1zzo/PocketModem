@@ -480,6 +480,7 @@ impl AudioManager {
         // Set enabled flag BEFORE spawning thread to avoid race
         self.tx_enabled.store(true, Ordering::SeqCst);
         *self.state.lock().unwrap() = AudioState::Capturing;
+        eprintln!("[audio] start_capture: state set, is_capturing={}", self.tx_enabled.load(Ordering::SeqCst));
         
         thread::spawn(move || {
             eprintln!("[audio] capture_loop thread started");
@@ -532,7 +533,11 @@ impl AudioManager {
     }
     
     pub fn start_playback(&mut self) -> Result<(), String> {
-        if self.rx_enabled.load(Ordering::SeqCst) { return Ok(()); }
+        if self.rx_enabled.load(Ordering::SeqCst) { 
+            eprintln!("[audio] start_playback: already enabled");
+            return Ok(()); 
+        }
+        eprintln!("[audio] start_playback: starting... buf={}", self.playback_buf.lock().unwrap().len());
         
         let config = self.config.clone();
         let _rx_callback = Arc::clone(&self.rx_callback);
@@ -601,6 +606,10 @@ impl AudioManager {
     /// 
     /// Matches Android app: decode at 16kHz native sample rate.
     pub fn accumulate_rx_audio(&mut self, adpcm_data: &[u8]) {
+        static RX_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if RX_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
+            eprintln!("[audio] RX: received {} bytes, buf={}", adpcm_data.len(), self.playback_buf.lock().unwrap().len());
+        }
         // Decode and buffer even before playback starts
         match self.decoder.decode_block(adpcm_data) {
             Ok(mut pcm_samples) => {
@@ -659,6 +668,7 @@ impl AudioManager {
         let host = cpal::default_host();
         let device = host.default_input_device()
             .ok_or("No input device available")?;
+        eprintln!("[audio] capture_loop: got device, enabled={}", enabled.load(Ordering::SeqCst));
         eprintln!("[audio] Using input: {}", device.name().unwrap_or_else(|_| "unknown".into()));
 
         let sample_rate = config.sample_rate;
