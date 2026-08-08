@@ -217,41 +217,31 @@ fn create_ui(
     // Squelch callback with debouncing
     let radio_squelch = Arc::clone(radio);
     let label_for_closure = squelch_value_label.clone();
-    let pending_handler: Arc<std::sync::Mutex<Option<glib::SourceId>>> = Arc::new(std::sync::Mutex::new(None));
     let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(4));
     
     squelch_scale.connect_value_changed(move |scale| {
         let level = scale.value().round() as u8;
         label_for_closure.set_text(&format!("{}", level));
         
-        // Cancel previous pending send
-        if let Ok(mut guard) = pending_handler.lock() {
-            if let Some(id) = guard.take() {
-                id.remove();
-            }
-        }
-        
-        // Debounce: schedule send after 300ms if different from last sent
+        // Immediately send to radio (no lock holding)
+        // Use spawn to avoid blocking GTK main loop
         if level != last_sent.load(std::sync::atomic::Ordering::SeqCst) {
             let radio_clone = radio_squelch.clone();
             let sent = Arc::clone(&last_sent);
-            let pending = Arc::clone(&pending_handler);
-            
-            let handler = glib::timeout_add_local(Duration::from_millis(300), move || {
-                let lvl = level;
-                sent.store(lvl, std::sync::atomic::Ordering::SeqCst);
-                if let Ok(mut r) = radio_clone.lock() {
-                    let _ = r.set_squelch(lvl);
+            std::thread::spawn(move || {
+                // Try to acquire lock with timeout
+                let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(mut r) = radio_clone.try_lock() {
+                        if let Err(e) = r.set_squelch(level) {
+                            eprintln!("[main] set_squelch error: {}", e);
+                        }
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                if let Ok(mut guard) = pending.lock() {
-                    *guard = None;
-                }
-                glib::ControlFlow::Break
+                sent.store(level, std::sync::atomic::Ordering::SeqCst);
             });
-            
-            if let Ok(mut guard) = pending_handler.lock() {
-                *guard = Some(handler);
-            }
         }
     });
     // Note: Debounce handles sending after 300ms, no need for separate button release
