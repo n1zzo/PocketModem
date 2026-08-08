@@ -469,12 +469,13 @@ impl AudioManager {
         let state = Arc::clone(&self.state);
         let dc_remover = Arc::clone(&self.dc_remover);
         let volume_ramp = Arc::clone(&self.volume_ramp);
+        let pre_emphasis = Arc::clone(&self.pre_emphasis);
         
         volume_ramp.lock().unwrap().start();
         
         thread::spawn(move || {
             if let Err(e) = Self::capture_loop(&config, tx_callback, tx_enabled.clone(), 
-                                                dc_remover, volume_ramp) {
+                                                dc_remover, volume_ramp, pre_emphasis) {
                 eprintln!("[audio] Capture error: {}", e);
             }
             tx_enabled.store(false, Ordering::SeqCst);
@@ -645,6 +646,7 @@ impl AudioManager {
         enabled: Arc<AtomicBool>,
         dc_remover: Arc<Mutex<DCOffsetRemover>>,
         volume_ramp: Arc<Mutex<VolumeRamp>>,
+        pre_emphasis: Arc<Mutex<PreEmphasis>>,
     ) -> Result<(), String> {
         let host = cpal::default_host();
         let device = host.default_input_device()
@@ -663,7 +665,7 @@ impl AudioManager {
         let callback_clone = Arc::clone(&callback);
         let dc_remover_clone = Arc::clone(&dc_remover);
         let volume_ramp_clone = Arc::clone(&volume_ramp);
-        let pre_emphasis_clone = Arc::clone(&pre_emphasis);
+        let pre_emph_clone = Arc::clone(&pre_emphasis);
         let enabled2 = Arc::clone(&enabled);
         
         // TX: accumulate samples to fill ADPCM blocks
@@ -685,7 +687,7 @@ impl AudioManager {
                         
                         dc_remover_clone.lock().unwrap().process(&mut samples);
                         volume_ramp_clone.lock().unwrap().process(&mut samples);
-                        pre_emphasis_clone.lock().unwrap().process(&mut samples);
+                        pre_emph_clone.lock().unwrap().process(&mut samples);
                         
                         let mut max_amp = 0.0f32;
                         for &s in &samples {
@@ -734,7 +736,7 @@ impl AudioManager {
                         drop(dc);
                         
                         volume_ramp_clone.lock().unwrap().process(&mut samples);
-                        pre_emphasis_clone.lock().unwrap().process(&mut samples);
+                        pre_emph_clone.lock().unwrap().process(&mut samples);
                         
                         let mut max_amp = 0.0f32;
                         for &s in &samples {

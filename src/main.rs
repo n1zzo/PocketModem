@@ -251,16 +251,15 @@ fn create_ui(
     let pre_emph_switch = gtk4::Switch::new();
     pre_emph_switch.set_valign(gtk4::Align::Center);
     let radio_pre_emph = Arc::clone(radio);
-    pre_emph_switch.connect_state_set(glib::clone!(@weak pre_emph_switch => move |sw| {
-        let enabled = sw.is_active();
+    pre_emph_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_pre_emph.clone();
         std::thread::spawn(move || {
             if let Ok(mut r) = radio_clone.lock() {
-                let _ = r.set_filter_pre_emphasis(enabled);
+                let _ = r.set_filter_pre_emphasis(state);
             }
         });
-        false
-    }));
+        glib::Propagation::Proceed
+    });
     pre_emph_row.append(&pre_emph_label);
     pre_emph_row.append(&pre_emph_switch);
     filters_section.append(&pre_emph_row);
@@ -274,16 +273,15 @@ fn create_ui(
     let de_emph_switch = gtk4::Switch::new();
     de_emph_switch.set_valign(gtk4::Align::Center);
     let radio_de_emph = Arc::clone(radio);
-    de_emph_switch.connect_state_set(glib::clone!(@weak de_emph_switch => move |sw| {
-        let enabled = sw.is_active();
+    de_emph_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_de_emph.clone();
         std::thread::spawn(move || {
             if let Ok(mut r) = radio_clone.lock() {
-                let _ = r.set_filter_de_emphasis(enabled);
+                let _ = r.set_filter_de_emphasis(state);
             }
         });
-        false
-    }));
+        glib::Propagation::Proceed
+    });
     de_emph_row.append(&de_emph_label);
     de_emph_row.append(&de_emph_switch);
     filters_section.append(&de_emph_row);
@@ -297,16 +295,15 @@ fn create_ui(
     let hp_switch = gtk4::Switch::new();
     hp_switch.set_valign(gtk4::Align::Center);
     let radio_hp = Arc::clone(radio);
-    hp_switch.connect_state_set(glib::clone!(@weak hp_switch => move |sw| {
-        let enabled = sw.is_active();
+    hp_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_hp.clone();
         std::thread::spawn(move || {
             if let Ok(mut r) = radio_clone.lock() {
-                let _ = r.set_filter_high_pass(enabled);
+                let _ = r.set_filter_high_pass(state);
             }
         });
-        false
-    }));
+        glib::Propagation::Proceed
+    });
     hp_row.append(&hp_label);
     hp_row.append(&hp_switch);
     filters_section.append(&hp_row);
@@ -320,16 +317,15 @@ fn create_ui(
     let lp_switch = gtk4::Switch::new();
     lp_switch.set_valign(gtk4::Align::Center);
     let radio_lp = Arc::clone(radio);
-    lp_switch.connect_state_set(glib::clone!(@weak lp_switch => move |sw| {
-        let enabled = sw.is_active();
+    lp_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_lp.clone();
         std::thread::spawn(move || {
             if let Ok(mut r) = radio_clone.lock() {
-                let _ = r.set_filter_low_pass(enabled);
+                let _ = r.set_filter_low_pass(state);
             }
         });
-        false
-    }));
+        glib::Propagation::Proceed
+    });
     lp_row.append(&lp_label);
     lp_row.append(&lp_switch);
     filters_section.append(&lp_row);
@@ -352,16 +348,15 @@ fn create_ui(
     tx_power_switch.set_active(true);
     tx_power_switch.set_valign(gtk4::Align::Center);
     let radio_tx_power = Arc::clone(radio);
-    tx_power_switch.connect_state_set(glib::clone!(@weak tx_power_switch => move |sw| {
-        let high_power = sw.is_active();
+    tx_power_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_tx_power.clone();
         std::thread::spawn(move || {
             if let Ok(mut r) = radio_clone.lock() {
-                let _ = r.set_tx_power(high_power);
+                let _ = r.set_tx_power(state);
             }
         });
-        false
-    }));
+        glib::Propagation::Proceed
+    });
     tx_power_row.append(&tx_power_label);
     tx_power_row.append(&tx_power_switch);
     tx_power_section.append(&tx_power_row);
@@ -374,15 +369,9 @@ fn create_ui(
     mic_title.set_halign(gtk4::Align::Start);
     mic_section.append(&mic_title);
     
-    let mic_dropdown = gtk4::DropDown::new(
-        Some(&[
-            glib::GString::from("None"),
-            glib::GString::from("Low"),
-            glib::GString::from("Med"),
-            glib::GString::from("High"),
-        ]),
-        None::<&fn(&glib::Object, u32) -> glib::Object>,
-    );
+    let mic_dropdown = gtk4::DropDown::from_strings(&[
+        "None", "Low", "Med", "High",
+    ]);
     let radio_mic = Arc::clone(radio);
     mic_dropdown.connect_selected_notify(glib::clone!(@weak mic_dropdown => move |dd| {
         let idx = dd.selected();
