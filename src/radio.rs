@@ -136,6 +136,11 @@ impl KV4PRadio {
 
         *self.serial.lock().unwrap() = Some(port);
         self.parser.lock().unwrap().reset();
+        
+        // Set read timeout to 100ms for non-blocking reads
+        if let Some(ref mut sp) = *self.serial.lock().unwrap() {
+            let _ = sp.set_timeout(Duration::from_millis(100));
+        }
 
         // Clear DTR and RTS (set to low) and wait for device to settle
         // The ESP32 needs DTR low to start sending boot data
@@ -181,10 +186,14 @@ impl KV4PRadio {
             thread::sleep(Duration::from_millis(500));
             if let Some(ref mut sp) = *self.serial.lock().unwrap() {
                 let mut buf = [0u8; 256];
-                while let Ok(n) = sp.read(&mut buf) {
-                    if n == 0 { break; }
-                    let packets = self.parser.lock().unwrap().feed(&buf[..n]);
-                    for pkt in &packets { self.dispatch(pkt); }
+                loop {
+                    match sp.read(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            let packets = self.parser.lock().unwrap().feed(&buf[..n]);
+                            for pkt in &packets { self.dispatch(pkt); }
+                        }
+                        _ => break,
+                    }
                 }
             }
         }
@@ -220,13 +229,17 @@ impl KV4PRadio {
                             thread::sleep(Duration::from_millis(200));
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock 
+                            || e.kind() == std::io::ErrorKind::TimedOut => {
                         if data.contains(&0xC0) && data.len() > 400 {
                             break;
                         }
                         thread::sleep(Duration::from_millis(100));
                     }
-                    Err(_) => { break; }
+                    Err(ref e) => { 
+                        eprintln!("[boot] Read error: {}", e);
+                        break; 
+                    }
                 }
             }
         }
@@ -234,11 +247,11 @@ impl KV4PRadio {
     }
 
     fn send_initial_state(&mut self) -> Result<(), String> {
-        // FIX: Added RX_AUDIO_OPEN flag to enable audio flow
-        // FIX: Added ENABLE_STATUS_REPORTS for consistent state updates
         let flags = (HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED |
                      HostStateFlags::RX_AUDIO_OPEN | HostStateFlags::ENABLE_STATUS_REPORTS).bits();
-        let state = HostDesiredState { flags, ..Default::default() };
+        // Use current squelch level, not default (0)
+        let squelch = self.current_squelch.load(Ordering::SeqCst);
+        let state = HostDesiredState { flags, squelch, ..Default::default() };
         self.send(state)
     }
 
@@ -297,7 +310,10 @@ impl KV4PRadio {
                     match sp.read(&mut buf) {
                         Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
                             // Normal - no data available
-                            thread::sleep(Duration::from_millis(50));
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => {
+                            eprintln!("[reader] Read error: {}", e);
                         }
                         Ok(n) if n == 0 => {
                             // Empty read, continue
@@ -305,7 +321,6 @@ impl KV4PRadio {
                         Ok(n) => {
                             let packets = parser.lock().unwrap().feed(&buf[..n]);
                             for pkt in &packets {
-
                                 let cmd = pkt.command;
                                 let payload = &pkt.payload;
                                 if cmd == DeviceCommand::Hello as u8 && payload.len() >= 9 {
@@ -605,7 +620,7 @@ impl KV4PRadio {
             freq_tx: freq,
             freq_rx: freq,
             ctcss_tx: 0,
-            squelch: 4,
+            squelch: self.current_squelch.load(Ordering::SeqCst),
             ctcss_rx: 0,
         };
         self.send(state)
@@ -670,4 +685,57 @@ impl KV4PRadio {
 
 impl Drop for KV4PRadio {
     fn drop(&mut self) { self.close(); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_squelch_set_and_read_back() {
+        let config = SerialConfig::default();
+        let mut radio = KV4PRadio::new(config);
+
+        // Verify initial squelch is 4 (from Default)
+        assert_eq!(radio.current_squelch.load(Ordering::SeqCst), 4);
+
+        // Set squelch to level 7
+        radio.set_squelch(7).unwrap();
+        assert_eq!(radio.current_squelch.load(Ordering::SeqCst), 7);
+
+        // Set squelch to level 2
+        radio.set_squelch(2).unwrap();
+        assert_eq!(radio.current_squelch.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_squelch_initial_state() {
+        // Test that initial state uses correct squelch level
+        let config = SerialConfig::default();
+        let mut radio = KV4PRadio::new(config);
+        
+        // current_squelch is initialized to 4
+        let squelch = radio.current_squelch.load(Ordering::SeqCst);
+        assert_eq!(squelch, 4);
+    }
+
+    #[test]
+    fn test_squelch_host_desired_state() {
+        // Verify HostDesiredState properly encodes squelch
+        let state = HostDesiredState::default();
+        assert_eq!(state.squelch, 0); // Default is 0
+
+        let bytes = state.to_bytes();
+        // squelch is at byte index 19 (after: seq[4], memory_id[4], flags[2], bandwidth[1], freq_tx[4], freq_rx[4], ctcss_tx[1])
+        assert_eq!(bytes.len(), 22);
+        assert_eq!(bytes[19], 0); // squelch byte
+
+        // Test with custom squelch
+        let custom_state = HostDesiredState {
+            squelch: 7,
+            ..Default::default()
+        };
+        let custom_bytes = custom_state.to_bytes();
+        assert_eq!(custom_bytes[19], 7);
+    }
 }

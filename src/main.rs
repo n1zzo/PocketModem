@@ -20,6 +20,13 @@ use libadwaita::prelude::*;
 use libadwaita as adw;
 
 fn main() {
+    // Check for test mode
+    if std::env::args().any(|a| a == "--test-squelch") {
+        let port = std::env::args().nth(2).unwrap_or_else(|| "/dev/ttyUSB0".to_string());
+        test_squelch(&port);
+        return;
+    }
+    
     // Parse command line args BEFORE GTK processes them
     let serial_device = std::env::args()
         .skip(1)  // Skip app name
@@ -953,4 +960,64 @@ fn create_ui(
     // Set main_box as content
     window.set_content(Some(&main_box));
     window.show();
+}
+
+/// Test squelch setting and readback (--test-squelch mode)
+fn test_squelch(port: &str) {
+    println!("=== Squelch Test on {} ===\n", port);
+
+    let mut radio = KV4PRadio::new(SerialConfig {
+        port: port.to_string(),
+        baudrate: 115200,
+        timeout_ms: 500,
+    });
+
+    // Connect
+    print!("Connecting... ");
+    match radio.open() {
+        Ok(Some(v)) => println!("OK (fw=v{}, rf={:?})", v.firmware_version, v.rf_module_type),
+        Ok(None) => { println!("NO RESPONSE"); return; }
+        Err(e) => { println!("FAILED: {}", e); return; }
+    }
+
+    // Wait for reader thread and state updates
+    println!("Waiting for device state updates...");
+    for i in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Some(state) = radio.device_state() {
+            println!("  Device state: squelch={}, rssi={}, flags={:#x}", 
+                     state.squelch, state.rssi, state.flags);
+            break;
+        }
+        if i == 19 { println!("  No device state received after 2s"); }
+    }
+
+    println!("\nSetting squelch levels:\n");
+    println!("  Set | Echo | Status");
+    println!("  ----|-------|--------");
+
+    for level in [0, 3, 6, 9] {
+        radio.set_squelch(level).unwrap();
+        
+        // Poll for device state response
+        let mut echoed: Option<u8> = None;
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Some(state) = radio.device_state() {
+                if state.squelch != 255 {
+                    echoed = Some(state.squelch);
+                    if echoed == Some(level) { break; }
+                }
+            }
+        }
+
+        match echoed {
+            Some(e) if e == level => println!("  {:3} | {:4} | OK", level, e),
+            Some(e) => println!("  {:3} | {:4} | MISMATCH (expected {})", level, e, level),
+            None => println!("  {:3} | -    | NO ECHO", level),
+        }
+    }
+
+    radio.close();
+    println!("\nDone.");
 }
