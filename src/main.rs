@@ -216,21 +216,47 @@ fn create_ui(
     squelch_value_label.set_halign(gtk4::Align::Start);
     squelch_value_label.add_css_class("squelch-value");
     
-    // Simple callback - just update label, send to radio in thread
+    // Squelch callback with debouncing
     let radio_squelch = Arc::clone(radio);
     let label_for_closure = squelch_value_label.clone();
+    let pending_handler: Arc<std::sync::Mutex<Option<glib::SourceId>>> = Arc::new(std::sync::Mutex::new(None));
+    let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(4));
+    
     squelch_scale.connect_value_changed(move |scale| {
         let level = scale.value().round() as u8;
         label_for_closure.set_text(&format!("{}", level));
         
-        // Send squelch to radio in background thread
-        let radio_clone = radio_squelch.clone();
-        std::thread::spawn(move || {
-            if let Ok(mut r) = radio_clone.lock() {
-                let _ = r.set_squelch(level);
+        // Cancel previous pending send
+        if let Ok(mut guard) = pending_handler.lock() {
+            if let Some(id) = guard.take() {
+                id.remove();
             }
-        });
+        }
+        
+        // Debounce: schedule send after 300ms if different from last sent
+        if level != last_sent.load(std::sync::atomic::Ordering::SeqCst) {
+            let radio_clone = radio_squelch.clone();
+            let sent = Arc::clone(&last_sent);
+            let pending = Arc::clone(&pending_handler);
+            
+            let handler = glib::timeout_add_local(Duration::from_millis(300), move || {
+                let lvl = level;
+                sent.store(lvl, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut r) = radio_clone.lock() {
+                    let _ = r.set_squelch(lvl);
+                }
+                if let Ok(mut guard) = pending.lock() {
+                    *guard = None;
+                }
+                glib::ControlFlow::Break
+            });
+            
+            if let Ok(mut guard) = pending_handler.lock() {
+                *guard = Some(handler);
+            }
+        }
     });
+    // Note: Debounce handles sending after 300ms, no need for separate button release
     
     squelch_row.append(&squelch_scale);
     squelch_row.append(&squelch_value_label);
@@ -704,9 +730,8 @@ fn create_ui(
             // dBm = raw * 1.2 - 160.8
             // S-val = 9 + (dBm - (-93)) / 6
             // Below S9: round to nearest whole S-unit
-            // Above S9: shows dB over S9
-            // Calculate dBm from raw RSSI (dBm = raw * 1.2 - 160.8)
-            let dbm = state.raw_rssi as f64 * 1.2 - 160.8;
+            // Calculate dBm from raw RSSI (matches DeviceState::rssi_dbm)
+            let dbm = -120.0 + (state.raw_rssi as f64 * 2.0);
             
             // Update dBm display
             let dbm_text = if state.connected { format!("{} dBm", dbm as i32) } else { "-- dBm".to_string() };
@@ -714,8 +739,7 @@ fn create_ui(
             
             // Update amber bar (dBm range: -120 to -60 = 0% to 100%)
             let frac = if state.connected {
-                let dbm_clamped = dbm.max(-120.0).min(-60.0);
-                (dbm_clamped + 120.0) / 60.0
+                ((dbm + 120.0) / 60.0).clamp(0.0, 1.0)
             } else {
                 0.0
             };
