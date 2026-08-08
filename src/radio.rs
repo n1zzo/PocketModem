@@ -5,7 +5,7 @@ use crate::kiss::{
     DeviceState, HostCommand, HostDesiredState, HostStateFlags, PacketParser, 
     RfModuleType, VersionInfo,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -63,6 +63,7 @@ pub struct KV4PRadio {
     frequency: Arc<AtomicU32>,
     tx_frequency: Arc<AtomicU32>,
     power_high: Arc<AtomicBool>,
+    current_squelch: Arc<AtomicU8>,  // Current squelch level (0-9)
     smeter_cb: Arc<Mutex<Option<SmeterCallback>>>,
     state_cb: Arc<Mutex<Option<StateCallback>>>,
     rssi_cb: Arc<Mutex<Option<RssiCallback>>>,
@@ -84,6 +85,7 @@ impl KV4PRadio {
             frequency: Arc::new(AtomicU32::new(145500)),
             tx_frequency: Arc::new(AtomicU32::new(145500)),
             power_high: Arc::new(AtomicBool::new(true)),
+            current_squelch: Arc::new(AtomicU8::new(4)),
             smeter_cb: Arc::new(Mutex::new(None)),
             state_cb: Arc::new(Mutex::new(None)),
             rssi_cb: Arc::new(Mutex::new(None)),
@@ -484,6 +486,7 @@ impl KV4PRadio {
     }
     
     pub fn set_squelch(&mut self, level: u8) -> Result<(), String> {
+        self.current_squelch.store(level, Ordering::SeqCst);
         eprintln!("[radio] set_squelch called with level={}", level);
         let khz = self.frequency.load(Ordering::SeqCst);
         let tx_khz = self.tx_frequency.load(Ordering::SeqCst);
