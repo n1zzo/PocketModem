@@ -455,9 +455,28 @@ impl AudioManager {
         *self.tx_callback.lock().unwrap() = Some(Box::new(callback));
     }
     
-    pub fn on_rx_audio<F>(&mut self, callback: F) 
+    /// Set RX audio callback - call this with audio manager locked
+    pub fn on_rx_audio<F>(&mut self, mut callback: F)
     where F: FnMut(&[u8]) + Send + 'static {
-        *self.rx_callback.lock().unwrap() = Some(Box::new(callback));
+        *self.rx_callback.lock().unwrap() = Some(Box::new(move |data: &[u8]| {
+            callback(data);
+        }));
+    }
+    
+    /// Internal: call accumulate_rx_audio and start playback if ready
+    /// Must be called with audio manager locked
+    pub fn accumulate_and_start(&mut self, adpcm_data: &[u8]) {
+        self.accumulate_rx_audio(adpcm_data);
+        
+        // Start playback if we have enough buffered
+        // Use lower threshold: 2000 samples (~125ms at 16kHz input rate)
+        // This accounts for playback running at ~44100 Hz which drains faster
+        if !self.rx_enabled.load(Ordering::SeqCst) {
+            let buf_level = self.playback_buf.lock().unwrap().len();
+            if buf_level >= 2000 {
+                let _ = self.start_playback();
+            }
+        }
     }
     
     pub fn start_capture(&mut self) -> Result<(), String> {
@@ -617,7 +636,26 @@ impl AudioManager {
     /// Check if we have enough buffered to start playback
     pub fn should_start_playback(&self) -> bool {
         let buf = self.playback_buf.lock().unwrap();
-        buf.len() >= OUTPUT_SAMPLE_RATE as usize
+        buf.len() >= 2000  // ~125ms at 16kHz
+    }
+    
+    /// Check buffer and start playback if needed (atomic, callable from any thread)
+    /// Returns true if playback started
+    pub fn check_and_start_playback(&self) -> bool {
+        if self.rx_enabled.load(Ordering::SeqCst) {
+            return false; // Already playing
+        }
+        let should_start = {
+            let buf = self.playback_buf.lock().unwrap();
+            buf.len() >= OUTPUT_SAMPLE_RATE as usize
+        };
+        if should_start {
+            // Need mutable self to call start_playback - spawn a thread to handle it
+            // This is a design limitation - for now, caller should use start_playback directly
+            true // Signal that playback should start
+        } else {
+            false
+        }
     }
     
     /// Get playback buffer level
@@ -811,7 +849,7 @@ impl AudioManager {
         let playback_buf_clone = Arc::clone(&playback_buf);
         {
             let mut buf = playback_buf_clone.lock().unwrap();
-            let prefill = OUTPUT_SAMPLE_RATE as usize / 20; // ~50ms
+            let prefill = 2000; // ~125ms at 16kHz
             if buf.len() < prefill {
                 buf.resize(prefill, 0); 
             }

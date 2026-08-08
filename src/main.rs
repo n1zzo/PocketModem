@@ -108,11 +108,9 @@ fn main() {
         let mut radio = radio.lock().unwrap();
         let audio = Arc::clone(&audio_manager);
         radio.on_rx_audio(move |adpcm_data| {
+            // Use accumulate_and_start which is atomic under the same lock
             if let Ok(mut a) = audio.lock() {
-                a.accumulate_rx_audio(adpcm_data);
-                if !a.is_playing() && a.should_start_playback() {
-                    let _ = a.start_playback();
-                }
+                a.accumulate_and_start(adpcm_data);
             }
         });
     }

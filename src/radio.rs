@@ -329,10 +329,6 @@ impl KV4PRadio {
                                     if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(payload[0] as i32); }
                                 } else if cmd == 0x0C {
                                     // Cmd 0x0C - Rx audio from device (ADPCM encoded - IMA WAV format)
-                                    static RX_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                                    if RX_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
-                                        eprintln!("[radio] RX AUDIO cmd=0x0C: {} bytes", payload.len());
-                                    }
                                     if !payload.is_empty() {
                                         if let Some(ref cb) = *rx_audio_cb.lock().unwrap() {
                                             cb(payload);
