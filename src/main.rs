@@ -117,6 +117,8 @@ fn main() {
         });
     }
     
+    eprintln!("[main] Radio lock released, starting app...");
+    
     let app = adw::Application::builder()
         .application_id("org.pocketmodem.gtk")
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)

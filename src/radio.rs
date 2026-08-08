@@ -454,6 +454,7 @@ impl KV4PRadio {
     }
 
     pub fn tune(&mut self, rx_khz: u32, tx_khz: u32, squelch: u8, bandwidth: u8) -> Result<(), String> {
+        eprintln!("[radio] tune called: rx={}, tx={}, squelch={}, bandwidth={}", rx_khz, tx_khz, squelch, bandwidth);
         self.frequency.store(rx_khz, Ordering::SeqCst);
         self.tx_frequency.store(tx_khz, Ordering::SeqCst);
         let freq_rx = rx_khz as f32 / 1000.0;
@@ -483,6 +484,7 @@ impl KV4PRadio {
     }
     
     pub fn set_squelch(&mut self, level: u8) -> Result<(), String> {
+        eprintln!("[radio] set_squelch called with level={}", level);
         let khz = self.frequency.load(Ordering::SeqCst);
         let tx_khz = self.tx_frequency.load(Ordering::SeqCst);
         self.tune(khz, tx_khz, level, 1)
