@@ -109,10 +109,7 @@ fn main() {
         let audio = Arc::clone(&audio_manager);
         radio.on_rx_audio(move |adpcm_data| {
             if let Ok(mut a) = audio.lock() {
-                // Accumulate a few frames before starting playback to avoid early underrun
                 a.accumulate_rx_audio(adpcm_data);
-                
-                // Start playback once we have enough buffered
                 if !a.is_playing() && a.should_start_playback() {
                     let _ = a.start_playback();
                 }

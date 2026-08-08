@@ -11,15 +11,25 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use oxideav_adpcm::ima_wav;
+
+// IMA ADPCM tables (same as oxideav-adpcm)
+const IMA_STEP_SIZE: [i32; 89] = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
+    73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
+    494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
+    2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
+    10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+];
+
+const IMA_INDEX_ADJUST: [i32; 16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
 
 // Audio parameters - KV4P uses IMA WAV ADPCM at 16kHz
 const AUDIO_WIRE_SAMPLE_RATE: u32 = 16000;
 const AUDIO_FRAME_SAMPLES: usize = 249; // 128-byte ADPCM block decodes to 249 samples
 const ADPCM_FRAME_BYTES: usize = 128; // ADPCM block size
 const CHANNELS: u16 = 1;
-const OUTPUT_SAMPLE_RATE: u32 = 8000; // Downsample to 8kHz for playback
-const OUTPUT_FRAME_SIZE: usize = 160; // 20ms at 8kHz
+const OUTPUT_SAMPLE_RATE: u32 = 16000; // Play at native 16kHz (match Android app)
+const OUTPUT_FRAME_SIZE: usize = 320; // 20ms at 16kHz
 
 /// Audio configuration
 #[derive(Debug, Clone)]
@@ -142,6 +152,96 @@ impl VolumeRamp {
     }
 }
 
+/// IMA WAV ADPCM decoder - matches the Android app implementation.
+/// 
+/// Each block is decoded independently using the block header's predictor/step_index.
+/// This is standard IMA WAV format behavior.
+pub struct ADPCMDecoder {
+    predictor: i32,
+    step_index: i32,
+}
+
+impl ADPCMDecoder {
+    pub fn new() -> Self {
+        Self { predictor: 0, step_index: 0 }
+    }
+
+    /// Decode an IMA WAV ADPCM block (128 bytes -> 249 samples).
+    /// 
+    /// Matches the Java implementation in Android app:
+    /// - Uses block header for initial predictor and step_index
+    /// - Low nibble decoded first, then high nibble
+    /// - Clamps predictor to i16 range
+    pub fn decode_block(&mut self, block: &[u8]) -> Result<Vec<i16>, String> {
+        if block.len() < 4 {
+            return Err("Block too short for IMA WAV header".to_string());
+        }
+
+        // Parse block header - little-endian (verified to match Java/Android)
+        let predictor_i16 = i16::from_le_bytes([block[0], block[1]]);
+        self.predictor = predictor_i16 as i32;
+        self.step_index = (block[2] as i32).clamp(0, 88);
+
+        let body = &block[4..];
+        let groups = body.len() / 4;
+        let samples = 1 + groups * 8;
+        let mut out = Vec::with_capacity(samples);
+
+        // First sample is the header predictor
+        out.push(self.predictor as i16);
+
+        // Decode nibbles (matches Java: low nibble first, then high)
+        for group in body.chunks(4) {
+            for &byte in group {
+                let n_lo = (byte & 0x0F) as u8;
+                let n_hi = ((byte >> 4) & 0x0F) as u8;
+                out.push(self.expand_nibble(n_lo));
+                out.push(self.expand_nibble(n_hi));
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Expand one IMA ADPCM nibble into a PCM sample.
+    /// Matches the Java decodeNibble() implementation.
+    fn expand_nibble(&mut self, code: u8) -> i16 {
+        let step = IMA_STEP_SIZE[self.step_index as usize];
+        
+        // delta calculation (matches Java)
+        let mut delta = step >> 3;
+        if (code & 4) != 0 { delta += step; }
+        if (code & 2) != 0 { delta += step >> 1; }
+        if (code & 1) != 0 { delta += step >> 2; }
+
+        // Apply sign
+        if (code & 8) != 0 {
+            self.predictor -= delta;
+        } else {
+            self.predictor += delta;
+        }
+
+        // Clamp to i16 range (matches Java clampInt16)
+        self.predictor = self.predictor.clamp(i16::MIN as i32, i16::MAX as i32);
+
+        // Update step index (matches Java clampIndex)
+        self.step_index += IMA_INDEX_ADJUST[code as usize];
+        self.step_index = self.step_index.clamp(0, 88);
+
+        self.predictor as i16
+    }
+
+    /// Reset decoder state
+    pub fn reset(&mut self) {
+        self.predictor = 0;
+        self.step_index = 0;
+    }
+}
+
+impl Default for ADPCMDecoder {
+    fn default() -> Self { Self::new() }
+}
+
 /// ADPCM frame state for encoding (maintains predictor across frames)
 pub struct ADPCMEncoder {
     predictor: i16,
@@ -170,6 +270,7 @@ impl Default for ADPCMEncoder {
 pub struct AudioManager {
     config: AudioConfig,
     encoder: ADPCMEncoder,
+    decoder: ADPCMDecoder,  // Stateful ADPCM decoder for smooth block transitions
     tx_callback: TxAudioCallback,
     rx_callback: RxAudioCallback,
     tx_enabled: Arc<AtomicBool>,
@@ -185,6 +286,7 @@ impl AudioManager {
         Self {
             config,
             encoder: ADPCMEncoder::new(),
+            decoder: ADPCMDecoder::new(),
             tx_callback: Arc::new(Mutex::new(None)),
             rx_callback: Arc::new(Mutex::new(None)),
             tx_enabled: Arc::new(AtomicBool::new(false)),
@@ -244,7 +346,7 @@ impl AudioManager {
         if self.rx_enabled.load(Ordering::SeqCst) { return Ok(()); }
         
         let config = self.config.clone();
-        let rx_callback = Arc::clone(&self.rx_callback);
+        let _rx_callback = Arc::clone(&self.rx_callback);
         let rx_enabled = Arc::clone(&self.rx_enabled);
         let rx_enabled_for_state = Arc::clone(&self.rx_enabled);
         let rx_enabled_for_monitor = Arc::clone(&self.rx_enabled);
@@ -295,17 +397,11 @@ impl AudioManager {
         if !self.rx_enabled.load(Ordering::SeqCst) { return Ok(()); }
         
         // Decode IMA WAV ADPCM (128 bytes -> 249 samples at 16kHz)
-        match ima_wav::decode_block(adpcm_data, 1) {
+        match self.decoder.decode_block(adpcm_data) {
             Ok(pcm_samples) => {
-                // Downsample from 16kHz to 8kHz (skip every other sample)
-                let downsampled: Vec<i16> = pcm_samples.iter()
-                    .enumerate()
-                    .filter(|(i, _)| i % 2 == 0)
-                    .map(|(_, &s)| s)
-                    .collect();
-                
+                // Store at native 16kHz (match Android app)
                 let mut buf = self.playback_buf.lock().unwrap();
-                buf.extend_from_slice(&downsampled);
+                buf.extend_from_slice(&pcm_samples);
             }
             Err(e) => eprintln!("[audio] ADPCM decode error: {}", e),
         }
@@ -313,25 +409,26 @@ impl AudioManager {
     }
     
     /// Accumulate ADPCM audio frames before starting playback
+    /// 
+    /// Matches Android app: decode at 16kHz native sample rate.
     pub fn accumulate_rx_audio(&mut self, adpcm_data: &[u8]) {
         // Decode and buffer even before playback starts
-        match ima_wav::decode_block(adpcm_data, 1) {
+        match self.decoder.decode_block(adpcm_data) {
             Ok(pcm_samples) => {
-                // Downsample from 16kHz to 8kHz
-                let downsampled: Vec<i16> = pcm_samples.iter()
-                    .enumerate()
-                    .filter(|(i, _)| i % 2 == 0)
-                    .map(|(_, &s)| s)
-                    .collect();
-                
+                // Store at native 16kHz (match Android app)
                 let mut buf = self.playback_buf.lock().unwrap();
-                buf.extend_from_slice(&downsampled);
+                buf.extend_from_slice(&pcm_samples);
             }
             Err(e) => eprintln!("[audio] ADPCM decode error: {}", e),
         }
     }
     
-    /// Check if we have enough buffered to start playback (1 second worth)
+    /// Reset the ADPCM decoder state (call when starting new RX session)
+    pub fn reset_decoder(&mut self) {
+        self.decoder.reset();
+    }
+    
+    /// Check if we have enough buffered to start playback
     pub fn should_start_playback(&self) -> bool {
         let buf = self.playback_buf.lock().unwrap();
         buf.len() >= OUTPUT_SAMPLE_RATE as usize
@@ -340,6 +437,23 @@ impl AudioManager {
     /// Get playback buffer level
     pub fn playback_level(&self) -> usize {
         self.playback_buf.lock().unwrap().len()
+    }
+    
+    /// Inject synthetic samples directly into playback buffer (for testing)
+    pub fn inject_samples(&mut self, samples: &[i16]) {
+        let mut buf = self.playback_buf.lock().unwrap();
+        buf.extend_from_slice(samples);
+    }
+    
+    /// Pre-fill buffer then start playback (avoids race condition)
+    pub fn prefill_and_start(&mut self, samples: &[i16]) -> Result<(), String> {
+        // First inject samples
+        {
+            let mut buf = self.playback_buf.lock().unwrap();
+            buf.extend_from_slice(samples);
+        }
+        // Then start playback
+        self.start_playback()
     }
     
     fn capture_loop(
@@ -483,12 +597,16 @@ impl AudioManager {
         
         let gain = config.rx_gain;
         
-        // Pre-fill with ~200ms buffer
+        // Pre-fill with smaller buffer (~50ms to avoid delay, but not silence)
+        // Only extend if buffer is smaller than needed - don't truncate!
         let playback_buf_clone = Arc::clone(&playback_buf);
         {
             let mut buf = playback_buf_clone.lock().unwrap();
-            buf.resize(OUTPUT_SAMPLE_RATE as usize / 5, 0); // ~200ms of silence
-            eprintln!("[audio] Pre-filled buffer with {} samples (~200ms)", buf.len());
+            let prefill = OUTPUT_SAMPLE_RATE as usize / 20; // ~50ms
+            if buf.len() < prefill {
+                buf.resize(prefill, 0); 
+            }
+            eprintln!("[audio] Buffer level: {} samples", buf.len());
         }
         
         let err_fn = |err| eprintln!("[audio] Stream error: {}", err);
@@ -508,7 +626,7 @@ impl AudioManager {
                         let mut buf = playback_buf_clone_i16.lock().unwrap();
                         let available = buf.len();
                         
-                        // Resample from 8kHz mono to native_rate stereo
+                        // Resample from 16kHz mono to native_rate stereo
                         let ratio = OUTPUT_SAMPLE_RATE as f64 / native_rate as f64;
                         let last_sample = if available > 0 { buf[available - 1] } else { 0i16 };
                         
@@ -557,7 +675,7 @@ impl AudioManager {
                         let mut buf = playback_buf_clone2.lock().unwrap();
                         let available = buf.len();
                         
-                        // Resample from 8kHz mono to native_rate stereo
+                        // Resample from 16kHz mono to native_rate stereo
                         let ratio = OUTPUT_SAMPLE_RATE as f64 / native_rate as f64;
                         let last_mono = if available > 0 { buf[available - 1] as f32 / 32768.0 } else { 0.0f32 };
                         
@@ -618,6 +736,24 @@ impl AudioManager {
     
     pub fn is_playing(&self) -> bool {
         self.rx_enabled.load(Ordering::SeqCst)
+    }
+    
+    /// Stop playback from external caller (fade out to avoid click)
+    pub fn stop_playback_external(&mut self) {
+        // Fade out last ~50ms to avoid click
+        let mut buf = self.playback_buf.lock().unwrap();
+        let fade_samples = (16000 * 50 / 1000) as usize; // 50ms at 16kHz
+        let len = buf.len();
+        if len >= fade_samples {
+            for i in 0..fade_samples {
+                let idx = len - fade_samples + i;
+                let t = i as f32 / fade_samples as f32;
+                buf[idx] = (buf[idx] as f32 * t) as i16;
+            }
+        }
+        drop(buf);
+        self.rx_enabled.store(false, Ordering::SeqCst);
+        eprintln!("[audio] Playback stopped externally");
     }
 }
 
