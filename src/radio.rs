@@ -334,6 +334,16 @@ impl KV4PRadio {
                                             cb(payload);
                                         }
                                     }
+                                } else if cmd == 0x09 {
+                                    // COMMAND_WINDOW_UPDATE - device reports window size, we must ack
+                                    if payload.len() >= 4 {
+                                        // Send ack back via write channel
+                                        let ack = build_kv4p_packet(HostCommand::WindowAck, payload);
+                                        let write_tx = _write_tx.lock().unwrap();
+                                        if let Some(ref tx) = *write_tx {
+                                            let _ = tx.send(ack);
+                                        }
+                                    }
                                 } else if cmd == 0x07 {
                                     // Cmd 0x07 - Rx audio from device (Opus encoded - legacy, unused in main firmware)
                                     eprintln!("[radio] RX AUDIO: Opus (cmd=0x07, {} bytes)", payload.len());

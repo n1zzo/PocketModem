@@ -17,6 +17,7 @@ pub const KV4P_PROTO_VERSION: u8 = 0x01;
 pub enum HostCommand {
     TxAudio = 0x0C,
     DesiredState = 0x0D,
+    WindowAck = 0x09,  // Ack for flow control window
 }
 
 /// KV4P responses from device to host
