@@ -507,6 +507,45 @@ impl KV4PRadio {
         };
         self.send(state)
     }
+    
+    pub fn set_tx_power(&mut self, high: bool) -> Result<(), String> {
+        self.set_power(high)
+    }
+    
+    /// Set pre-emphasis filter (TX) - 6dB/octave high-frequency boost
+    pub fn set_filter_pre_emphasis(&mut self, enabled: bool) -> Result<(), String> {
+        // TODO: Send to device - this is a device-level setting
+        eprintln!("[radio] Pre-emphasis: {}", if enabled { "on" } else { "off" });
+        Ok(())
+    }
+    
+    /// Set de-emphasis filter (RX) - 6dB/octave low-frequency boost
+    pub fn set_filter_de_emphasis(&mut self, enabled: bool) -> Result<(), String> {
+        // TODO: Send to device - this is a device-level setting
+        eprintln!("[radio] De-emphasis: {}", if enabled { "on" } else { "off" });
+        Ok(())
+    }
+    
+    /// Set high-pass filter (removes low frequencies)
+    pub fn set_filter_high_pass(&mut self, enabled: bool) -> Result<(), String> {
+        // TODO: Send to device
+        eprintln!("[radio] High-pass filter: {}", if enabled { "on" } else { "off" });
+        Ok(())
+    }
+    
+    /// Set low-pass filter (removes high frequencies)
+    pub fn set_filter_low_pass(&mut self, enabled: bool) -> Result<(), String> {
+        // TODO: Send to device
+        eprintln!("[radio] Low-pass filter: {}", if enabled { "on" } else { "off" });
+        Ok(())
+    }
+    
+    /// Set mic gain boost level
+    pub fn set_mic_gain(&mut self, level: &str) -> Result<(), String> {
+        // TODO: Send to device
+        eprintln!("[radio] Mic gain: {}", level);
+        Ok(())
+    }
 
     pub fn enable_smeter(&mut self, enabled: bool) -> Result<(), String> {
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;

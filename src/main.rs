@@ -235,6 +235,173 @@ fn create_ui(
     squelch_section.append(&squelch_row);
     settings_view.append(&squelch_section);
     
+    // Audio Filters section
+    let filters_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let filters_title = gtk4::Label::new(Some("<b>Audio Filters</b>"));
+    filters_title.set_markup("<b>Audio Filters</b>");
+    filters_title.set_halign(gtk4::Align::Start);
+    filters_section.append(&filters_title);
+    
+    // Pre-emphasis
+    let pre_emph_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    pre_emph_row.set_hexpand(true);
+    let pre_emph_label = gtk4::Label::new(Some("Pre-emphasis (TX)"));
+    pre_emph_label.set_hexpand(true);
+    pre_emph_label.set_halign(gtk4::Align::Start);
+    let pre_emph_switch = gtk4::Switch::new();
+    pre_emph_switch.set_valign(gtk4::Align::Center);
+    let radio_pre_emph = Arc::clone(radio);
+    pre_emph_switch.connect_state_set(glib::clone!(@weak pre_emph_switch => move |sw| {
+        let enabled = sw.is_active();
+        let radio_clone = radio_pre_emph.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut r) = radio_clone.lock() {
+                let _ = r.set_filter_pre_emphasis(enabled);
+            }
+        });
+        false
+    }));
+    pre_emph_row.append(&pre_emph_label);
+    pre_emph_row.append(&pre_emph_switch);
+    filters_section.append(&pre_emph_row);
+    
+    // De-emphasis
+    let de_emph_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    de_emph_row.set_hexpand(true);
+    let de_emph_label = gtk4::Label::new(Some("De-emphasis (RX)"));
+    de_emph_label.set_hexpand(true);
+    de_emph_label.set_halign(gtk4::Align::Start);
+    let de_emph_switch = gtk4::Switch::new();
+    de_emph_switch.set_valign(gtk4::Align::Center);
+    let radio_de_emph = Arc::clone(radio);
+    de_emph_switch.connect_state_set(glib::clone!(@weak de_emph_switch => move |sw| {
+        let enabled = sw.is_active();
+        let radio_clone = radio_de_emph.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut r) = radio_clone.lock() {
+                let _ = r.set_filter_de_emphasis(enabled);
+            }
+        });
+        false
+    }));
+    de_emph_row.append(&de_emph_label);
+    de_emph_row.append(&de_emph_switch);
+    filters_section.append(&de_emph_row);
+    
+    // High-pass filter
+    let hp_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    hp_row.set_hexpand(true);
+    let hp_label = gtk4::Label::new(Some("High-pass filter"));
+    hp_label.set_hexpand(true);
+    hp_label.set_halign(gtk4::Align::Start);
+    let hp_switch = gtk4::Switch::new();
+    hp_switch.set_valign(gtk4::Align::Center);
+    let radio_hp = Arc::clone(radio);
+    hp_switch.connect_state_set(glib::clone!(@weak hp_switch => move |sw| {
+        let enabled = sw.is_active();
+        let radio_clone = radio_hp.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut r) = radio_clone.lock() {
+                let _ = r.set_filter_high_pass(enabled);
+            }
+        });
+        false
+    }));
+    hp_row.append(&hp_label);
+    hp_row.append(&hp_switch);
+    filters_section.append(&hp_row);
+    
+    // Low-pass filter
+    let lp_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    lp_row.set_hexpand(true);
+    let lp_label = gtk4::Label::new(Some("Low-pass filter"));
+    lp_label.set_hexpand(true);
+    lp_label.set_halign(gtk4::Align::Start);
+    let lp_switch = gtk4::Switch::new();
+    lp_switch.set_valign(gtk4::Align::Center);
+    let radio_lp = Arc::clone(radio);
+    lp_switch.connect_state_set(glib::clone!(@weak lp_switch => move |sw| {
+        let enabled = sw.is_active();
+        let radio_clone = radio_lp.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut r) = radio_clone.lock() {
+                let _ = r.set_filter_low_pass(enabled);
+            }
+        });
+        false
+    }));
+    lp_row.append(&lp_label);
+    lp_row.append(&lp_switch);
+    filters_section.append(&lp_row);
+    
+    settings_view.append(&filters_section);
+    
+    // TX Power section
+    let tx_power_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let tx_power_title = gtk4::Label::new(Some("<b>TX Power</b>"));
+    tx_power_title.set_markup("<b>TX Power</b>");
+    tx_power_title.set_halign(gtk4::Align::Start);
+    tx_power_section.append(&tx_power_title);
+    
+    let tx_power_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    tx_power_row.set_hexpand(true);
+    let tx_power_label = gtk4::Label::new(Some("High power"));
+    tx_power_label.set_hexpand(true);
+    tx_power_label.set_halign(gtk4::Align::Start);
+    let tx_power_switch = gtk4::Switch::new();
+    tx_power_switch.set_active(true);
+    tx_power_switch.set_valign(gtk4::Align::Center);
+    let radio_tx_power = Arc::clone(radio);
+    tx_power_switch.connect_state_set(glib::clone!(@weak tx_power_switch => move |sw| {
+        let high_power = sw.is_active();
+        let radio_clone = radio_tx_power.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut r) = radio_clone.lock() {
+                let _ = r.set_tx_power(high_power);
+            }
+        });
+        false
+    }));
+    tx_power_row.append(&tx_power_label);
+    tx_power_row.append(&tx_power_switch);
+    tx_power_section.append(&tx_power_row);
+    settings_view.append(&tx_power_section);
+    
+    // Mic Gain section
+    let mic_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let mic_title = gtk4::Label::new(Some("<b>Mic Gain Boost</b>"));
+    mic_title.set_markup("<b>Mic Gain Boost</b>");
+    mic_title.set_halign(gtk4::Align::Start);
+    mic_section.append(&mic_title);
+    
+    let mic_dropdown = gtk4::DropDown::new(
+        Some(&[
+            glib::GString::from("None"),
+            glib::GString::from("Low"),
+            glib::GString::from("Med"),
+            glib::GString::from("High"),
+        ]),
+        None::<&fn(&glib::Object, u32) -> glib::Object>,
+    );
+    let radio_mic = Arc::clone(radio);
+    mic_dropdown.connect_selected_notify(glib::clone!(@weak mic_dropdown => move |dd| {
+        let idx = dd.selected();
+        let level = match idx {
+            0 => "None",
+            1 => "Low", 
+            2 => "Med",
+            _ => "High",
+        };
+        let radio_clone = radio_mic.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut r) = radio_clone.lock() {
+                let _ = r.set_mic_gain(level);
+            }
+        });
+    }));
+    mic_section.append(&mic_dropdown);
+    settings_view.append(&mic_section);
+    
     // Add back button
     let back_btn = gtk4::Button::with_label("Back");
     back_btn.set_margin_top(24);

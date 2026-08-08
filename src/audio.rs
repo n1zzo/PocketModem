@@ -100,6 +100,60 @@ impl DCOffsetRemover {
     }
 }
 
+/// Pre-emphasis filter (high-frequency boost for TX)
+pub struct PreEmphasis {
+    alpha: f32,
+    prev: f32,
+}
+
+impl PreEmphasis {
+    pub fn new(alpha: f32) -> Self {
+        Self { alpha, prev: 0.0 }
+    }
+    
+    pub fn process(&mut self, samples: &mut [i16]) {
+        // y[n] = x[n] - α * x[n-1]
+        // This provides a high-shelf boost
+        for s in samples.iter_mut() {
+            let x = *s as f32;
+            let out = x - self.alpha * self.prev;
+            self.prev = x;
+            *s = out.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+    
+    pub fn reset(&mut self) {
+        self.prev = 0.0;
+    }
+}
+
+/// De-emphasis filter (high-frequency cut for RX)
+pub struct DeEmphasis {
+    alpha: f32,
+    prev: f32,
+}
+
+impl DeEmphasis {
+    pub fn new(alpha: f32) -> Self {
+        Self { alpha, prev: 0.0 }
+    }
+    
+    pub fn process(&mut self, samples: &mut [i16]) {
+        // y[n] = x[n] + α * y[n-1]
+        // This provides a high-shelf cut (low-pass characteristic)
+        for s in samples.iter_mut() {
+            let x = *s as f32;
+            let out = x + self.alpha * self.prev;
+            self.prev = out;
+            *s = out.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+    
+    pub fn reset(&mut self) {
+        self.prev = 0.0;
+    }
+}
+
 /// Volume ramp for smooth attack/release
 pub struct VolumeRamp {
     alpha: f32,
@@ -244,21 +298,113 @@ impl Default for ADPCMDecoder {
 
 /// ADPCM frame state for encoding (maintains predictor across frames)
 pub struct ADPCMEncoder {
-    predictor: i16,
-    step_index: u8,
+    predictor: i32,
+    step_index: i32,
 }
 
 impl ADPCMEncoder {
     pub fn new() -> Self {
         Self { predictor: 0, step_index: 0 }
     }
+    
+    /// Reset encoder state
+    pub fn reset(&mut self) {
+        self.predictor = 0;
+        self.step_index = 0;
+    }
 
-    /// Encode PCM samples to IMA WAV ADPCM block (128 bytes for 249 samples)
-    /// Note: This is a simplified encoder - the KV4P firmware uses the full encoder
-    pub fn encode(&mut self, _samples: &[i16]) -> Vec<u8> {
-        // For now, return empty - TX encoding would need a proper IMA encoder
-        // The firmware does the encoding, we just need to handle RX decoding
-        vec![0u8; ADPCM_FRAME_BYTES]
+    /// Encode PCM samples to IMA WAV ADPCM block.
+    /// 
+    /// Matches the Java/Android implementation:
+    /// - Little-endian predictor bytes
+    /// - Low nibble first, then high nibble
+    /// - 249 samples from 128 bytes
+    pub fn encode(&mut self, samples: &[i16]) -> Vec<u8> {
+        // 128 bytes per block: 4 byte header + 124 bytes data = 249 samples
+        let mut out = vec![0u8; ADPCM_FRAME_BYTES];
+        
+        if samples.is_empty() {
+            return out;
+        }
+        
+        // Initialize state with first sample
+        self.predictor = samples[0] as i32;
+        
+        // Write header: predictor (2 bytes, little-endian), step_index (1 byte), reserved (1 byte = 0)
+        out[0] = (self.predictor & 0xFF) as u8;
+        out[1] = ((self.predictor >> 8) & 0xFF) as u8;
+        out[2] = self.step_index as u8;
+        out[3] = 0;
+        
+        // Encode remaining samples (249 - 1 = 248 samples = 124 bytes)
+        let mut out_idx = 4;
+        let mut high_nibble = false;
+        let mut packed = 0u8;
+        
+        for &sample in &samples[1..] {
+            let code = self.encode_nibble(sample as i32);
+            
+            if !high_nibble {
+                packed = code & 0x0F;
+                high_nibble = true;
+            } else {
+                out[out_idx] = packed | (code << 4);
+                out_idx += 1;
+                high_nibble = false;
+            }
+        }
+        
+        // Pad last nibble if odd number of samples
+        if high_nibble {
+            out[out_idx] = packed;
+        }
+        
+        out
+    }
+    
+    /// Encode a single sample and return the 4-bit code
+    fn encode_nibble(&mut self, sample: i32) -> u8 {
+        let diff = sample - self.predictor;
+        let mut code = 0u8;
+        let mut abs_diff = diff.abs();
+        
+        if diff < 0 {
+            code = 8; // negative sign
+        }
+        
+        let step = IMA_STEP_SIZE[self.step_index as usize];
+        let mut delta = step >> 3;
+        
+        if abs_diff >= step {
+            code |= 4;
+            abs_diff -= step;
+            delta += step;
+        }
+        if abs_diff >= step >> 1 {
+            code |= 2;
+            abs_diff -= step >> 1;
+            delta += step >> 1;
+        }
+        if abs_diff >= step >> 2 {
+            code |= 1;
+            delta += step >> 2;
+        }
+        
+        // Update predictor
+        if (code & 8) != 0 {
+            self.predictor -= delta;
+        } else {
+            self.predictor += delta;
+        }
+        
+        // Clamp predictor
+        self.predictor = self.predictor.clamp(i16::MIN as i32, i16::MAX as i32);
+        
+        // Update step index
+        self.step_index += IMA_INDEX_ADJUST[code as usize];
+        self.step_index = self.step_index.clamp(0, 88);
+        
+        code
     }
 }
 
@@ -278,11 +424,15 @@ pub struct AudioManager {
     state: Arc<Mutex<AudioState>>,
     dc_remover: Arc<Mutex<DCOffsetRemover>>,
     volume_ramp: Arc<Mutex<VolumeRamp>>,
+    pre_emphasis: Arc<Mutex<PreEmphasis>>,
+    de_emphasis: Arc<Mutex<DeEmphasis>>,
     playback_buf: Arc<Mutex<Vec<i16>>>,
 }
 
 impl AudioManager {
     pub fn new(config: AudioConfig) -> Self {
+        let pre_emph = PreEmphasis::new(config.pre_emphasis_alpha);
+        let de_emph = DeEmphasis::new(0.85); // Standard de-emphasis coefficient
         Self {
             config,
             encoder: ADPCMEncoder::new(),
@@ -294,6 +444,8 @@ impl AudioManager {
             state: Arc::new(Mutex::new(AudioState::Idle)),
             dc_remover: Arc::new(Mutex::new(DCOffsetRemover::new(0.25, AUDIO_WIRE_SAMPLE_RATE as f32))),
             volume_ramp: Arc::new(Mutex::new(VolumeRamp::new(0.05, 0.7))),
+            pre_emphasis: Arc::new(Mutex::new(pre_emph)),
+            de_emphasis: Arc::new(Mutex::new(de_emph)),
             playback_buf: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -338,8 +490,36 @@ impl AudioManager {
         self.tx_enabled.store(false, Ordering::SeqCst);
         self.volume_ramp.lock().unwrap().stop();
         self.dc_remover.lock().unwrap().reset();
+        self.pre_emphasis.lock().unwrap().reset();
         let mut s = self.state.lock().unwrap();
         if *s == AudioState::Capturing { *s = AudioState::Idle; }
+    }
+    
+    /// Enable or disable pre-emphasis filter (TX)
+    pub fn set_pre_emphasis(&mut self, enabled: bool, alpha: f32) {
+        if enabled {
+            *self.pre_emphasis.lock().unwrap() = PreEmphasis::new(alpha);
+            eprintln!("[audio] Pre-emphasis enabled, alpha={}", alpha);
+        } else {
+            *self.pre_emphasis.lock().unwrap() = PreEmphasis::new(0.0);
+            eprintln!("[audio] Pre-emphasis disabled");
+        }
+    }
+    
+    /// Enable or disable de-emphasis filter (RX)
+    pub fn set_de_emphasis(&mut self, enabled: bool) {
+        if enabled {
+            *self.de_emphasis.lock().unwrap() = DeEmphasis::new(0.85);
+            eprintln!("[audio] De-emphasis enabled");
+        } else {
+            *self.de_emphasis.lock().unwrap() = DeEmphasis::new(0.0);
+            eprintln!("[audio] De-emphasis disabled");
+        }
+    }
+    
+    /// Reset de-emphasis filter state
+    pub fn reset_de_emphasis(&mut self) {
+        self.de_emphasis.lock().unwrap().reset();
     }
     
     pub fn start_playback(&mut self) -> Result<(), String> {
@@ -414,7 +594,10 @@ impl AudioManager {
     pub fn accumulate_rx_audio(&mut self, adpcm_data: &[u8]) {
         // Decode and buffer even before playback starts
         match self.decoder.decode_block(adpcm_data) {
-            Ok(pcm_samples) => {
+            Ok(mut pcm_samples) => {
+                // Apply de-emphasis if enabled
+                self.de_emphasis.lock().unwrap().process(&mut pcm_samples);
+                
                 // Store at native 16kHz (match Android app)
                 let mut buf = self.playback_buf.lock().unwrap();
                 buf.extend_from_slice(&pcm_samples);
@@ -480,7 +663,14 @@ impl AudioManager {
         let callback_clone = Arc::clone(&callback);
         let dc_remover_clone = Arc::clone(&dc_remover);
         let volume_ramp_clone = Arc::clone(&volume_ramp);
+        let pre_emphasis_clone = Arc::clone(&pre_emphasis);
         let enabled2 = Arc::clone(&enabled);
+        
+        // TX: accumulate samples to fill ADPCM blocks
+        let tx_buf: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::with_capacity(250)));
+        let tx_buf_clone = Arc::clone(&tx_buf);
+        let encoder: Arc<std::sync::Mutex<ADPCMEncoder>> = Arc::new(std::sync::Mutex::new(ADPCMEncoder::new()));
+        let encoder_clone = Arc::clone(&encoder);
         
         let stream = match supported.sample_format() {
             cpal::SampleFormat::I16 => {
@@ -495,6 +685,7 @@ impl AudioManager {
                         
                         dc_remover_clone.lock().unwrap().process(&mut samples);
                         volume_ramp_clone.lock().unwrap().process(&mut samples);
+                        pre_emphasis_clone.lock().unwrap().process(&mut samples);
                         
                         let mut max_amp = 0.0f32;
                         for &s in &samples {
@@ -503,14 +694,21 @@ impl AudioManager {
                         }
                         
                         if max_amp > gate_threshold {
-                            // TODO: Encode to ADPCM for TX
-                            // For now, just send raw samples
-                            let bytes = unsafe {
-                                std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2)
-                            };
-                            if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
-                                cb(bytes);
+                            // Accumulate samples for ADPCM encoding
+                            let mut tx = tx_buf_clone.lock().unwrap();
+                            tx.extend_from_slice(&samples);
+                            
+                            // Encode full blocks (249 samples each)
+                            while tx.len() >= 249 {
+                                let block = tx.drain(..249).collect::<Vec<_>>();
+                                let adpcm = encoder_clone.lock().unwrap().encode(&block);
+                                if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
+                                    cb(&adpcm);
+                                }
                             }
+                        } else if tx_buf_clone.lock().unwrap().is_empty() {
+                            // Silence - reset encoder state
+                            encoder_clone.lock().unwrap().reset();
                         }
                     },
                     err_fn,
@@ -536,6 +734,7 @@ impl AudioManager {
                         drop(dc);
                         
                         volume_ramp_clone.lock().unwrap().process(&mut samples);
+                        pre_emphasis_clone.lock().unwrap().process(&mut samples);
                         
                         let mut max_amp = 0.0f32;
                         for &s in &samples {
@@ -544,13 +743,21 @@ impl AudioManager {
                         }
                         
                         if max_amp > gate_threshold {
-                            // TODO: Encode to ADPCM for TX
-                            let bytes = unsafe {
-                                std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2)
-                            };
-                            if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
-                                cb(bytes);
+                            // Accumulate samples for ADPCM encoding
+                            let mut tx = tx_buf_clone.lock().unwrap();
+                            tx.extend_from_slice(&samples);
+                            
+                            // Encode full blocks (249 samples each)
+                            while tx.len() >= 249 {
+                                let block = tx.drain(..249).collect::<Vec<_>>();
+                                let adpcm = encoder_clone.lock().unwrap().encode(&block);
+                                if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
+                                    cb(&adpcm);
+                                }
                             }
+                        } else if tx_buf_clone.lock().unwrap().is_empty() {
+                            // Silence - reset encoder state
+                            encoder_clone.lock().unwrap().reset();
                         }
                     },
                     err_fn,
