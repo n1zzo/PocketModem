@@ -2,12 +2,18 @@
 //!
 //! Uses only libadwaita bindings for a modern GNOME-style interface
 
+mod audio;
+mod gps;
 mod kiss;
 mod radio;
+
+use audio::{AudioConfig, AudioManager};
+use gps::GpsManager;
 
 use radio::{KV4PRadio, SerialConfig};
 
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use libadwaita::prelude::*;
@@ -65,6 +71,65 @@ fn main() {
     };
     
     let radio_clone = Arc::clone(&radio);
+
+    // Create GPS manager
+    let gps_manager = Arc::new(Mutex::new(GpsManager::new()));
+    {
+        // Enable GPS location in ModemManager
+        GpsManager::enable_gps_location();
+        let gps = gps_manager.lock().unwrap();
+        gps.start();
+    }
+
+    // Create audio manager with KV4P settings
+    let audio_config = AudioConfig {
+        sample_rate: 8000,
+        tx_gain: 2.0,
+        rx_gain: 1.0,
+        gate_threshold: 0.005,
+        pre_emphasis_alpha: 0.0,
+        hard_limit: 0.95,
+    };
+    let audio_manager = Arc::new(Mutex::new(AudioManager::new(audio_config)));
+    
+    // Initialize encoder and decoder
+    {
+        let mut audio = audio_manager.lock().unwrap();
+        if let Err(e) = audio.init_encoder() {
+            eprintln!("[pocket-modem] Failed to init encoder: {}", e);
+        }
+        if let Err(e) = audio.init_decoder() {
+            eprintln!("[pocket-modem] Failed to init decoder: {}", e);
+        }
+    }
+    
+    // Connect audio TX to radio (Opus frames)
+    {
+        let mut audio = audio_manager.lock().unwrap();
+        let radio = Arc::clone(&radio);
+        audio.on_tx_audio(move |opus_data| {
+            if let Ok(mut r) = radio.lock() {
+                let _ = r.send_audio(opus_data);
+            }
+        });
+    }
+    
+    // Connect radio RX audio to speaker playback
+    {
+        let mut radio = radio.lock().unwrap();
+        let audio = Arc::clone(&audio_manager);
+        radio.on_rx_audio(move |opus_data| {
+            if let Ok(mut a) = audio.lock() {
+                // Accumulate a few frames before starting playback to avoid early underrun
+                a.accumulate_rx_audio(opus_data);
+                
+                // Start playback once we have enough buffered
+                if !a.is_playing() && a.should_start_playback() {
+                    let _ = a.start_playback();
+                }
+            }
+        });
+    }
     
     let app = adw::Application::builder()
         .application_id("org.pocketmodem.gtk")
@@ -77,28 +142,125 @@ fn main() {
         app.activate();
     });
 
+    // Clone for shutdown handler before move into activate
+    let audio_for_shutdown = Arc::clone(&audio_manager);
+    let gps_manager_activate = Arc::clone(&gps_manager);
+
     app.connect_activate(move |app| {
-        create_ui(app, &radio_clone, connected);
+        create_ui(app, &radio_clone, &audio_manager, &gps_manager_activate, connected);
+    });
+
+    // Close radio, audio and GPS on shutdown
+    let radio_for_shutdown = Arc::clone(&radio);
+    let gps_for_shutdown = Arc::clone(&gps_manager);
+    app.connect_shutdown(move |_| {
+        eprintln!("[pocket-modem] App shutting down...");
+        // Stop audio capture/playback
+        if let Ok(mut a) = audio_for_shutdown.lock() {
+            a.stop_capture();
+            a.stop_playback();
+        }
+        // Close radio connection
+        if let Ok(mut r) = radio_for_shutdown.lock() {
+            r.close();
+        }
+        // Stop GPS polling
+        if let Ok(g) = gps_for_shutdown.lock() {
+            g.stop();
+        }
     });
     
     app.run();
 }
 
-fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: bool) {
+fn create_ui(
+    app: &adw::Application,
+    radio: &Arc<Mutex<KV4PRadio>>,
+    audio: &Arc<Mutex<AudioManager>>,
+    gps: &Arc<Mutex<GpsManager>>,
+    connected: bool
+) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .default_width(360)
+        .default_width(320)
         .default_height(720)
         .title("PocketModem")
         .build();
+    window.set_size_request(320, -1);  // Constrain width to 320
     
     // Main content box using HeaderBar for title area
     let header_bar = adw::HeaderBar::builder()
         .title_widget(&adw::WindowTitle::new("PocketModem", ""))
         .build();
     
+    // Settings button - toggles view
+    let settings_btn = gtk4::ToggleButton::new();
+    settings_btn.set_icon_name("emblem-system-symbolic");
+    settings_btn.add_css_class("flat");
+    settings_btn.set_tooltip_text(Some("Settings"));
+    
+    // Settings view content
+    let settings_view = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+    settings_view.set_margin_top(24);
+    settings_view.set_margin_start(16);
+    settings_view.set_margin_end(16);
+    settings_view.set_margin_bottom(24);
+    settings_view.set_visible(false);
+    
+    // Squelch section
+    let squelch_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let squelch_title = gtk4::Label::new(Some("<b>Squelch</b>"));
+    squelch_title.set_markup("<b>Squelch</b>");
+    squelch_title.set_halign(gtk4::Align::Start);
+    squelch_section.append(&squelch_title);
+    
+    let squelch_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    squelch_row.set_valign(gtk4::Align::Center);
+    
+    let squelch_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 9.0, 1.0);
+    squelch_scale.set_value(4.0);
+    squelch_scale.set_hexpand(true);
+    squelch_scale.set_draw_value(false);
+    squelch_scale.set_has_origin(true);
+    
+    let squelch_value_label = gtk4::Label::new(Some("4"));
+    squelch_value_label.set_width_request(24);
+    squelch_value_label.set_halign(gtk4::Align::Start);
+    squelch_value_label.add_css_class("squelch-value");
+    
+    // Simple callback - just update label, send to radio in thread
+    let radio_squelch = Arc::clone(radio);
+    let label_for_closure = squelch_value_label.clone();
+    squelch_scale.connect_value_changed(move |scale| {
+        let level = scale.value().round() as u8;
+        label_for_closure.set_text(&format!("{}", level));
+        
+        // Send squelch to radio in background thread
+        let radio_clone = radio_squelch.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut r) = radio_clone.lock() {
+                let _ = r.set_squelch(level);
+            }
+        });
+    });
+    
+    squelch_row.append(&squelch_scale);
+    squelch_row.append(&squelch_value_label);
+    squelch_section.append(&squelch_row);
+    settings_view.append(&squelch_section);
+    
+    // Add back button
+    let back_btn = gtk4::Button::with_label("Back");
+    back_btn.set_margin_top(24);
+    back_btn.connect_clicked(glib::clone!(@weak settings_btn => move |_| {
+        settings_btn.set_active(false);
+    }));
+    settings_view.append(&back_btn);
+    
+    header_bar.pack_end(&settings_btn);
+    
     // Status row using a horizontal Box with labels
-    let status_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 24);
+    let status_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 32);
     status_row.set_halign(gtk4::Align::Center);
     status_row.set_margin_top(16);
     status_row.set_margin_bottom(16);
@@ -108,7 +270,7 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
     modem_label.add_css_class(if connected { "status-icon-green" } else { "status-icon-red" });
     let modem_status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     let modem_icon = gtk4::Image::from_icon_name("network-wireless-symbolic");
-    modem_icon.set_pixel_size(32);
+    modem_icon.set_pixel_size(28);
     let modem_status_label = gtk4::Label::new(Some("MODEM"));
     modem_status_label.add_css_class("status-text");
     modem_status_label.add_css_class("modem-label");
@@ -116,37 +278,81 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
     modem_status_box.append(&modem_label);
     modem_status_box.append(&modem_status_label);
     
-    // RSSI / S-meter using AdwStatusPage style
-    let rssi_label = gtk4::Label::new(None);
-    rssi_label.add_css_class("s-meter");
-    rssi_label.set_markup(&format!("<span color='#44dd66'>{}</span>", if connected { "S5" } else { "S0" }));
-    let rssi_icon = gtk4::Image::from_icon_name("network-cellular-signal-excellent-symbolic");
-    rssi_icon.set_pixel_size(32);
-    let rssi_sbar = gtk4::LevelBar::new();
-    rssi_sbar.set_size_request(80, 10);
-    rssi_sbar.set_min_value(0.0);
-    rssi_sbar.set_max_value(9.0);
-    rssi_sbar.set_value(if connected { 5.0 } else { 0.0 });
-    let rssi_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-    rssi_box.append(&rssi_icon);
-    rssi_box.append(&rssi_sbar);
-    rssi_box.append(&rssi_label);
+    // GPS icon and status LED
+    let gps_icon = gtk4::Image::from_icon_name("location-services-active-symbolic");
+    gps_icon.set_pixel_size(28);
+    let gps_led = gtk4::Label::new(Some("○"));
+    gps_led.add_css_class("gps-led-off");
+    let gps_status_label = gtk4::Label::new(Some("GPS"));
+    gps_status_label.add_css_class("status-text");
+    gps_status_label.add_css_class("gps-label");
+    let gps_status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    gps_status_box.add_css_class("gps-status-box");
+    gps_status_box.append(&gps_icon);
+    gps_status_box.append(&gps_led);
+    gps_status_box.append(&gps_status_label);
     
     status_row.append(&modem_status_box);
-    status_row.append(&rssi_box);
+    status_row.append(&gps_status_box);
+
+    // GPS location display (below status row)
+    let gps_location_label = gtk4::Label::new(Some("Searching..."));
+    gps_location_label.add_css_class("gps-location");
+    gps_location_label.set_margin_top(4);
+
+    // Audio status indicator
+    let audio_label = gtk4::Label::new(Some("○"));
+    audio_label.add_css_class("status-icon-gray");
+    let audio_status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    let audio_icon = gtk4::Image::from_icon_name("audio-volume-medium-symbolic");
+    audio_icon.set_pixel_size(28);
+    let audio_status_label = gtk4::Label::new(Some("AUDIO"));
+    audio_status_label.add_css_class("status-text");
+    audio_status_label.add_css_class("audio-label");
+    audio_status_box.append(&audio_icon);
+    audio_status_box.append(&audio_label);
+    audio_status_box.append(&audio_status_label);
+    status_row.append(&audio_status_box);
     
-    // Mode badge using gtk4::Label styled
-    let mode_label = gtk4::Label::new(Some("FM"));
-    mode_label.add_css_class("mode-badge");
-    mode_label.set_halign(gtk4::Align::Center);
-    mode_label.set_margin_bottom(12);
+    // RSSI / S-meter - below VFO
+    let rssi_sbar = gtk4::ProgressBar::new();
+    rssi_sbar.set_fraction(if connected { 0.5 } else { 0.0 });
+    rssi_sbar.add_css_class("rssi-bar");
+    
+    // S-meter: bar and dBm value side by side
+    let smeter_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    smeter_box.set_halign(gtk4::Align::Center);
+    smeter_box.set_margin_start(24);
+    smeter_box.set_margin_end(24);
+    smeter_box.set_valign(gtk4::Align::Center);
+    smeter_box.set_size_request(-1, 20);
+    
+    // SIGNAL label on left
+    let signal_label = gtk4::Label::new(Some("SIGNAL"));
+    signal_label.add_css_class("signal-text");
+    signal_label.set_valign(gtk4::Align::Center);
+    
+    // Bar in center, takes remaining space
+    rssi_sbar.set_hexpand(true);
+    rssi_sbar.set_valign(gtk4::Align::Center);
+    
+    // dBm value on right
+    let signal_value = gtk4::Label::new(None);
+    signal_value.add_css_class("signal-value");
+    signal_value.set_markup(&format!("<span color='#FFB000'>{}</span>", if connected { "-97 dBm" } else { "-- dBm" }));
+    signal_value.set_valign(gtk4::Align::Center);
+    signal_value.set_width_request(70);
+    
+    smeter_box.append(&signal_label);
+    smeter_box.append(&rssi_sbar);
+    smeter_box.append(&signal_value);
     
     // VFO frequency display - using Entry for interaction
     let freq_entry = gtk4::Entry::new();
     freq_entry.set_text("145.500");
     gtk4::prelude::EditableExt::set_alignment(&freq_entry, 0.5);
     freq_entry.add_css_class("freq-display");
-    freq_entry.set_size_request(300, 100);
+    freq_entry.set_size_request(260, 100);
     freq_entry.set_margin_start(16);
     freq_entry.set_margin_end(16);
     freq_entry.set_margin_top(8);
@@ -186,13 +392,21 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
     mode_box.set_homogeneous(true);
     mode_box.set_margin_start(16);
     mode_box.set_margin_end(16);
+    mode_box.set_margin_top(20);
     mode_box.set_margin_bottom(16);
     
     let btn_fm = gtk4::ToggleButton::with_label("FM");
+    btn_fm.add_css_class("mode-btn");
+    btn_fm.add_css_class("mode-btn-active");  // FM is default active
+    
     let btn_rade = gtk4::ToggleButton::with_label("RADE");
-    let btn_m17 = gtk4::ToggleButton::with_label("M17");
+    btn_rade.add_css_class("mode-btn");
     btn_rade.set_sensitive(false);
+    
+    let btn_m17 = gtk4::ToggleButton::with_label("M17");
+    btn_m17.add_css_class("mode-btn");
     btn_m17.set_sensitive(false);
+    
     btn_fm.set_active(true);
     mode_box.append(&btn_fm);
     mode_box.append(&btn_rade);
@@ -213,38 +427,56 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
     // PTT Button using SplitButton for modern look (without dropdown)
     let ptt_btn = gtk4::Button::new();
     ptt_btn.add_css_class("ptt-button");
+    ptt_btn.set_valign(gtk4::Align::Center);
     
     // PTT box with circle and label underneath
     let ptt_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     ptt_box.set_halign(gtk4::Align::Center);
+    ptt_box.set_valign(gtk4::Align::Center);
     
     let ptt_icon = gtk4::Image::from_icon_name("media-record-symbolic");
     ptt_icon.set_pixel_size(40);
     ptt_icon.add_css_class("ptt-icon");
+    ptt_icon.set_halign(gtk4::Align::Center);
+    ptt_icon.set_valign(gtk4::Align::Center);
     
     let ptt_label = gtk4::Label::new(Some("PTT"));
     ptt_label.add_css_class("ptt-label");
+    ptt_label.set_halign(gtk4::Align::Center);
     
     ptt_box.append(&ptt_icon);
     ptt_box.append(&ptt_label);
     
     ptt_btn.set_child(Some(&ptt_box));
     ptt_btn.set_tooltip_text(Some("Hold to transmit"));
-    ptt_btn.set_size_request(100, 110);
-    ptt_btn.set_margin_top(12);
+    ptt_btn.set_hexpand(true);
+    ptt_btn.set_margin_start(20);
+    ptt_btn.set_margin_end(20);
     ptt_btn.set_margin_bottom(20);
-    ptt_btn.set_halign(gtk4::Align::Center);
+    ptt_btn.set_valign(gtk4::Align::End);
     
     let radio_ptt_press = Arc::clone(radio);
     let radio_ptt_release = Arc::clone(radio);
+    let audio_ptt_press = Arc::clone(audio);
+    let audio_ptt_release = Arc::clone(audio);
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
     gesture.connect_pressed(move |_, _, _, _| {
+        // Start PTT
         if let Ok(mut r) = radio_ptt_press.lock() {
             let _ = r.ptt_on();
         }
+        // Start audio capture for TX
+        if let Ok(mut a) = audio_ptt_press.lock() {
+            let _ = a.start_capture();
+        }
     });
     gesture.connect_released(move |_, _, _, _| {
+        // Stop audio capture first
+        if let Ok(mut a) = audio_ptt_release.lock() {
+            a.stop_capture();
+        }
+        // Stop PTT
         if let Ok(mut r) = radio_ptt_release.lock() {
             let _ = r.ptt_off();
         }
@@ -253,35 +485,64 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
     
     // Main content area with Clamp for responsive width
     let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    content_box.set_halign(gtk4::Align::Fill);
-    content_box.set_hexpand(true);
+    content_box.set_halign(gtk4::Align::Center);
+    content_box.set_hexpand(false);
+    content_box.set_size_request(320, -1);
     
+    // Connect toggle button to switch views (after content_box exists)
+    let settings_view_clone = settings_view.clone();
+    let content_box_clone = content_box.clone();
+    settings_btn.connect_toggled(move |btn| {
+        if btn.is_active() {
+            settings_view_clone.set_visible(true);
+            content_box_clone.set_visible(false);
+        } else {
+            settings_view_clone.set_visible(false);
+            content_box_clone.set_visible(true);
+        }
+    });
+    
+    // Status row at top
     content_box.append(&status_row);
-    content_box.append(&mode_label);
-    content_box.append(&freq_entry);
-    content_box.append(&mode_box);
-    content_box.append(channel_group.as_ref() as &gtk4::Widget);
-    content_box.append(&ptt_btn);
     
-    // Use Clamp to constrain content width on wider screens
-    let clamp = adw::Clamp::builder()
-        .maximum_size(400)
-        . tightening_threshold(300)
-        .child(&content_box)
-        .build();
+    // Frequency display and signal
+    content_box.append(&freq_entry);
+    content_box.append(&smeter_box);
+    
+    // Mode buttons
+    content_box.append(&mode_box);
+    
+    // Channel list
+    content_box.append(channel_group.as_ref() as &gtk4::Widget);
+    
+    // Spacer to push PTT to bottom
+    let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    spacer.set_vexpand(true);
+    content_box.append(&spacer);
+    
+    // PTT at bottom
+    content_box.append(&ptt_btn);
     
     // Main layout box
     let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     main_box.append(&header_bar);
-    main_box.append(&clamp);
+    main_box.append(&content_box);
+    main_box.append(&settings_view);
     
     // Update loop for live status
     let radio_update = Arc::clone(radio);
     let modem_label_clone = modem_label.clone();
     let rssi_sbar_clone = rssi_sbar.clone();
-    let rssi_label_clone = rssi_label.clone();
-    
-    glib::timeout_add_local(Duration::from_millis(500), move || {
+    let signal_value_clone = signal_value.clone();
+    let audio_clone = Arc::clone(audio);
+    let audio_label_clone = audio_label.clone();
+    let gps_clone = Arc::clone(gps);
+
+    let gps_led_clone = gps_led.clone();
+
+    let gps_location_clone = gps_location_label.clone();
+
+    glib::timeout_add_local(Duration::from_millis(1000), move || {
         if let Ok(r) = radio_update.lock() {
             let state = r.state();
             
@@ -295,11 +556,64 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
                 modem_label_clone.add_css_class("status-icon-red");
             }
             
-            // Use RSSI directly scaled to 0-9 for S-meter (rssi 0-255 maps to S0-S9)
-            let smeter = ((state.rssi as f64) * 9.0 / 255.0).clamp(0.0, 9.0);
-            let s_val = smeter.max(1.0);  // At least S1 visible
-            rssi_sbar_clone.set_value(s_val);
-            rssi_label_clone.set_markup(&format!("<span color='#44dd66'>S{}</span>", (smeter.round() as i32).max(1).min(9)));
+            // S-meter: Standard VHF/UHF formula (S9 = -93 dBm)
+            // dBm = raw * 1.2 - 160.8
+            // S-val = 9 + (dBm - (-93)) / 6
+            // Below S9: round to nearest whole S-unit
+            // Above S9: shows dB over S9
+            // Calculate dBm from raw RSSI (dBm = raw * 1.2 - 160.8)
+            let dbm = state.raw_rssi as f64 * 1.2 - 160.8;
+            
+            // Update dBm display
+            let dbm_text = if state.connected { format!("{} dBm", dbm as i32) } else { "-- dBm".to_string() };
+            signal_value_clone.set_markup(&format!("<span color='#FFB000'>{}</span>", dbm_text));
+            
+            // Update amber bar (dBm range: -120 to -60 = 0% to 100%)
+            let frac = if state.connected {
+                let dbm_clamped = dbm.max(-120.0).min(-60.0);
+                (dbm_clamped + 120.0) / 60.0
+            } else {
+                0.0
+            };
+            rssi_sbar_clone.set_fraction(frac);
+            
+            // Update audio status indicator
+            if let Ok(a) = audio_clone.lock() {
+                if a.is_capturing() || a.is_playing() {
+                    audio_label_clone.set_text("●");
+                    audio_label_clone.remove_css_class("status-icon-gray");
+                    audio_label_clone.add_css_class("status-icon-green");
+                } else {
+                    audio_label_clone.set_text("○");
+                    audio_label_clone.remove_css_class("status-icon-green");
+                    audio_label_clone.add_css_class("status-icon-gray");
+                }
+            }
+
+            // Update GPS status indicator
+            if let Ok(g) = gps_clone.lock() {
+                let gps_data = g.get_data();
+                if gps_data.has_fix {
+                    gps_led_clone.set_text("●");
+                    gps_led_clone.remove_css_class("gps-led-off");
+                    gps_led_clone.add_css_class("gps-led-on");
+
+                    // Update location display
+                    if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
+                        let location = format!("{:.6}, {:.6}", lat, lon);
+                        gps_location_clone.set_text(&location);
+                        gps_location_clone.remove_css_class("gps-searching");
+                        gps_location_clone.add_css_class("gps-fixed");
+                    }
+                } else {
+                    gps_led_clone.set_text("○");
+                    gps_led_clone.remove_css_class("gps-led-on");
+                    gps_led_clone.add_css_class("gps-led-off");
+                    gps_location_clone.set_text("Searching...");
+                    gps_location_clone.remove_css_class("gps-fixed");
+                    gps_location_clone.add_css_class("gps-searching");
+                }
+            }
         }
         glib::ControlFlow::Continue
     });
@@ -322,14 +636,23 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
         .freq-display:focus {
             border-color: #FFB000;
         }
-        .mode-badge {
-            font-size: 18px;
+        .mode-btn {
+            font-size: 14px;
             font-weight: bold;
-            color: #33D17A;
+            padding: 8px 16px;
+            border-radius: 8px;
+            background: #2a2a2a;
+            border: 1px solid #444;
+            color: #888;
+        }
+        .mode-btn:disabled {
+            opacity: 0.4;
+        }
+        .mode-btn-active {
             background: #1a2a1a;
-            padding: 6px 20px;
-            border-radius: 20px;
-            border: 1px solid #33D17A;
+            border: 2px solid #33D17A;
+            color: #33D17A;
+            box-shadow: 0 0 8px rgba(51, 209, 122, 0.3);
         }
         .status-icon-green {
             font-size: 16px;
@@ -344,21 +667,87 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
             color: #FFB000;
             font-weight: bold;
         }
-        .s-meter {
-            font-size: 14px;
-            font-weight: bold;
-            color: #FFB000;
+        .s-meter-header {
+            font-size: 12px;
+            color: #888;
+        }
+        .s-level {
+            font-size: 18px;
+            min-width: 40px;
         }
         .modem-label {
             color: #666;
+            font-size: 13px;
         }
-        levelbar > trough {
+        .gps-label {
+            color: #666;
+            font-size: 13px;
+        }
+        .audio-label {
+            color: #666;
+            font-size: 13px;
+        }
+        .audio-status-box {
+            color: @theme_fg_color;
+        }
+        .gps-status-box {
+            color: @theme_fg_color;
+        }
+        .location-services-active-symbolic {
+            color: inherit;
+        }
+        .gps-led-on {
+            color: #33D17A;
+            font-size: 16px;
+        }
+        .gps-led-off {
+            color: #666;
+            font-size: 16px;
+        }
+
+        .gps-location {
+            font-size: 11px;
+            font-family: monospace;
+            color: #888;
+        }
+        .gps-searching {
+            color: #666;
+            font-style: italic;
+        }
+        .gps-fixed {
+            color: #33D17A;
+        }
+        .status-icon-gray {
+            font-size: 16px;
+            color: #666;
+        }
+
+        .squelch-label {
+            font-size: 12px;
+            color: #888;
+            font-weight: bold;
+        }
+        .signal-text {
+            font-size: 12px;
+            color: #666;
+            font-weight: bold;
+        }
+        .signal-value {
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .rssi-bar {
             background: #2a2a2a;
-            border-radius: 4px;
+            border: 1px solid #444;
+            border-radius: 6px;
         }
-        levelbar > trough > block {
+        .rssi-bar > trough {
+            background: #2a2a2a;
+            border-radius: 6px;
+        }
+        .rssi-bar > trough > progress {
             background: #FFB000;
-            border-radius: 4px;
+            border-radius: 5px;
         }
         .ptt-button {
             min-width: 100px;
@@ -403,6 +792,7 @@ fn create_ui(app: &adw::Application, radio: &Arc<Mutex<KV4PRadio>>, connected: b
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION
     );
     
+    // Set main_box as content
     window.set_content(Some(&main_box));
     window.show();
 }

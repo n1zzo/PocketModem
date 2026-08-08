@@ -1,11 +1,12 @@
 //! KV4P HT Radio driver - native Rust implementation
 
 use crate::kiss::{
-    build_kv4p_packet, DeviceCommand, DeviceState, HostCommand, HostDesiredState,
-    HostStateFlags, PacketParser, RfModuleType, VersionInfo,
+    build_kv4p_packet, build_tx_audio_packet, DeviceCommand, 
+    DeviceState, HostCommand, HostDesiredState, HostStateFlags, PacketParser, 
+    RfModuleType, VersionInfo,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ pub type SmeterCallback = Box<dyn Fn(i32) + Send + Sync>;
 pub type StateCallback = Box<dyn Fn(&DeviceState) + Send + Sync>;
 pub type RssiCallback = Box<dyn Fn(f32) + Send + Sync>;
 pub type ConnectCallback = Box<dyn Fn(bool) + Send + Sync>;
+pub type RxAudioCallback = Box<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Serial config
 #[derive(Debug, Clone)]
@@ -40,6 +42,7 @@ pub struct RadioState {
     pub ctcss: u32,
     pub rssi: f32,
     pub smeter_bars: i32,
+    pub raw_rssi: u8,
     pub squelch_open: bool,
     pub ptt: bool,
     pub connected: bool,
@@ -49,9 +52,12 @@ pub struct RadioState {
 pub struct KV4PRadio {
     config: SerialConfig,
     serial: Arc<Mutex<Option<Box<dyn serialport::SerialPort>>>>,
+    write_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,  // Channel for write commands
     parser: Arc<Mutex<PacketParser>>,
     running: Arc<AtomicBool>,
+    write_shutdown: Arc<AtomicBool>,
     sequence: Arc<AtomicU32>,
+    audio_sequence: Arc<AtomicU16>,  // Sequence for audio frames
     version: Arc<Mutex<Option<VersionInfo>>>,
     device_state: Arc<Mutex<Option<DeviceState>>>,
     frequency: Arc<AtomicU32>,
@@ -61,15 +67,18 @@ pub struct KV4PRadio {
     state_cb: Arc<Mutex<Option<StateCallback>>>,
     rssi_cb: Arc<Mutex<Option<RssiCallback>>>,
     connect_cb: Arc<Mutex<Option<ConnectCallback>>>,
+    rx_audio_cb: Arc<Mutex<Option<RxAudioCallback>>>,  // Callback for received audio
 }
 
 impl KV4PRadio {
     pub fn new(config: SerialConfig) -> Self {
         Self {
             config, serial: Arc::new(Mutex::new(None)),
+            write_tx: Arc::new(Mutex::new(None)),
             parser: Arc::new(Mutex::new(PacketParser::new())),
             running: Arc::new(AtomicBool::new(false)),
             sequence: Arc::new(AtomicU32::new(1)),
+            audio_sequence: Arc::new(AtomicU16::new(0)),
             version: Arc::new(Mutex::new(None)),
             device_state: Arc::new(Mutex::new(None)),
             frequency: Arc::new(AtomicU32::new(145500)),
@@ -79,6 +88,8 @@ impl KV4PRadio {
             state_cb: Arc::new(Mutex::new(None)),
             rssi_cb: Arc::new(Mutex::new(None)),
             connect_cb: Arc::new(Mutex::new(None)),
+            rx_audio_cb: Arc::new(Mutex::new(None)),
+            write_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -98,14 +109,26 @@ impl KV4PRadio {
         *self.connect_cb.lock().unwrap() = Some(Box::new(cb));
     }
 
+    pub fn on_rx_audio<F>(&mut self, cb: F) where F: Fn(&[u8]) + Send + Sync + 'static {
+        *self.rx_audio_cb.lock().unwrap() = Some(Box::new(cb));
+    }
+
     pub fn open(&mut self) -> Result<Option<VersionInfo>, String> {
+        // Reset state for reconnection (in case we're reopening)
+        self.running.store(false, Ordering::SeqCst);
+        self.write_shutdown.store(false, Ordering::SeqCst);
+        *self.version.lock().unwrap() = None;
+        *self.device_state.lock().unwrap() = None;
+        *self.write_tx.lock().unwrap() = None;
+        self.parser.lock().unwrap().reset();
+        
         let port = serialport::new(&self.config.port, self.config.baudrate)
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)
             .stop_bits(serialport::StopBits::One)
             .flow_control(serialport::FlowControl::None)
             .dtr_on_open(false)
-            .timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(5))
             .open()
             .map_err(|e| format!("Failed to open {}: {}", self.config.port, e))?;
 
@@ -215,30 +238,59 @@ impl KV4PRadio {
     fn send(&mut self, state: HostDesiredState) -> Result<(), String> {
         let payload = state.to_bytes();
         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
-        if let Some(ref mut sp) = *self.serial.lock().unwrap() {
-            sp.write_all(&frame).map_err(|e| format!("Write error: {}", e))?;
-            sp.flush().map_err(|e| format!("Flush error: {}", e))?;
+        
+        // Send to write thread via channel (non-blocking)
+        if let Ok(guard) = self.write_tx.lock() {
+            if let Some(ref tx) = *guard {
+                let _ = tx.send(frame);
+            }
         }
         Ok(())
     }
 
     fn spawn_reader_thread(&mut self) {
         let serial = Arc::clone(&self.serial);
+        let _write_tx = Arc::clone(&self.write_tx);
         let parser = Arc::clone(&self.parser);
         let running = Arc::clone(&self.running);
+        let write_shutdown = Arc::clone(&self.write_shutdown);
         let version = Arc::clone(&self.version);
         let device_state = Arc::clone(&self.device_state);
         let smeter_cb = Arc::clone(&self.smeter_cb);
         let state_cb = Arc::clone(&self.state_cb);
         let rssi_cb = Arc::clone(&self.rssi_cb);
         let connect_cb = Arc::clone(&self.connect_cb);
+        let rx_audio_cb = Arc::clone(&self.rx_audio_cb);
 
+        // Spawn write thread
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut guard = self.write_tx.lock().unwrap();
+            *guard = Some(tx);
+        }
+        
+        let serial_for_write = Arc::clone(&serial);
         thread::spawn(move || {
+            while !write_shutdown.load(Ordering::SeqCst) {
+                if let Ok(frame) = rx.recv_timeout(Duration::from_millis(100)) {
+                    if let Some(ref mut sp) = *serial_for_write.lock().unwrap() {
+                        let _ = sp.write_all(&frame);
+                        let _ = sp.flush();
+                    }
+                }
+            }
+        });
+
+        // Reader thread
+        let _reader_handle = thread::spawn(move || {
             let mut buf = [0u8; 256];
             while running.load(Ordering::SeqCst) {
                 if let Some(ref mut sp) = *serial.lock().unwrap() {
                     match sp.read(&mut buf) {
-                        Ok(0) => { thread::sleep(Duration::from_millis(20)); }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            // Normal - no data available
+                            thread::sleep(Duration::from_millis(50));
+                        }
                         Ok(n) => {
                             let packets = parser.lock().unwrap().feed(&buf[..n]);
                             for pkt in &packets {
@@ -269,6 +321,20 @@ impl KV4PRadio {
                                     }
                                 } else if cmd == DeviceCommand::SmeterReport as u8 && !payload.is_empty() {
                                     if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(payload[0] as i32); }
+                                } else if cmd == 0x0C {
+                                    // Cmd 0x0C - Rx audio from device (ADPCM encoded)
+                                    if !payload.is_empty() {
+                                        if let Some(ref cb) = *rx_audio_cb.lock().unwrap() {
+                                            cb(payload);
+                                        }
+                                    }
+                                } else if cmd == 0x07 {
+                                    // Cmd 0x07 - Rx audio from device (Opus encoded)
+                                    if !payload.is_empty() {
+                                        if let Some(ref cb) = *rx_audio_cb.lock().unwrap() {
+                                            cb(payload);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -322,7 +388,41 @@ impl KV4PRadio {
     }
 
     pub fn close(&mut self) {
+        // Send final shutdown state to KV4P (PTT off, radio to idle)
+        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
+        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
+        
+        // Send idle state: no PTT, close squelch, minimal flags
+        let shutdown_state = HostDesiredState {
+            sequence: seq as i32,
+            memory_id: -1,
+            flags: HostStateFlags::RSSI_ENABLED.bits(),
+            bandwidth: 1,
+            freq_tx: freq,
+            freq_rx: freq,
+            ctcss_tx: 0,
+            squelch: 9,
+            ctcss_rx: 0,
+        };
+        let _ = self.send(shutdown_state);
+        
+        // Give time for final command to be sent
+        thread::sleep(Duration::from_millis(50));
+        
+        // Signal threads to stop
         self.running.store(false, Ordering::SeqCst);
+        self.write_shutdown.store(true, Ordering::SeqCst);
+        
+        // Drop the sender to unblock the write thread's recv
+        {
+            let mut guard = self.write_tx.lock().unwrap();
+            *guard = None;
+        }
+        
+        // Give threads time to clean up
+        thread::sleep(Duration::from_millis(150));
+        
+        // Close serial port
         *self.serial.lock().unwrap() = None;
     }
 
@@ -333,9 +433,9 @@ impl KV4PRadio {
     pub fn state(&self) -> RadioState {
         let freq = self.frequency.load(Ordering::SeqCst);
         let dev_state = self.device_state.lock().unwrap();
-        let (rssi, smeter, squelch) = if let Some(ref s) = *dev_state {
-            (s.rssi_dbm(), s.smeter_bars() as i32, s.is_squelched())
-        } else { (-121.0, 0, false) };
+        let (rssi, smeter, squelch, raw_rssi) = if let Some(ref s) = *dev_state {
+            (s.rssi_dbm(), ((s.rssi as i32) * 9 / 255).max(1), s.is_squelched(), s.rssi)
+        } else { (-121.0, 0, false, 0) };
         RadioState {
             frequency: freq,
             tx_frequency: self.tx_frequency.load(Ordering::SeqCst),
@@ -345,6 +445,7 @@ impl KV4PRadio {
             ctcss: 0,
             rssi,
             smeter_bars: smeter,
+            raw_rssi,
             squelch_open: !squelch,
             ptt: false,
             connected: self.is_connected(),
@@ -379,7 +480,13 @@ impl KV4PRadio {
     pub fn set_frequency(&mut self, khz: u32) -> Result<(), String> {
         self.tune(khz, khz, 4, 1)
     }
-
+    
+    pub fn set_squelch(&mut self, level: u8) -> Result<(), String> {
+        let khz = self.frequency.load(Ordering::SeqCst);
+        let tx_khz = self.tx_frequency.load(Ordering::SeqCst);
+        self.tune(khz, tx_khz, level, 1)
+    }
+    
     pub fn set_power(&mut self, high: bool) -> Result<(), String> {
         self.power_high.store(high, Ordering::SeqCst);
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
@@ -456,6 +563,43 @@ impl KV4PRadio {
             ctcss_rx: 0,
         };
         self.send(state)
+    }
+
+    /// Send Opus-encoded audio frame to the radio for TX
+    /// 
+    /// Called by the audio capture system when transmitting.
+    pub fn send_audio(&mut self, opus_data: &[u8]) -> Result<(), String> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err("Radio not connected".to_string());
+        }
+        
+        let frame = build_tx_audio_packet(opus_data);
+        
+        // Send to write thread via channel
+        if let Ok(guard) = self.write_tx.lock() {
+            if let Some(ref tx) = *guard {
+                let _ = tx.send(frame);
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Send raw audio bytes directly (for testing or alternative formats)
+    pub fn send_raw_audio(&mut self, data: &[u8]) -> Result<(), String> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err("Radio not connected".to_string());
+        }
+        
+        let frame = build_kv4p_packet(HostCommand::TxAudio, data);
+        
+        if let Ok(guard) = self.write_tx.lock() {
+            if let Some(ref tx) = *guard {
+                let _ = tx.send(frame);
+            }
+        }
+        
+        Ok(())
     }
 }
 

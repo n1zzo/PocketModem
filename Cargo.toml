@@ -13,6 +13,18 @@ gio = "0.19"
 gtk4 = "0.7"
 libadwaita = "0.5"
 
+# Audio
+cpal = "0.15"
+rodio = "0.19"
+opus = { version = "0.3", default-features = false }
+
+# Async runtime for audio
+futures = "0.3"
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
+
+# Ring buffer for audio buffering
+ringbuf = "0.3"
+
 [build-dependencies]
 cc = "1.0"
 

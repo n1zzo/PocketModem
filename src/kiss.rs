@@ -29,11 +29,19 @@ pub enum DeviceCommand {
     DebugDebug = 0x04,
     DebugTrace = 0x05,
     Hello = 0x06,
-    RxAudio = 0x0C,
     Version = 0x08,
     WindowUpdate = 0x09,
+    RxAudio = 0x0C,
     DeviceState = 0x0B,
     SmeterReport = 0x53,
+}
+
+/// Audio frame types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AudioFrameType {
+    /// Opus encoded audio (narrowband VOIP, VBR)
+    Opus = 0x01,
 }
 
 /// Host state flags
@@ -351,4 +359,22 @@ pub fn build_kv4p_packet(kv4p_cmd: HostCommand, payload: &[u8]) -> Vec<u8> {
     kv4p_data.push(kv4p_cmd as u8);
     kv4p_data.extend_from_slice(payload);
     build_kiss_frame(KISS_CMD_SETHARDWARE, &kv4p_data)
+}
+
+/// Build a TxAudio packet with Opus-encoded audio frame
+/// 
+/// Format: [opus_data: variable bytes]
+pub fn build_tx_audio_packet(opus_data: &[u8]) -> Vec<u8> {
+    build_kv4p_packet(HostCommand::TxAudio, opus_data)
+}
+
+/// Parse an RxAudio packet (Opus encoded)
+/// 
+/// Returns the Opus data if successful
+pub fn parse_rx_audio_packet(data: &[u8]) -> Option<Vec<u8>> {
+    // RxAudio payload is just the raw Opus data
+    if data.is_empty() {
+        return None;
+    }
+    Some(data.to_vec())
 }

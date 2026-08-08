@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Outer ring (smaller) -->
+  <path fill="currentColor" d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 1.5a5.5 5.5 0 1 1 0 11A5.5 5.5 0 0 1 8 2.5z"/>
+  <!-- Inner ring (smaller) -->
+  <circle cx="8" cy="8" r="2.5" fill="none" stroke="currentColor" stroke-width="1"/>
+  <!-- Center dot (smaller) -->
+  <circle cx="8" cy="8" r="1" fill="currentColor"/>
+  <!-- Crosshair - top, bottom, left, right (bigger) -->
+  <rect x="7.5" y="0" width="1" height="3" fill="currentColor"/>
+  <rect x="7.5" y="13" width="1" height="3" fill="currentColor"/>
+  <rect x="0" y="7.5" width="3" height="1" fill="currentColor"/>
+  <rect x="13" y="7.5" width="3" height="1" fill="currentColor"/>
+</svg>
