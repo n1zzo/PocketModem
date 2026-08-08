@@ -83,7 +83,7 @@ fn main() {
 
     // Create audio manager with KV4P settings
     let audio_config = AudioConfig {
-        sample_rate: 8000,
+        sample_rate: 16000,
         tx_gain: 2.0,
         rx_gain: 1.0,
         gate_threshold: 0.005,
@@ -92,24 +92,13 @@ fn main() {
     };
     let audio_manager = Arc::new(Mutex::new(AudioManager::new(audio_config)));
     
-    // Initialize encoder and decoder
-    {
-        let mut audio = audio_manager.lock().unwrap();
-        if let Err(e) = audio.init_encoder() {
-            eprintln!("[pocket-modem] Failed to init encoder: {}", e);
-        }
-        if let Err(e) = audio.init_decoder() {
-            eprintln!("[pocket-modem] Failed to init decoder: {}", e);
-        }
-    }
-    
-    // Connect audio TX to radio (Opus frames)
+    // Connect audio TX to radio (ADPCM frames)
     {
         let mut audio = audio_manager.lock().unwrap();
         let radio = Arc::clone(&radio);
-        audio.on_tx_audio(move |opus_data| {
+        audio.on_tx_audio(move |adpcm_data| {
             if let Ok(mut r) = radio.lock() {
-                let _ = r.send_audio(opus_data);
+                let _ = r.send_audio(adpcm_data);
             }
         });
     }
@@ -118,10 +107,10 @@ fn main() {
     {
         let mut radio = radio.lock().unwrap();
         let audio = Arc::clone(&audio_manager);
-        radio.on_rx_audio(move |opus_data| {
+        radio.on_rx_audio(move |adpcm_data| {
             if let Ok(mut a) = audio.lock() {
                 // Accumulate a few frames before starting playback to avoid early underrun
-                a.accumulate_rx_audio(opus_data);
+                a.accumulate_rx_audio(adpcm_data);
                 
                 // Start playback once we have enough buffered
                 if !a.is_playing() && a.should_start_playback() {

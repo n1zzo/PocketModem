@@ -322,14 +322,16 @@ impl KV4PRadio {
                                 } else if cmd == DeviceCommand::SmeterReport as u8 && !payload.is_empty() {
                                     if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(payload[0] as i32); }
                                 } else if cmd == 0x0C {
-                                    // Cmd 0x0C - Rx audio from device (ADPCM encoded)
+                                    // Cmd 0x0C - Rx audio from device (ADPCM encoded - IMA WAV format)
+                                    eprintln!("[radio] RX AUDIO: ADPCM (cmd=0x0C, {} bytes)", payload.len());
                                     if !payload.is_empty() {
                                         if let Some(ref cb) = *rx_audio_cb.lock().unwrap() {
                                             cb(payload);
                                         }
                                     }
                                 } else if cmd == 0x07 {
-                                    // Cmd 0x07 - Rx audio from device (Opus encoded)
+                                    // Cmd 0x07 - Rx audio from device (Opus encoded - legacy, unused in main firmware)
+                                    eprintln!("[radio] RX AUDIO: Opus (cmd=0x07, {} bytes)", payload.len());
                                     if !payload.is_empty() {
                                         if let Some(ref cb) = *rx_audio_cb.lock().unwrap() {
                                             cb(payload);

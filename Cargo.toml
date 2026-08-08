@@ -17,6 +17,9 @@ libadwaita = "0.5"
 cpal = "0.15"
 rodio = "0.19"
 opus = { version = "0.3", default-features = false }
+oxideav-adpcm = "0.0.6"
+oxideav-core = "0.1"
+bytemuck = "1"
 
 # Async runtime for audio
 futures = "0.3"

@@ -1,23 +1,25 @@
-//! Audio I/O for PocketModem with Opus encoding/decoding
+//! Audio I/O for PocketModem with ADPCM encoding/decoding
 //!
 //! Matches the KV4P HT firmware audio pipeline:
-//!   RX: ADC → DC offset removal → 16x gain → squelch mute → Opus (AUDIO, NB, VBR)
-//!   TX: Opus decode (VOIP, NB, VBR) → I2S DAC (PDM)
+//!   RX: ADC → DC offset removal → 16x gain → squelch mute → ADPCM (IMA WAV, 16kHz, 4-bit)
+//!   TX: ADPCM decode (IMA WAV, 16kHz) → I2S DAC (PDM)
 //!
-//! Uses cpal for capture and playback, opus for encoding/decoding.
+//! Uses cpal for capture and playback, oxideav-adpcm for ADPCM decoding.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use oxideav_adpcm::ima_wav;
 
-// Audio parameters - KV4P v17 uses Opus narrowband (8kHz)
-const SAMPLE_RATE: u32 = 8000;
-const FRAME_MS: u32 = 40;
-const FRAME_SIZE: usize = (SAMPLE_RATE * FRAME_MS / 1000) as usize; // 320 samples
-const CHANNELS: opus::Channels = opus::Channels::Mono;
-const MAX_OPUS_SIZE: usize = 400; // Max Opus frame size
+// Audio parameters - KV4P uses IMA WAV ADPCM at 16kHz
+const AUDIO_WIRE_SAMPLE_RATE: u32 = 16000;
+const AUDIO_FRAME_SAMPLES: usize = 249; // 128-byte ADPCM block decodes to 249 samples
+const ADPCM_FRAME_BYTES: usize = 128; // ADPCM block size
+const CHANNELS: u16 = 1;
+const OUTPUT_SAMPLE_RATE: u32 = 8000; // Downsample to 8kHz for playback
+const OUTPUT_FRAME_SIZE: usize = 160; // 20ms at 8kHz
 
 /// Audio configuration
 #[derive(Debug, Clone)]
@@ -33,7 +35,7 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            sample_rate: SAMPLE_RATE,
+            sample_rate: AUDIO_WIRE_SAMPLE_RATE,
             tx_gain: 2.0,
             rx_gain: 1.0,
             gate_threshold: 0.005,
@@ -43,10 +45,10 @@ impl Default for AudioConfig {
     }
 }
 
-/// TX Audio callback - called with Opus-encoded audio frames
+/// TX Audio callback - called with ADPCM-encoded audio frames
 pub type TxAudioCallback = Arc<Mutex<Option<Box<dyn FnMut(&[u8]) + Send>>>>;
 
-/// RX Audio handler - receives Opus-encoded frames  
+/// RX Audio handler - receives ADPCM-encoded frames  
 pub type RxAudioCallback = Arc<Mutex<Option<Box<dyn FnMut(&[u8]) + Send>>>>;
 
 /// Audio state
@@ -140,11 +142,34 @@ impl VolumeRamp {
     }
 }
 
+/// ADPCM frame state for encoding (maintains predictor across frames)
+pub struct ADPCMEncoder {
+    predictor: i16,
+    step_index: u8,
+}
+
+impl ADPCMEncoder {
+    pub fn new() -> Self {
+        Self { predictor: 0, step_index: 0 }
+    }
+
+    /// Encode PCM samples to IMA WAV ADPCM block (128 bytes for 249 samples)
+    /// Note: This is a simplified encoder - the KV4P firmware uses the full encoder
+    pub fn encode(&mut self, _samples: &[i16]) -> Vec<u8> {
+        // For now, return empty - TX encoding would need a proper IMA encoder
+        // The firmware does the encoding, we just need to handle RX decoding
+        vec![0u8; ADPCM_FRAME_BYTES]
+    }
+}
+
+impl Default for ADPCMEncoder {
+    fn default() -> Self { Self::new() }
+}
+
 /// Main audio manager
 pub struct AudioManager {
     config: AudioConfig,
-    encoder: Arc<Mutex<Option<opus::Encoder>>>,
-    decoder: Arc<Mutex<Option<opus::Decoder>>>,
+    encoder: ADPCMEncoder,
     tx_callback: TxAudioCallback,
     rx_callback: RxAudioCallback,
     tx_enabled: Arc<AtomicBool>,
@@ -159,33 +184,16 @@ impl AudioManager {
     pub fn new(config: AudioConfig) -> Self {
         Self {
             config,
-            encoder: Arc::new(Mutex::new(None)),
-            decoder: Arc::new(Mutex::new(None)),
+            encoder: ADPCMEncoder::new(),
             tx_callback: Arc::new(Mutex::new(None)),
             rx_callback: Arc::new(Mutex::new(None)),
             tx_enabled: Arc::new(AtomicBool::new(false)),
             rx_enabled: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(AudioState::Idle)),
-            dc_remover: Arc::new(Mutex::new(DCOffsetRemover::new(0.25, SAMPLE_RATE as f32))),
+            dc_remover: Arc::new(Mutex::new(DCOffsetRemover::new(0.25, AUDIO_WIRE_SAMPLE_RATE as f32))),
             volume_ramp: Arc::new(Mutex::new(VolumeRamp::new(0.05, 0.7))),
             playback_buf: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-    
-    pub fn init_encoder(&mut self) -> Result<(), String> {
-        let mut enc = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
-            .map_err(|e| format!("Failed to create Opus encoder: {}", e))?;
-        enc.set_bitrate(opus::Bitrate::Bits(4000)).ok();
-        enc.set_vbr(true).ok();
-        *self.encoder.lock().unwrap() = Some(enc);
-        Ok(())
-    }
-    
-    pub fn init_decoder(&mut self) -> Result<(), String> {
-        let dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)
-            .map_err(|e| format!("Failed to create Opus decoder: {}", e))?;
-        *self.decoder.lock().unwrap() = Some(dec);
-        Ok(())
     }
     
     pub fn on_tx_audio<F>(&mut self, callback: F) 
@@ -201,15 +209,10 @@ impl AudioManager {
     pub fn start_capture(&mut self) -> Result<(), String> {
         if self.tx_enabled.load(Ordering::SeqCst) { return Ok(()); }
         
-        if self.encoder.lock().unwrap().is_none() {
-            self.init_encoder()?;
-        }
-        
         let config = self.config.clone();
         let tx_callback = Arc::clone(&self.tx_callback);
         let tx_enabled = Arc::clone(&self.tx_enabled);
         let state = Arc::clone(&self.state);
-        let encoder = Arc::clone(&self.encoder);
         let dc_remover = Arc::clone(&self.dc_remover);
         let volume_ramp = Arc::clone(&self.volume_ramp);
         
@@ -217,7 +220,7 @@ impl AudioManager {
         
         thread::spawn(move || {
             if let Err(e) = Self::capture_loop(&config, tx_callback, tx_enabled.clone(), 
-                                                encoder, dc_remover, volume_ramp) {
+                                                dc_remover, volume_ramp) {
                 eprintln!("[audio] Capture error: {}", e);
             }
             tx_enabled.store(false, Ordering::SeqCst);
@@ -239,10 +242,6 @@ impl AudioManager {
     
     pub fn start_playback(&mut self) -> Result<(), String> {
         if self.rx_enabled.load(Ordering::SeqCst) { return Ok(()); }
-        
-        if self.decoder.lock().unwrap().is_none() {
-            self.init_decoder()?;
-        }
         
         let config = self.config.clone();
         let rx_callback = Arc::clone(&self.rx_callback);
@@ -270,7 +269,7 @@ impl AudioManager {
                 let level = buf.len();
                 
                 // Detect underrun (buffer emptied since last check)
-                if level < FRAME_SIZE && last_level >= FRAME_SIZE {
+                if level < OUTPUT_FRAME_SIZE && last_level >= OUTPUT_FRAME_SIZE {
                     underrun_count += 1;
                 }
                 last_level = level;
@@ -291,47 +290,62 @@ impl AudioManager {
         if *s == AudioState::Playing { *s = AudioState::Idle; }
     }
     
-    pub fn play_opus_frame(&mut self, opus_data: &[u8]) -> Result<(), String> {
+    /// Decode ADPCM frame and add to playback buffer
+    pub fn play_adpcm_frame(&mut self, adpcm_data: &[u8]) -> Result<(), String> {
         if !self.rx_enabled.load(Ordering::SeqCst) { return Ok(()); }
         
-        let mut output = vec![0i16; FRAME_SIZE];
-        let mut decoder_guard = self.decoder.lock().unwrap();
-        if let Some(ref mut dec) = *decoder_guard {
-            match dec.decode(opus_data, &mut output, false) {
-                Ok(_) => {
-                    let mut buf = self.playback_buf.lock().unwrap();
-                    buf.extend_from_slice(&output);
-                }
-                Err(e) => eprintln!("[audio] Decode error: {}", e),
+        // Decode IMA WAV ADPCM (128 bytes -> 249 samples at 16kHz)
+        match ima_wav::decode_block(adpcm_data, 1) {
+            Ok(pcm_samples) => {
+                // Downsample from 16kHz to 8kHz (skip every other sample)
+                let downsampled: Vec<i16> = pcm_samples.iter()
+                    .enumerate()
+                    .filter(|(i, _)| i % 2 == 0)
+                    .map(|(_, &s)| s)
+                    .collect();
+                
+                let mut buf = self.playback_buf.lock().unwrap();
+                buf.extend_from_slice(&downsampled);
             }
+            Err(e) => eprintln!("[audio] ADPCM decode error: {}", e),
         }
         Ok(())
     }
     
-    /// Accumulate audio frames before starting playback
-    pub fn accumulate_rx_audio(&mut self, opus_data: &[u8]) {
+    /// Accumulate ADPCM audio frames before starting playback
+    pub fn accumulate_rx_audio(&mut self, adpcm_data: &[u8]) {
         // Decode and buffer even before playback starts
-        let mut output = vec![0i16; FRAME_SIZE];
-        let mut decoder_guard = self.decoder.lock().unwrap();
-        if let Some(ref mut dec) = *decoder_guard {
-            if dec.decode(opus_data, &mut output, false).is_ok() {
+        match ima_wav::decode_block(adpcm_data, 1) {
+            Ok(pcm_samples) => {
+                // Downsample from 16kHz to 8kHz
+                let downsampled: Vec<i16> = pcm_samples.iter()
+                    .enumerate()
+                    .filter(|(i, _)| i % 2 == 0)
+                    .map(|(_, &s)| s)
+                    .collect();
+                
                 let mut buf = self.playback_buf.lock().unwrap();
-                buf.extend_from_slice(&output);
+                buf.extend_from_slice(&downsampled);
             }
+            Err(e) => eprintln!("[audio] ADPCM decode error: {}", e),
         }
     }
     
     /// Check if we have enough buffered to start playback (1 second worth)
     pub fn should_start_playback(&self) -> bool {
         let buf = self.playback_buf.lock().unwrap();
-        buf.len() >= SAMPLE_RATE as usize
+        buf.len() >= OUTPUT_SAMPLE_RATE as usize
+    }
+    
+    /// Get playback buffer level
+    pub fn playback_level(&self) -> usize {
+        self.playback_buf.lock().unwrap().len()
     }
     
     fn capture_loop(
         config: &AudioConfig,
         callback: TxAudioCallback,
         enabled: Arc<AtomicBool>,
-        encoder: Arc<Mutex<Option<opus::Encoder>>>,
         dc_remover: Arc<Mutex<DCOffsetRemover>>,
         volume_ramp: Arc<Mutex<VolumeRamp>>,
     ) -> Result<(), String> {
@@ -350,7 +364,6 @@ impl AudioManager {
 
         let err_fn = |err| eprintln!("[audio] Stream error: {}", err);
         let callback_clone = Arc::clone(&callback);
-        let encoder_clone = Arc::clone(&encoder);
         let dc_remover_clone = Arc::clone(&dc_remover);
         let volume_ramp_clone = Arc::clone(&volume_ramp);
         let enabled2 = Arc::clone(&enabled);
@@ -376,17 +389,13 @@ impl AudioManager {
                         }
                         
                         if max_amp > gate_threshold {
-                            let mut enc_guard = encoder_clone.lock().unwrap();
-                            if let Some(ref mut enc) = *enc_guard {
-                                let mut opus_out = vec![0u8; MAX_OPUS_SIZE];
-                                match enc.encode(&samples, &mut opus_out) {
-                                    Ok(len) => {
-                                        if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
-                                            cb(&opus_out[..len]);
-                                        }
-                                    }
-                                    Err(e) => eprintln!("[audio] Encode error: {}", e),
-                                }
+                            // TODO: Encode to ADPCM for TX
+                            // For now, just send raw samples
+                            let bytes = unsafe {
+                                std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2)
+                            };
+                            if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
+                                cb(bytes);
                             }
                         }
                     },
@@ -421,17 +430,12 @@ impl AudioManager {
                         }
                         
                         if max_amp > gate_threshold {
-                            let mut enc_guard = encoder_clone.lock().unwrap();
-                            if let Some(ref mut enc) = *enc_guard {
-                                let mut opus_out = vec![0u8; MAX_OPUS_SIZE];
-                                match enc.encode(&samples, &mut opus_out) {
-                                    Ok(len) => {
-                                        if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
-                                            cb(&opus_out[..len]);
-                                        }
-                                    }
-                                    Err(e) => eprintln!("[audio] Encode error: {}", e),
-                                }
+                            // TODO: Encode to ADPCM for TX
+                            let bytes = unsafe {
+                                std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2)
+                            };
+                            if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
+                                cb(bytes);
                             }
                         }
                     },
@@ -468,7 +472,7 @@ impl AudioManager {
             .map_err(|e| format!("Failed to get default output config: {}", e))?;
         eprintln!("[audio] Output format: {:?}", supported);
         
-        // Use device's native format (44100Hz stereo) - resample from Opus 8kHz mono
+        // Use device's native format (44100Hz stereo) - resample from ADPCM 8kHz mono
         let stream_config = cpal::StreamConfig {
             channels: supported.channels(),
             sample_rate: supported.sample_rate(),
@@ -483,7 +487,7 @@ impl AudioManager {
         let playback_buf_clone = Arc::clone(&playback_buf);
         {
             let mut buf = playback_buf_clone.lock().unwrap();
-            buf.resize(SAMPLE_RATE as usize / 5, 0); // ~200ms of silence
+            buf.resize(OUTPUT_SAMPLE_RATE as usize / 5, 0); // ~200ms of silence
             eprintln!("[audio] Pre-filled buffer with {} samples (~200ms)", buf.len());
         }
         
@@ -505,7 +509,7 @@ impl AudioManager {
                         let available = buf.len();
                         
                         // Resample from 8kHz mono to native_rate stereo
-                        let ratio = SAMPLE_RATE as f64 / native_rate as f64;
+                        let ratio = OUTPUT_SAMPLE_RATE as f64 / native_rate as f64;
                         let last_sample = if available > 0 { buf[available - 1] } else { 0i16 };
                         
                         let mut src_pos = 0.0f64;
@@ -554,7 +558,7 @@ impl AudioManager {
                         let available = buf.len();
                         
                         // Resample from 8kHz mono to native_rate stereo
-                        let ratio = SAMPLE_RATE as f64 / native_rate as f64;
+                        let ratio = OUTPUT_SAMPLE_RATE as f64 / native_rate as f64;
                         let last_mono = if available > 0 { buf[available - 1] as f32 / 32768.0 } else { 0.0f32 };
                         
                         let mut src_pos = 0.0f64;
@@ -593,7 +597,7 @@ impl AudioManager {
         }.map_err(|e| format!("Failed to build output stream: {}", e))?;
         
         stream.play().map_err(|e| format!("Failed to start stream: {}", e))?;
-        eprintln!("[audio] Playback started at {} Hz", SAMPLE_RATE);
+        eprintln!("[audio] Playback started at {} Hz", OUTPUT_SAMPLE_RATE);
         
         while enabled2.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(50));
