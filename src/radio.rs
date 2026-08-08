@@ -508,7 +508,7 @@ impl KV4PRadio {
             freq_tx: freq,
             freq_rx: freq,
             ctcss_tx: 0,
-            squelch: 4,
+            squelch: self.current_squelch.load(Ordering::SeqCst),
             ctcss_rx: 0,
         };
         self.send(state)
@@ -566,7 +566,7 @@ impl KV4PRadio {
             freq_tx: freq,
             freq_rx: freq,
             ctcss_tx: 0,
-            squelch: 4,
+            squelch: self.current_squelch.load(Ordering::SeqCst),
             ctcss_rx: 0,
         };
         self.send(state)
@@ -605,7 +605,7 @@ impl KV4PRadio {
             freq_tx: freq,
             freq_rx: freq,
             ctcss_tx: 0,
-            squelch: 4,
+            squelch: self.current_squelch.load(Ordering::SeqCst),
             ctcss_rx: 0,
         };
         self.send(state)

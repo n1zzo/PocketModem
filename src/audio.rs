@@ -461,7 +461,11 @@ impl AudioManager {
     }
     
     pub fn start_capture(&mut self) -> Result<(), String> {
-        if self.tx_enabled.load(Ordering::SeqCst) { return Ok(()); }
+        if self.tx_enabled.load(Ordering::SeqCst) { 
+            eprintln!("[audio] start_capture: already enabled");
+            return Ok(()); 
+        }
+        eprintln!("[audio] start_capture: starting...");
         
         let config = self.config.clone();
         let tx_callback = Arc::clone(&self.tx_callback);
@@ -473,17 +477,21 @@ impl AudioManager {
         
         volume_ramp.lock().unwrap().start();
         
+        // Set enabled flag BEFORE spawning thread to avoid race
+        self.tx_enabled.store(true, Ordering::SeqCst);
+        *self.state.lock().unwrap() = AudioState::Capturing;
+        
         thread::spawn(move || {
+            eprintln!("[audio] capture_loop thread started");
             if let Err(e) = Self::capture_loop(&config, tx_callback, tx_enabled.clone(), 
                                                 dc_remover, volume_ramp, pre_emphasis) {
                 eprintln!("[audio] Capture error: {}", e);
             }
             tx_enabled.store(false, Ordering::SeqCst);
             *state.lock().unwrap() = AudioState::Idle;
+            eprintln!("[audio] capture_loop thread ended");
         });
         
-        self.tx_enabled.store(true, Ordering::SeqCst);
-        *self.state.lock().unwrap() = AudioState::Capturing;
         Ok(())
     }
     
