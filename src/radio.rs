@@ -154,7 +154,7 @@ impl KV4PRadio {
             }
         }
 
-        // Read boot data
+        // Read boot data FIRST (reader thread not yet started, no race)
         let boot_data = self.read_boot_data(5000)?;
         
         let packets = self.parser.lock().unwrap().feed(&boot_data);
@@ -191,6 +191,8 @@ impl KV4PRadio {
 
         let version = self.version.lock().unwrap().clone();
         if version.as_ref().map(|v| v.is_valid).unwrap_or(false) {
+            // Spawn threads AFTER boot data read and dispatch
+            // Write thread needs to exist before we send anything
             self.running.store(true, Ordering::SeqCst);
             self.spawn_reader_thread();
             Ok(version)
@@ -232,13 +234,17 @@ impl KV4PRadio {
     }
 
     fn send_initial_state(&mut self) -> Result<(), String> {
-        let flags = (HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED).bits();
+        // FIX: Added RX_AUDIO_OPEN flag to enable audio flow
+        // FIX: Added ENABLE_STATUS_REPORTS for consistent state updates
+        let flags = (HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED |
+                     HostStateFlags::RX_AUDIO_OPEN | HostStateFlags::ENABLE_STATUS_REPORTS).bits();
         let state = HostDesiredState { flags, ..Default::default() };
         self.send(state)
     }
 
     fn send(&mut self, state: HostDesiredState) -> Result<(), String> {
         let payload = state.to_bytes();
+
         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
         
         // Send to write thread via channel (non-blocking)
@@ -299,7 +305,7 @@ impl KV4PRadio {
                         Ok(n) => {
                             let packets = parser.lock().unwrap().feed(&buf[..n]);
                             for pkt in &packets {
-                                eprintln!("[radio] PACKET: cmd=0x{:02x}, len={}", pkt.command, pkt.payload.len());
+
                                 let cmd = pkt.command;
                                 let payload = &pkt.payload;
                                 if cmd == DeviceCommand::Hello as u8 && payload.len() >= 9 {
@@ -346,7 +352,7 @@ impl KV4PRadio {
                                     }
                                 } else if cmd == 0x07 {
                                     // Cmd 0x07 - Rx audio from device (Opus encoded - legacy, unused in main firmware)
-                                    eprintln!("[radio] RX AUDIO: Opus (cmd=0x07, {} bytes)", payload.len());
+
                                     if !payload.is_empty() {
                                         if let Some(ref cb) = *rx_audio_cb.lock().unwrap() {
                                             cb(payload);
@@ -499,9 +505,11 @@ impl KV4PRadio {
     }
     
     pub fn set_squelch(&mut self, level: u8) -> Result<(), String> {
+        eprintln!("[radio] set_squelch: level={}", level);
         self.current_squelch.store(level, Ordering::SeqCst);
         let khz = self.frequency.load(Ordering::SeqCst);
         let tx_khz = self.tx_frequency.load(Ordering::SeqCst);
+        eprintln!("[radio] set_squelch: calling tune({}, {}, {})", khz, tx_khz, level);
         self.tune(khz, tx_khz, level, 1)
     }
     
