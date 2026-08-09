@@ -281,13 +281,12 @@ impl KV4PRadio {
 
     fn send(&mut self, state: HostDesiredState) -> Result<(), String> {
         let payload = state.to_bytes();
-
         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
         
-        // Send to write thread via channel (non-blocking)
+        // Send via serial I/O thread channel (non-blocking)
         if let Ok(guard) = self.write_tx.lock() {
             if let Some(ref tx) = *guard {
-                let _ = tx.send(frame);
+                let _ = tx.send(frame);  // Will be picked up in reader loop
             }
         }
         Ok(())
@@ -314,23 +313,19 @@ impl KV4PRadio {
             *guard = Some(tx);
         }
         
-        let serial_for_write = Arc::clone(&serial);
-        thread::spawn(move || {
-            while !write_shutdown.load(Ordering::SeqCst) {
-                if let Ok(frame) = rx.recv_timeout(Duration::from_millis(100)) {
-                    if let Some(ref mut sp) = *serial_for_write.lock().unwrap() {
-                        let _ = sp.write_all(&frame);
-                        let _ = sp.flush();
-                    }
-                }
-            }
-        });
-
-        // Reader thread
+        // Single serial I/O thread - handles both read and write to avoid lock contention
         let _reader_handle = thread::spawn(move || {
             let mut buf = [0u8; 256];
             while running.load(Ordering::SeqCst) {
+                // Lock serial for the entire iteration - read, then check for writes
                 if let Some(ref mut sp) = *serial.lock().unwrap() {
+                    // First, write any pending frames (non-blocking check)
+                    while let Ok(frame) = rx.try_recv() {
+                        let _ = sp.write_all(&frame);
+                        let _ = sp.flush();
+                    }
+                    
+                    // Then read data
                     match sp.read(&mut buf) {
                         Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
                             // Normal - no data available
@@ -391,16 +386,13 @@ impl KV4PRadio {
                                 } else if cmd == 0x09 {
                                     // COMMAND_WINDOW_UPDATE - device reports window size, we must ack
                                     if payload.len() >= 4 {
-                                        // Send ack back via write channel
+                                        // Send ack back directly while we hold the serial lock
                                         let ack = build_kv4p_packet(HostCommand::WindowAck, payload);
-                                        let write_tx = _write_tx.lock().unwrap();
-                                        if let Some(ref tx) = *write_tx {
-                                            let _ = tx.send(ack);
-                                        }
+                                        let _ = sp.write_all(&ack);
+                                        let _ = sp.flush();
                                     }
                                 } else if cmd == 0x07 {
                                     // Cmd 0x07 - Rx audio from device (Opus encoded - legacy, unused in main firmware)
-
                                     if !payload.is_empty() {
                                         if let Some(ref cb) = *rx_audio_cb.lock().unwrap() {
                                             cb(payload);
@@ -419,6 +411,11 @@ impl KV4PRadio {
                     }
                 } else {
                     thread::sleep(Duration::from_millis(1000));
+                }
+                
+                // Check shutdown flag
+                if write_shutdown.load(Ordering::SeqCst) {
+                    break;
                 }
             }
         });

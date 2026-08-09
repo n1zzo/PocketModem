@@ -225,8 +225,15 @@ impl DeviceState {
         }
     }
 
-    pub fn rssi_dbm(&self) -> f32 { -120.0 + (self.rssi as f32 * 2.0) }
-    pub fn smeter_bars(&self) -> u8 { (self.rssi * 9 / 255) as u8 }
+    /// Calculate RSSI in dBm from raw value (0-255)
+    /// When squelch is closed (no signal), RSSI reading is just noise floor.
+    /// When squelch is open (receiving signal), RSSI shows actual signal strength.
+    pub fn rssi_dbm(&self) -> f32 {
+        -120.0 + (self.rssi as f32 * 2.0)
+    }
+    pub fn smeter_bars(&self) -> u8 {
+        (self.rssi * 9 / 255) as u8
+    }
     pub fn is_squelched(&self) -> bool { (self.flags & DeviceStateFlags::SQUELCHED) != 0 }
 
     pub fn from_bytes(data: &[u8]) -> Option<Self> {

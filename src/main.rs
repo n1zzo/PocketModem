@@ -27,6 +27,13 @@ fn main() {
         return;
     }
     
+    // Check for raw command test mode (for debugging protocol issues)
+    if std::env::args().any(|a| a == "--test-raw") {
+        let port = std::env::args().nth(2).unwrap_or_else(|| "/dev/ttyUSB0".to_string());
+        test_raw(&port);
+        return;
+    }
+    
     // Parse command line args BEFORE GTK processes them
     let serial_device = std::env::args()
         .skip(1)  // Skip app name
@@ -985,39 +992,167 @@ fn test_squelch(port: &str) {
     for i in 0..20 {
         std::thread::sleep(Duration::from_millis(100));
         if let Some(state) = radio.device_state() {
-            println!("  Device state: squelch={}, rssi={}, flags={:#x}", 
-                     state.squelch, state.rssi, state.flags);
+            println!("  Initial state: applied_seq={}, squelch={}, rssi={}, flags={:#x}", 
+                     state.applied_sequence, state.squelch, state.rssi, state.flags);
             break;
         }
         if i == 19 { println!("  No device state received after 2s"); }
     }
 
     println!("\nSetting squelch levels:\n");
-    println!("  Set | Echo | Status");
-    println!("  ----|-------|--------");
+    println!("  Set | Echo | Seq | Status");
+    println!("  ----|------|-----|--------");
 
     for level in [0, 3, 6, 9] {
         radio.set_squelch(level).unwrap();
         
+        // Wait a bit for the command to be sent and processed
+        std::thread::sleep(Duration::from_millis(200));
+        
         // Poll for device state response
         let mut echoed: Option<u8> = None;
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(50));
+        let mut last_seq: Option<i32> = None;
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
             if let Some(state) = radio.device_state() {
+                last_seq = Some(state.applied_sequence);
                 if state.squelch != 255 {
                     echoed = Some(state.squelch);
-                    if echoed == Some(level) { break; }
                 }
+                // Also check if we got the expected squelch
+                if echoed == Some(level) { break; }
             }
         }
 
         match echoed {
-            Some(e) if e == level => println!("  {:3} | {:4} | OK", level, e),
-            Some(e) => println!("  {:3} | {:4} | MISMATCH (expected {})", level, e, level),
-            None => println!("  {:3} | -    | NO ECHO", level),
+            Some(e) if e == level => println!("  {:3} | {:4} | {:3} | OK", level, e, last_seq.unwrap_or(-1)),
+            Some(e) => println!("  {:3} | {:4} | {:3} | MISMATCH (expected {})", level, e, last_seq.unwrap_or(-1), level),
+            None => println!("  {:3} | -    | {:3} | NO ECHO", level, last_seq.unwrap_or(-1)),
         }
     }
 
     radio.close();
     println!("\nDone.");
+}
+
+/// Test raw command with explicit sequence
+fn test_raw(port: &str) {
+    use std::io::Read;
+    use std::io::Write;
+    
+    println!("=== Raw Command Test on {} ===\n", port);
+
+    // Open serial port directly
+    let mut sp = serialport::new(port, 115200)
+        .data_bits(serialport::DataBits::Eight)
+        .parity(serialport::Parity::None)
+        .stop_bits(serialport::StopBits::One)
+        .flow_control(serialport::FlowControl::None)
+        .timeout(Duration::from_millis(100))
+        .open()
+        .expect("Failed to open serial port");
+
+    // Clear buffer
+    let _ = sp.clear(serialport::ClearBuffer::Input);
+    
+    // Build a HostDesiredState packet manually with seq=100
+    let mut payload = Vec::new();
+    // sequence: i32 = 100
+    payload.extend_from_slice(&100i32.to_le_bytes());
+    // memory_id: i32 = -1
+    payload.extend_from_slice(&(-1i32).to_le_bytes());
+    // flags: u16 = RADIO_CONFIG_VALID | HIGH_POWER | RSSI_ENABLED | ENABLE_STATUS_REPORTS | RX_AUDIO_OPEN = 0x101d
+    payload.extend_from_slice(&0x101du16.to_le_bytes());
+    // bandwidth: u8 = 1
+    payload.push(1);
+    // freq_tx: f32 = 145.5
+    payload.extend_from_slice(&145.5f32.to_le_bytes());
+    // freq_rx: f32 = 145.5
+    payload.extend_from_slice(&145.5f32.to_le_bytes());
+    // ctcss_tx: u8 = 0
+    payload.push(0);
+    // squelch: u8 = 5
+    payload.push(5);
+    // ctcss_rx: u8 = 0
+    payload.push(0);
+    
+    println!("Payload (22 bytes): {:02x?}", payload);
+    
+    // Build KISS/KV4P frame
+    let kv4p_data: Vec<u8> = vec![
+        b'K', b'V', b'4', b'P',  // KV4P vendor prefix
+        0x01,                      // protocol version
+        0x0d,                      // COMMAND_HOST_DESIRED_STATE
+    ];
+    let mut kv4p_data = kv4p_data;
+    kv4p_data.extend_from_slice(&payload);
+    
+    // Build KISS frame
+    let mut frame = vec![0xc0, 0x06];  // FEND, SETHARDWARE
+    for b in &kv4p_data {
+        if *b == 0xc0 {
+            frame.push(0xdb); frame.push(0xdc);  // FESC, TFEND
+        } else if *b == 0xdb {
+            frame.push(0xdb); frame.push(0xdd);  // FESC, TFESC
+        } else {
+            frame.push(*b);
+        }
+    }
+    frame.push(0xc0);  // FEND
+    
+    println!("Frame ({} bytes): {:02x?}", frame.len(), frame);
+    
+    // Send
+    print!("Sending command with seq=100, squelch=5... ");
+    sp.write_all(&frame).expect("Write failed");
+    sp.flush().expect("Flush failed");
+    println!("OK");
+    
+    // Wait for response
+    println!("\nWaiting for DeviceState response...");
+    let mut buf = [0u8; 256];
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut found_device_state = false;
+    
+    while std::time::Instant::now() < deadline {
+        match sp.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                println!("Received {} bytes: {:02x?}", n, &buf[..n]);
+                
+                // Look for DeviceState (cmd 0x0B) in the response
+                for i in 0..n {
+                    if buf[i] == 0xc0 && i + 30 < n {
+                        // Check for KV4P frame
+                        if i + 10 < n && buf[i+1] == 0x06 && 
+                           buf[i+2] == b'K' && buf[i+3] == b'V' && 
+                           buf[i+4] == b'4' && buf[i+5] == b'P' {
+                            let cmd = buf[i+7];
+                            if cmd == 0x0B {  // DeviceState
+                                println!("Found DeviceState!");
+                                let payload_start = i + 8;
+                                if payload_start + 26 <= n {
+                                    let sq = buf[payload_start + 20];
+                                    let seq = i32::from_le_bytes([
+                                        buf[payload_start], buf[payload_start+1],
+                                        buf[payload_start+2], buf[payload_start+3]
+                                    ]);
+                                    println!("  applied_seq={}, squelch={}", seq, sq);
+                                    found_device_state = true;
+                                }
+                            } else if cmd == 0x06 {
+                                println!("Found HELLO");
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        if found_device_state { break; }
+    }
+    
+    if !found_device_state {
+        println!("No DeviceState found in response");
+    }
 }
