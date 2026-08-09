@@ -116,143 +116,167 @@ impl KV4PRadio {
     }
 
     pub fn open(&mut self) -> Result<Option<VersionInfo>, String> {
-        // Reset state for reconnection (in case we're reopening)
-        self.running.store(false, Ordering::SeqCst);
+        const MAX_ATTEMPTS: u32 = 5;
+        
+        for attempt in 1..=MAX_ATTEMPTS {
+            eprintln!("[radio] Connection attempt {}/{}", attempt, MAX_ATTEMPTS);
+            
+            if let Ok(version) = self.try_connect() {
+                // Threads already spawned in try_connect, just return
+                return Ok(version);
+            }
+            
+            eprintln!("[radio] Attempt {} failed, cleaning up...", attempt);
+            
+            // Clean up before next attempt
+            self.running.store(false, Ordering::SeqCst);
+            self.write_shutdown.store(true, Ordering::SeqCst);
+            
+            // Drop the sender to unblock the write thread
+            {
+                let mut guard = self.write_tx.lock().unwrap();
+                *guard = None;
+            }
+            thread::sleep(Duration::from_millis(200));
+            
+            // Close serial port
+            *self.serial.lock().unwrap() = None;
+            thread::sleep(Duration::from_millis(500));
+        }
+        
+        Err("Failed to connect to device after 5 attempts".to_string())
+    }
+    
+    /// Attempt a single connection to the device
+    /// Returns Ok(version) on success, Err(message) on failure
+    fn try_connect(&mut self) -> Result<Option<VersionInfo>, String> {
+        // Reset state for this attempt
+        self.running.store(true, Ordering::SeqCst);  // Enable reader thread to run
         self.write_shutdown.store(false, Ordering::SeqCst);
         *self.version.lock().unwrap() = None;
         *self.device_state.lock().unwrap() = None;
         *self.write_tx.lock().unwrap() = None;
         self.parser.lock().unwrap().reset();
         
+        // Open serial port
         let port = serialport::new(&self.config.port, self.config.baudrate)
             .data_bits(serialport::DataBits::Eight)
             .parity(serialport::Parity::None)
             .stop_bits(serialport::StopBits::One)
             .flow_control(serialport::FlowControl::None)
-            .dtr_on_open(false)
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_millis(100))
             .open()
             .map_err(|e| format!("Failed to open {}: {}", self.config.port, e))?;
 
         *self.serial.lock().unwrap() = Some(port);
-        self.parser.lock().unwrap().reset();
         
-        // Set read timeout to 100ms for non-blocking reads
+        // Clear input buffer
         if let Some(ref mut sp) = *self.serial.lock().unwrap() {
             let _ = sp.set_timeout(Duration::from_millis(100));
+            let _ = sp.clear(serialport::ClearBuffer::Input);
         }
-
-        // Clear DTR and RTS (set to low) and wait for device to settle
-        // The ESP32 needs DTR low to start sending boot data
-        {
-            let mut sp = self.serial.lock().unwrap();
-            if let Some(ref mut port) = *sp {
-                let _ = port.write_data_terminal_ready(false);  // DTR = low
-            }
-        }
-        thread::sleep(Duration::from_millis(200));
-        {
-            let mut sp = self.serial.lock().unwrap();
-            if let Some(ref mut port) = *sp {
-                let _ = port.write_request_to_send(false);      // RTS = low
-                let _ = port.clear(serialport::ClearBuffer::Input);
-            }
-        }
-
-        // Read boot data FIRST (reader thread not yet started, no race)
-        let boot_data = self.read_boot_data(5000)?;
         
-        let packets = self.parser.lock().unwrap().feed(&boot_data);
-        for pkt in &packets { 
-            self.dispatch(pkt); 
+        // CRITICAL: Spawn reader/writer threads BEFORE reset so we can receive HELLO
+        self.spawn_reader_thread();
+        
+        // Reset ESP32 via DTR/RTS toggle to trigger fresh boot
+        self.reset_esp32();
+        
+        // Wait for ESP32 to boot and send HELLO
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        
+        while std::time::Instant::now() < deadline {
+            if self.version.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
         }
-
+        
+        // If no HELLO yet, try sending initial state
         if self.version.lock().unwrap().is_none() {
-            self.send_initial_state()?;
-            thread::sleep(Duration::from_millis(500));
+            eprintln!("[radio] No HELLO yet, sending initial state...");
+            
+            let state = self.build_initial_state();
             if let Some(ref mut sp) = *self.serial.lock().unwrap() {
-                let mut buf = [0u8; 256];
-                while let Ok(n) = sp.read(&mut buf) {
-                    if n == 0 { break; }
-                    let packets = self.parser.lock().unwrap().feed(&buf[..n]);
-                    for pkt in &packets { self.dispatch(pkt); }
+                let _ = sp.write_all(&state);
+                let _ = sp.flush();
+            }
+            
+            // Wait for HELLO
+            for _ in 0..15 {
+                if self.version.lock().unwrap().is_some() {
+                    break;
                 }
+                thread::sleep(Duration::from_millis(200));
             }
         }
-
-        // If still no HELLO, try again
-        if self.version.lock().unwrap().is_none() {
-            self.send_initial_state()?;
-            thread::sleep(Duration::from_millis(500));
-            if let Some(ref mut sp) = *self.serial.lock().unwrap() {
-                let mut buf = [0u8; 256];
-                loop {
-                    match sp.read(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            let packets = self.parser.lock().unwrap().feed(&buf[..n]);
-                            for pkt in &packets { self.dispatch(pkt); }
-                        }
-                        _ => break,
-                    }
-                }
-            }
-        }
-
+        
         let version = self.version.lock().unwrap().clone();
         if version.as_ref().map(|v| v.is_valid).unwrap_or(false) {
-            // Spawn threads AFTER boot data read and dispatch
-            // Write thread needs to exist before we send anything
-            self.running.store(true, Ordering::SeqCst);
-            self.spawn_reader_thread();
+            eprintln!("[radio] Connected: fw=v{}, rf={:?}", 
+                     version.as_ref().unwrap().firmware_version, 
+                     version.as_ref().unwrap().rf_module_type);
             Ok(version)
         } else {
-            Err("Failed to connect to device".to_string())
+            Err("No HELLO received".to_string())
+        }
+    }
+    
+    /// Reset ESP32 via DTR/RTS signal toggle
+    /// Standard reset sequence: DTR low, RTS pulse, DTR high
+    fn reset_esp32(&mut self) {
+        if let Some(ref mut sp) = *self.serial.lock().unwrap() {
+            // ESP32 reset via DTR/RTS:
+            // DTR=0 triggers bootloader, RTS pulse resets
+            let _ = sp.write_data_terminal_ready(false);  // DTR = low
+            let _ = sp.write_request_to_send(true);       // RTS = high (reset)
+            thread::sleep(Duration::from_millis(50));
+            let _ = sp.write_request_to_send(false);      // RTS = low
+            thread::sleep(Duration::from_millis(100));
+            let _ = sp.write_data_terminal_ready(true);   // DTR = high
+            
+            // Clear any stale data from previous session
+            let _ = sp.clear(serialport::ClearBuffer::Input);
+            
+            eprintln!("[radio] ESP32 reset via DTR/RTS toggle");
+            
+            // Give ESP32 time to boot and send HELLO
+            thread::sleep(Duration::from_millis(1000));
         }
     }
 
-    fn read_boot_data(&mut self, timeout_ms: u64) -> Result<Vec<u8>, String> {
-        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-        let mut data = Vec::new();
+    /// Legacy method kept for compatibility - now uses write thread channel
+    fn send_initial_state(&mut self) -> Result<(), String> {
+        let data = self.build_initial_state();
         
-        if let Some(ref mut sp) = *self.serial.lock().unwrap() {
-            let mut buf = [0u8; 256];
-            while std::time::Instant::now() < deadline {
-                match sp.read(&mut buf) {
-                    Ok(0) => {
-                        // No data, wait a bit
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    Ok(n) => {
-                        data.extend_from_slice(&buf[..n]);
-                        // If we got a KISS frame marker, wait a bit more for binary data
-                        if data.contains(&0xC0) {
-                            thread::sleep(Duration::from_millis(200));
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock 
-                            || e.kind() == std::io::ErrorKind::TimedOut => {
-                        if data.contains(&0xC0) && data.len() > 400 {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(ref e) => { 
-                        eprintln!("[boot] Read error: {}", e);
-                        break; 
-                    }
-                }
+        // Send to write thread via channel
+        if let Ok(guard) = self.write_tx.lock() {
+            if let Some(ref tx) = *guard {
+                let _ = tx.send(data);
             }
         }
-        Ok(data)
+        Ok(())
     }
 
-    fn send_initial_state(&mut self) -> Result<(), String> {
+    /// Build the initial state packet bytes for direct serial write
+    fn build_initial_state(&self) -> Vec<u8> {
         let flags = (HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED |
                      HostStateFlags::RX_AUDIO_OPEN | HostStateFlags::ENABLE_STATUS_REPORTS).bits();
-        // Use current squelch level, not default (0)
         let squelch = self.current_squelch.load(Ordering::SeqCst);
-        let state = HostDesiredState { flags, squelch, ..Default::default() };
-        self.send(state)
+        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
+        let state = HostDesiredState {
+            sequence: 1,
+            memory_id: -1,
+            flags,
+            bandwidth: 1,
+            freq_tx: freq,
+            freq_rx: freq,
+            ctcss_tx: 0,
+            squelch,
+            ctcss_rx: 0,
+        };
+        let payload = state.to_bytes();
+        build_kv4p_packet(HostCommand::DesiredState, &payload)
     }
 
     fn send(&mut self, state: HostDesiredState) -> Result<(), String> {
@@ -339,6 +363,15 @@ impl KV4PRadio {
                                     v.is_valid = true;
                                     *version.lock().unwrap() = Some(v);
                                     if let Some(ref cb) = *connect_cb.lock().unwrap() { cb(true); }
+                                    // Also parse DeviceState from HELLO payload (starts at offset 17)
+                                    if payload.len() >= 43 {  // 17 (Version) + 26 (DeviceState)
+                                        if let Some(state) = DeviceState::from_bytes(&payload[17..]) {
+                                            *device_state.lock().unwrap() = Some(state.clone());
+                                            if let Some(ref cb) = *state_cb.lock().unwrap() { cb(&state); }
+                                            if let Some(ref cb) = *rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
+                                            if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
+                                        }
+                                    }
                                 } else if cmd == DeviceCommand::DeviceState as u8 {
                                     if let Some(state) = DeviceState::from_bytes(payload) {
                                         *device_state.lock().unwrap() = Some(state.clone());
@@ -396,6 +429,7 @@ impl KV4PRadio {
         let payload = &pkt.payload;
         match cmd as u8 {
             x if x == DeviceCommand::Hello as u8 => {
+                // HELLO payload: Version (17 bytes) + DeviceState (26 bytes) = 43 bytes
                 if payload.len() >= 9 {
                     let mut v = VersionInfo::new();
                     v.firmware_version = u16::from_le_bytes([payload[0], payload[1]]);
@@ -411,6 +445,15 @@ impl KV4PRadio {
                     }
                     v.is_valid = true;
                     *self.version.lock().unwrap() = Some(v);
+                }
+                // Also parse DeviceState from HELLO payload (starts at offset 17)
+                if payload.len() >= 43 {  // 17 (Version) + 26 (DeviceState)
+                    if let Some(state) = DeviceState::from_bytes(&payload[17..]) {
+                        *self.device_state.lock().unwrap() = Some(state.clone());
+                        if let Some(ref cb) = *self.state_cb.lock().unwrap() { cb(&state); }
+                        if let Some(ref cb) = *self.rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
+                        if let Some(ref cb) = *self.smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
+                    }
                 }
             }
             x if x == DeviceCommand::DeviceState as u8 => {
@@ -497,8 +540,9 @@ impl KV4PRadio {
         let freq_tx = tx_khz as f32 / 1000.0;
         let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
         
-        let mut flags = HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED |
-                         HostStateFlags::ENABLE_STATUS_REPORTS | HostStateFlags::RX_AUDIO_OPEN;
+        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::HIGH_POWER | 
+                         HostStateFlags::RSSI_ENABLED | HostStateFlags::ENABLE_STATUS_REPORTS | 
+                         HostStateFlags::RX_AUDIO_OPEN;
         if self.power_high.load(Ordering::SeqCst) { flags |= HostStateFlags::HIGH_POWER; }
         
         let state = HostDesiredState {
@@ -531,7 +575,8 @@ impl KV4PRadio {
     pub fn set_power(&mut self, high: bool) -> Result<(), String> {
         self.power_high.store(high, Ordering::SeqCst);
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::RSSI_ENABLED | HostStateFlags::ENABLE_STATUS_REPORTS;
+        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::RSSI_ENABLED | 
+                         HostStateFlags::ENABLE_STATUS_REPORTS;
         if high { flags |= HostStateFlags::HIGH_POWER; }
         let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
         let state = HostDesiredState {
@@ -589,7 +634,8 @@ impl KV4PRadio {
 
     pub fn enable_smeter(&mut self, enabled: bool) -> Result<(), String> {
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::HIGH_POWER | HostStateFlags::ENABLE_STATUS_REPORTS;
+        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::HIGH_POWER | 
+                         HostStateFlags::ENABLE_STATUS_REPORTS;
         if enabled { flags |= HostStateFlags::RSSI_ENABLED; }
         let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
         let state = HostDesiredState {
@@ -608,7 +654,8 @@ impl KV4PRadio {
 
     pub fn ptt_on(&mut self) -> Result<(), String> {
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED;
+        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::HIGH_POWER | 
+                         HostStateFlags::RSSI_ENABLED;
         if self.power_high.load(Ordering::SeqCst) { flags |= HostStateFlags::HIGH_POWER; }
         flags |= HostStateFlags::PTT_REQUESTED;
         let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
@@ -628,7 +675,8 @@ impl KV4PRadio {
 
     pub fn ptt_off(&mut self) -> Result<(), String> {
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED;
+        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::HIGH_POWER | 
+                         HostStateFlags::RSSI_ENABLED;
         if self.power_high.load(Ordering::SeqCst) { flags |= HostStateFlags::HIGH_POWER; }
         let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
         let state = HostDesiredState {
