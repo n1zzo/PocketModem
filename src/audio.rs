@@ -551,6 +551,11 @@ impl AudioManager {
         let playback_buf = Arc::clone(&self.playback_buf);
         let playback_buf_for_monitor = Arc::clone(&self.playback_buf);
         
+        // CRITICAL: Set enabled flag BEFORE spawning thread
+        // cpal stream starts asynchronously and callbacks may run immediately
+        self.rx_enabled.store(true, Ordering::SeqCst);
+        *self.state.lock().unwrap() = AudioState::Playing;
+        
         // Spawn playback loop
         thread::spawn(move || {
             if let Err(e) = Self::playback_loop(&config, rx_enabled.clone(), playback_buf) {
@@ -578,8 +583,6 @@ impl AudioManager {
             }
         });
         
-        self.rx_enabled.store(true, Ordering::SeqCst);
-        *self.state.lock().unwrap() = AudioState::Playing;
         Ok(())
     }
     
@@ -611,14 +614,6 @@ impl AudioManager {
     pub fn accumulate_rx_audio(&mut self, adpcm_data: &[u8]) {
         // Decode and buffer even before playback starts
         match self.decoder.decode_block(adpcm_data) {
-            Ok(mut pcm_samples) => {
-                // Apply de-emphasis if enabled
-                self.de_emphasis.lock().unwrap().process(&mut pcm_samples);
-                
-                // Store at native 16kHz (match Android app)
-                let mut buf = self.playback_buf.lock().unwrap();
-                buf.extend_from_slice(&pcm_samples);
-            }
             Ok(mut pcm_samples) => {
                 // Apply de-emphasis if enabled
                 self.de_emphasis.lock().unwrap().process(&mut pcm_samples);
@@ -726,6 +721,7 @@ impl AudioManager {
                             .map(|&s| (s as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16)
                             .collect();
                         
+                        // I16 format branch
                         dc_remover_clone.lock().unwrap().process(&mut samples);
                         volume_ramp_clone.lock().unwrap().process(&mut samples);
                         pre_emph_clone.lock().unwrap().process(&mut samples);
@@ -771,6 +767,7 @@ impl AudioManager {
                             })
                             .collect();
                         
+                        // F32 format branch
                         let mut dc = dc_remover_clone.lock().unwrap();
                         let mut samples = samples;
                         dc.process(&mut samples);
@@ -877,7 +874,8 @@ impl AudioManager {
                         let available = buf.len();
                         
                         // Resample from 16kHz mono to native_rate stereo
-                        let ratio = OUTPUT_SAMPLE_RATE as f64 / native_rate as f64;
+                        // For each stereo output frame at native_rate, we need native_rate/OUTPUT_SAMPLE_RATE source samples
+                        let ratio = native_rate as f64 / OUTPUT_SAMPLE_RATE as f64;
                         let last_sample = if available > 0 { buf[available - 1] } else { 0i16 };
                         
                         let mut src_pos = 0.0f64;
@@ -885,6 +883,7 @@ impl AudioManager {
                         
                         for i in 0..data.len() {
                             let ch = i % native_channels as usize;
+                            // Fetch new source sample only on first channel of each frame
                             if ch == 0 {
                                 let idx = src_pos as usize;
                                 if idx < available {
@@ -896,11 +895,10 @@ impl AudioManager {
                                 } else {
                                     prev_sample = (last_sample as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32);
                                 }
-                                data[i] = prev_sample as i16;
+                                // Advance source position ONCE per audio frame, not per channel
                                 src_pos += ratio;
-                            } else {
-                                data[i] = prev_sample as i16;
                             }
+                            data[i] = prev_sample as i16;
                         }
                         
                         let consumed = src_pos as usize;
@@ -926,7 +924,8 @@ impl AudioManager {
                         let available = buf.len();
                         
                         // Resample from 16kHz mono to native_rate stereo
-                        let ratio = OUTPUT_SAMPLE_RATE as f64 / native_rate as f64;
+                        // For each stereo output frame at native_rate, we need native_rate/OUTPUT_SAMPLE_RATE source samples
+                        let ratio = native_rate as f64 / OUTPUT_SAMPLE_RATE as f64;
                         let last_mono = if available > 0 { buf[available - 1] as f32 / 32768.0 } else { 0.0f32 };
                         
                         let mut src_pos = 0.0f64;
@@ -934,6 +933,7 @@ impl AudioManager {
                         
                         for i in 0..data.len() {
                             let ch = i % native_channels as usize;
+                            // Fetch new source sample only on first channel of each frame
                             if ch == 0 {
                                 let idx = src_pos as usize;
                                 if idx < available {
@@ -944,12 +944,10 @@ impl AudioManager {
                                 } else {
                                     prev_sample = last_mono * gain;
                                 }
-                                data[i] = prev_sample;
-                                
+                                // Advance source position ONCE per audio frame, not per channel
                                 src_pos += ratio;
-                            } else {
-                                data[i] = prev_sample;
                             }
+                            data[i] = prev_sample;
                         }
                         
                         let consumed = src_pos as usize;
@@ -965,7 +963,6 @@ impl AudioManager {
         }.map_err(|e| format!("Failed to build output stream: {}", e))?;
         
         stream.play().map_err(|e| format!("Failed to start stream: {}", e))?;
-        eprintln!("[audio] Playback started at {} Hz", OUTPUT_SAMPLE_RATE);
         
         while enabled2.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(50));

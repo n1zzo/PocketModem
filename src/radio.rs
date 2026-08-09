@@ -16,6 +16,7 @@ pub type StateCallback = Box<dyn Fn(&DeviceState) + Send + Sync>;
 pub type RssiCallback = Box<dyn Fn(f32) + Send + Sync>;
 pub type ConnectCallback = Box<dyn Fn(bool) + Send + Sync>;
 pub type RxAudioCallback = Box<dyn Fn(&[u8]) + Send + Sync>;
+pub type PhysPttCallback = Box<dyn Fn(bool) + Send + Sync>;
 
 /// Serial config
 #[derive(Debug, Clone)]
@@ -66,8 +67,10 @@ pub struct KV4PRadio {
     current_squelch: Arc<AtomicU8>,  // Current squelch level (0-9)
     smeter_cb: Arc<Mutex<Option<SmeterCallback>>>,
     state_cb: Arc<Mutex<Option<StateCallback>>>,
+    phys_ptt_cb: Arc<Mutex<Option<PhysPttCallback>>>,  // Physical PTT callback
     rssi_cb: Arc<Mutex<Option<RssiCallback>>>,
     connect_cb: Arc<Mutex<Option<ConnectCallback>>>,
+    last_phys_ptt: Arc<AtomicBool>,  // Track previous PTT state
     rx_audio_cb: Arc<Mutex<Option<RxAudioCallback>>>,  // Callback for received audio
 }
 
@@ -88,8 +91,10 @@ impl KV4PRadio {
             current_squelch: Arc::new(AtomicU8::new(4)),
             smeter_cb: Arc::new(Mutex::new(None)),
             state_cb: Arc::new(Mutex::new(None)),
+            phys_ptt_cb: Arc::new(Mutex::new(None)),
             rssi_cb: Arc::new(Mutex::new(None)),
             connect_cb: Arc::new(Mutex::new(None)),
+            last_phys_ptt: Arc::new(AtomicBool::new(false)),
             rx_audio_cb: Arc::new(Mutex::new(None)),
             write_shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -113,6 +118,11 @@ impl KV4PRadio {
 
     pub fn on_rx_audio<F>(&mut self, cb: F) where F: Fn(&[u8]) + Send + Sync + 'static {
         *self.rx_audio_cb.lock().unwrap() = Some(Box::new(cb));
+    }
+    
+    /// Register callback for physical PTT button changes
+    pub fn on_phys_ptt<F>(&mut self, cb: F) where F: Fn(bool) + Send + Sync + 'static {
+        *self.phys_ptt_cb.lock().unwrap() = Some(Box::new(cb));
     }
 
     pub fn open(&mut self) -> Result<Option<VersionInfo>, String> {
@@ -305,6 +315,8 @@ impl KV4PRadio {
         let rssi_cb = Arc::clone(&self.rssi_cb);
         let connect_cb = Arc::clone(&self.connect_cb);
         let rx_audio_cb = Arc::clone(&self.rx_audio_cb);
+        let phys_ptt_cb = Arc::clone(&self.phys_ptt_cb);
+        let last_phys_ptt = Arc::clone(&self.last_phys_ptt);
 
         // Spawn write thread
         let (tx, rx) = mpsc::channel();
@@ -373,6 +385,13 @@ impl KV4PRadio {
                                         if let Some(ref cb) = *state_cb.lock().unwrap() { cb(&state); }
                                         if let Some(ref cb) = *rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
                                         if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
+                                        // Check physical PTT state change
+                                        let phys_ptt = state.phys_ptt_down();
+                                        if phys_ptt != last_phys_ptt.load(Ordering::SeqCst) {
+                                            last_phys_ptt.store(phys_ptt, Ordering::SeqCst);
+                                            if let Some(ref cb) = *phys_ptt_cb.lock().unwrap() { cb(phys_ptt); }
+                                            eprintln!("[radio] Phys PTT: {}", if phys_ptt { "DOWN" } else { "UP" });
+                                        }
                                     }
                                 } else if cmd == DeviceCommand::SmeterReport as u8 && !payload.is_empty() {
                                     if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(payload[0] as i32); }
@@ -652,7 +671,8 @@ impl KV4PRadio {
     pub fn ptt_on(&mut self) -> Result<(), String> {
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
         let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::HIGH_POWER | 
-                         HostStateFlags::RSSI_ENABLED;
+                         HostStateFlags::RSSI_ENABLED | HostStateFlags::TX_ALLOWED |
+                         HostStateFlags::ENABLE_STATUS_REPORTS;
         if self.power_high.load(Ordering::SeqCst) { flags |= HostStateFlags::HIGH_POWER; }
         flags |= HostStateFlags::PTT_REQUESTED;
         let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
@@ -672,14 +692,14 @@ impl KV4PRadio {
 
     pub fn ptt_off(&mut self) -> Result<(), String> {
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::HIGH_POWER | 
-                         HostStateFlags::RSSI_ENABLED;
+        // Keep ENABLE_STATUS_REPORTS so we continue receiving DeviceState updates
+        let mut flags = HostStateFlags::RSSI_ENABLED | HostStateFlags::ENABLE_STATUS_REPORTS;
         if self.power_high.load(Ordering::SeqCst) { flags |= HostStateFlags::HIGH_POWER; }
         let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
         let state = HostDesiredState {
             sequence: seq as i32,
             memory_id: -1,
-            flags: flags.bits(),
+            flags: flags.bits(),  // TX_ALLOWED (bit 11) not set = TX off
             bandwidth: 1,
             freq_tx: freq,
             freq_rx: freq,
@@ -693,13 +713,12 @@ impl KV4PRadio {
     /// Send Opus-encoded audio frame to the radio for TX
     /// 
     /// Called by the audio capture system when transmitting.
-    pub fn send_audio(&mut self, opus_data: &[u8]) -> Result<(), String> {
+    pub fn send_audio(&mut self, adpcm_data: &[u8]) -> Result<(), String> {
         if !self.running.load(Ordering::SeqCst) {
             return Err("Radio not connected".to_string());
         }
         
-        let frame = build_tx_audio_packet(opus_data);
-        
+        let frame = build_tx_audio_packet(adpcm_data);
         // Send to write thread via channel
         if let Ok(guard) = self.write_tx.lock() {
             if let Some(ref tx) = *guard {

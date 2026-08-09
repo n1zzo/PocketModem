@@ -35,23 +35,22 @@ fn main() {
     }
     
     // Parse command line args BEFORE GTK processes them
-    let serial_device = std::env::args()
-        .skip(1)  // Skip app name
-        .find(|arg| !arg.starts_with('-'))  // Find first non-option arg
-        .unwrap_or_else(|| {
-            // Auto-detect if no device specified
-            if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.path().to_str() {
-                        if name.contains("10c4") || name.contains("CP2102") || name.contains("Silicon_Labs") {
-                            eprintln!("[pocket-modem] Found device: {}", name);
-                            return name.to_string();
-                        }
+    // Note: We use POCKET_MODEM_DEVICE env var instead of command line args
+    // to avoid GTK interpreting the serial device as a file to open
+    let serial_device = std::env::var("POCKET_MODEM_DEVICE").ok().unwrap_or_else(|| {
+        // Auto-detect if no env var set
+        if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.path().to_str() {
+                    if name.contains("10c4") || name.contains("CP2102") || name.contains("Silicon_Labs") {
+                        eprintln!("[pocket-modem] Found device: {}", name);
+                        return name.to_string();
                     }
                 }
             }
-            "/dev/ttyUSB0".to_string()
-        });
+        }
+        "/dev/ttyUSB0".to_string()
+    });
 
     eprintln!("[pocket-modem] Using: {}", serial_device);
 
@@ -129,6 +128,38 @@ fn main() {
         });
     }
     
+    // Connect physical PTT button on radio hardware
+    {
+        let radio2 = Arc::clone(&radio);
+        let audio = Arc::clone(&audio_manager);
+        {
+            let mut r = radio.lock().unwrap();
+            r.on_phys_ptt(move |pressed| {
+                eprintln!("[main] Phys PTT: {}", if pressed { "pressed" } else { "released" });
+                // Call ptt_on/ptt_off for firmware control FIRST
+                if let Ok(mut r) = radio2.try_lock() {
+                    if pressed {
+                        let _ = r.ptt_on();
+                        eprintln!("[main] ptt_on called");
+                    } else {
+                        let _ = r.ptt_off();
+                        eprintln!("[main] ptt_off called");
+                    }
+                }
+                // Handle audio capture
+                if let Ok(mut a) = audio.lock() {
+                    if pressed {
+                        // Stop RX playback when TX starts
+                        a.stop_playback();
+                        let _ = a.start_capture();
+                    } else {
+                        let _ = a.stop_capture();
+                    }
+                }
+            });
+        }
+    }
+    
     eprintln!("[main] Radio lock released, starting app...");
     
     let app = adw::Application::builder()
@@ -136,16 +167,16 @@ fn main() {
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     
-    // Override the open handler to prevent GTK from trying to open serial device as file
-    app.connect_open(|app, _files, _hint| {
-        // Just activate the app without opening any files
-        app.activate();
+    // Register empty open handler to prevent GTK from exiting when command line args
+    // are passed - GTK default is to exit on open, we want to ignore those args
+    app.connect_open(|_app, _files, _hint| {
+        // Empty handler - ignore file open requests
     });
-
+    
     // Clone for shutdown handler before move into activate
     let audio_for_shutdown = Arc::clone(&audio_manager);
     let gps_manager_activate = Arc::clone(&gps_manager);
-
+    
     app.connect_activate(move |app| {
         create_ui(app, &radio_clone, &audio_manager, &gps_manager_activate, connected);
     });
@@ -632,25 +663,39 @@ fn create_ui(
     let audio_ptt_press = Arc::clone(audio);
     let audio_ptt_release = Arc::clone(audio);
     let gesture = gtk4::GestureClick::new();
-    gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    // Allow any button (0) for touch events
+    gesture.set_button(0);
+    gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
     gesture.connect_pressed(move |_, _, _, _| {
         // Start PTT
         if let Ok(mut r) = radio_ptt_press.lock() {
-            let _ = r.ptt_on();
+            if let Err(e) = r.ptt_on() {
+                eprintln!("[main] ptt_on error: {}", e);
+            } else {
+                eprintln!("[main] ptt_on success");
+            }
         }
         // Start audio capture for TX
         if let Ok(mut a) = audio_ptt_press.lock() {
-            let _ = a.start_capture();
+            if let Err(e) = a.start_capture() {
+                eprintln!("[main] start_capture error: {}", e);
+            } else {
+                eprintln!("[main] start_capture success");
+            }
         }
     });
     gesture.connect_released(move |_, _, _, _| {
-        // Stop audio capture first
+        // Stop PTT first - signal firmware to stop TX
+        if let Ok(mut r) = radio_ptt_release.lock() {
+            if let Err(e) = r.ptt_off() {
+                eprintln!("[main] ptt_off error: {}", e);
+            } else {
+                eprintln!("[main] ptt_off success");
+            }
+        }
+        // Stop audio capture
         if let Ok(mut a) = audio_ptt_release.lock() {
             a.stop_capture();
-        }
-        // Stop PTT
-        if let Ok(mut r) = radio_ptt_release.lock() {
-            let _ = r.ptt_off();
         }
     });
     ptt_btn.add_controller(gesture);

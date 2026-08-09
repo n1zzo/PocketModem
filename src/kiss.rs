@@ -224,7 +224,17 @@ impl DeviceState {
             radio_module_status: '?', mode: 0, last_error: 0, rssi: 0,
         }
     }
-
+    
+    /// Check if physical PTT button on radio is pressed
+    pub fn phys_ptt_down(&self) -> bool {
+        (self.flags & DeviceStateFlags::PHYS_PTT_DOWN) != 0
+    }
+    
+    /// Check if TX is currently active
+    pub fn tx_active(&self) -> bool {
+        (self.flags & DeviceStateFlags::TX_ACTIVE) != 0
+    }
+    
     /// Calculate RSSI in dBm from raw value (0-255)
     /// When squelch is closed (no signal), RSSI reading is just noise floor.
     /// When squelch is open (receiving signal), RSSI shows actual signal strength.
