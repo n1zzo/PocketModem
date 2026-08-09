@@ -1,4 +1,7 @@
 //! KV4P HT Radio driver - native Rust implementation
+//!
+//! On connect, we seed current_squelch from the firmware's reported squelch
+//! so we don't override the radio's existing configuration with hardcoded defaults.
 
 use crate::kiss::{
     build_kv4p_packet, build_tx_audio_packet, DeviceCommand, 
@@ -64,7 +67,7 @@ pub struct KV4PRadio {
     frequency: Arc<AtomicU32>,
     tx_frequency: Arc<AtomicU32>,
     power_high: Arc<AtomicBool>,
-    current_squelch: Arc<AtomicU8>,  // Current squelch level (0-9)
+    current_squelch: Arc<AtomicU8>,  // Desired squelch level (0-9)
     smeter_cb: Arc<Mutex<Option<SmeterCallback>>>,
     state_cb: Arc<Mutex<Option<StateCallback>>>,
     phys_ptt_cb: Arc<Mutex<Option<PhysPttCallback>>>,  // Physical PTT callback
@@ -88,7 +91,7 @@ impl KV4PRadio {
             frequency: Arc::new(AtomicU32::new(145500)),
             tx_frequency: Arc::new(AtomicU32::new(145500)),
             power_high: Arc::new(AtomicBool::new(true)),
-            current_squelch: Arc::new(AtomicU8::new(4)),
+            current_squelch: Arc::new(AtomicU8::new(4)),  // Default, will be seeded from firmware
             smeter_cb: Arc::new(Mutex::new(None)),
             state_cb: Arc::new(Mutex::new(None)),
             phys_ptt_cb: Arc::new(Mutex::new(None)),
@@ -97,6 +100,16 @@ impl KV4PRadio {
             last_phys_ptt: Arc::new(AtomicBool::new(false)),
             rx_audio_cb: Arc::new(Mutex::new(None)),
             write_shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    
+    /// Seed current_squelch from firmware's DeviceState if we haven't done so yet
+    fn seed_squelch_from_firmware(&self, state: &DeviceState) {
+        // If firmware has valid config and we haven't received state yet, seed squelch
+        if (state.flags & 0x01) != 0 && self.device_state.lock().unwrap().is_none() {
+            let old = self.current_squelch.load(Ordering::SeqCst);
+            self.current_squelch.store(state.squelch, Ordering::SeqCst);
+            eprintln!("[radio] Seeded squelch from firmware: {} (was {})", state.squelch, old);
         }
     }
 
@@ -123,6 +136,11 @@ impl KV4PRadio {
     /// Register callback for physical PTT button changes
     pub fn on_phys_ptt<F>(&mut self, cb: F) where F: Fn(bool) + Send + Sync + 'static {
         *self.phys_ptt_cb.lock().unwrap() = Some(Box::new(cb));
+    }
+    
+    /// Get the current squelch level (seeded from firmware on connect)
+    pub fn get_squelch(&self) -> u8 {
+        self.current_squelch.load(Ordering::SeqCst)
     }
 
     pub fn open(&mut self) -> Result<Option<VersionInfo>, String> {
@@ -317,6 +335,7 @@ impl KV4PRadio {
         let rx_audio_cb = Arc::clone(&self.rx_audio_cb);
         let phys_ptt_cb = Arc::clone(&self.phys_ptt_cb);
         let last_phys_ptt = Arc::clone(&self.last_phys_ptt);
+        let current_squelch = Arc::clone(&self.current_squelch);  // For squelch seeding
 
         // Spawn write thread
         let (tx, rx) = mpsc::channel();
@@ -373,6 +392,12 @@ impl KV4PRadio {
                                     // Also parse DeviceState from HELLO payload (starts at offset 17)
                                     if payload.len() >= 43 {  // 17 (Version) + 26 (DeviceState)
                                         if let Some(state) = DeviceState::from_bytes(&payload[17..]) {
+                                            // Seed squelch from firmware if this is first state
+                                            if (state.flags & 0x01) != 0 && device_state.lock().unwrap().is_none() {
+                                                let old = current_squelch.load(Ordering::SeqCst);
+                                                current_squelch.store(state.squelch, Ordering::SeqCst);
+                                                eprintln!("[radio] Seeded squelch from firmware: {} (was {})", state.squelch, old);
+                                            }
                                             *device_state.lock().unwrap() = Some(state.clone());
                                             if let Some(ref cb) = *state_cb.lock().unwrap() { cb(&state); }
                                             if let Some(ref cb) = *rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
@@ -381,6 +406,12 @@ impl KV4PRadio {
                                     }
                                 } else if cmd == DeviceCommand::DeviceState as u8 {
                                     if let Some(state) = DeviceState::from_bytes(payload) {
+                                        // Seed squelch from firmware if this is first state
+                                        if (state.flags & 0x01) != 0 && device_state.lock().unwrap().is_none() {
+                                            let old = current_squelch.load(Ordering::SeqCst);
+                                            current_squelch.store(state.squelch, Ordering::SeqCst);
+                                            eprintln!("[radio] Seeded squelch from firmware: {} (was {})", state.squelch, old);
+                                        }
                                         *device_state.lock().unwrap() = Some(state.clone());
                                         if let Some(ref cb) = *state_cb.lock().unwrap() { cb(&state); }
                                         if let Some(ref cb) = *rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
@@ -465,6 +496,7 @@ impl KV4PRadio {
                 // Also parse DeviceState from HELLO payload (starts at offset 17)
                 if payload.len() >= 43 {  // 17 (Version) + 26 (DeviceState)
                     if let Some(state) = DeviceState::from_bytes(&payload[17..]) {
+                        self.seed_squelch_from_firmware(&state);
                         *self.device_state.lock().unwrap() = Some(state.clone());
                         if let Some(ref cb) = *self.state_cb.lock().unwrap() { cb(&state); }
                         if let Some(ref cb) = *self.rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
@@ -474,6 +506,7 @@ impl KV4PRadio {
             }
             x if x == DeviceCommand::DeviceState as u8 => {
                 if let Some(state) = DeviceState::from_bytes(payload) {
+                    self.seed_squelch_from_firmware(&state);
                     *self.device_state.lock().unwrap() = Some(state.clone());
                     if let Some(ref cb) = *self.state_cb.lock().unwrap() { cb(&state); }
                     if let Some(ref cb) = *self.rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }

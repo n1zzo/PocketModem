@@ -69,7 +69,10 @@ fn main() {
                 if let Some(v) = version {
                     eprintln!("[pocket-modem] Connected: fw=v{}, rf={:?}", 
                              v.firmware_version, v.rf_module_type);
-                    let _ = radio.tune(145500, 145500, 4, 1);
+                    // Use seeded squelch from firmware, don't override with hardcoded value
+                    let squelch = radio.get_squelch();
+                    eprintln!("[pocket-modem] Using seeded squelch: {}", squelch);
+                    let _ = radio.tune(145500, 145500, squelch, 1);
                     eprintln!("[pocket-modem] Tuned to 145.500 MHz");
                     true
                 } else {
@@ -104,6 +107,18 @@ fn main() {
         hard_limit: 0.95,
     };
     let audio_manager = Arc::new(Mutex::new(AudioManager::new(audio_config)));
+    
+    // Connect audio manager to radio state updates (for squelch tracking)
+    {
+        let audio = Arc::clone(&audio_manager);
+        let mut r = radio.lock().unwrap();
+        r.on_state(move |state| {
+            if let Ok(mut a) = audio.lock() {
+                let squelch_open = !state.is_squelched();
+                a.set_squelch_open(squelch_open);
+            }
+        });
+    }
     
     // Connect audio TX to radio (ADPCM frames)
     {
@@ -154,6 +169,8 @@ fn main() {
                         let _ = a.start_capture();
                     } else {
                         let _ = a.stop_capture();
+                        // Re-enable RX playback after TX stops
+                        let _ = a.start_playback();
                     }
                 }
             });
@@ -677,6 +694,8 @@ fn create_ui(
         }
         // Start audio capture for TX
         if let Ok(mut a) = audio_ptt_press.lock() {
+            // Stop RX playback when TX starts
+            a.stop_playback();
             if let Err(e) = a.start_capture() {
                 eprintln!("[main] start_capture error: {}", e);
             } else {
@@ -693,9 +712,10 @@ fn create_ui(
                 eprintln!("[main] ptt_off success");
             }
         }
-        // Stop audio capture
+        // Stop audio capture and re-enable RX playback
         if let Ok(mut a) = audio_ptt_release.lock() {
             a.stop_capture();
+            let _ = a.start_playback();
         }
     });
     ptt_btn.add_controller(gesture);
