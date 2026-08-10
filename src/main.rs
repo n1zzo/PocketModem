@@ -59,9 +59,6 @@ fn main() {
                     let _ = radio.tune_freq(145500, 145500);
                     // Open audio after tuning - like Android's openFirmwareAudio()
                     let _ = radio.open_audio();
-                    
-                    // TEST: set squelch to 8 (slider right = strict)
-                    let _ = radio.set_squelch(8);
                     eprintln!("[pocket-modem] Tuned to 145.500 MHz");
                     true
                 } else {
