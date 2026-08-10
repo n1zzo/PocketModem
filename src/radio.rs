@@ -67,7 +67,7 @@ pub struct KV4PRadio {
     frequency: Arc<AtomicU32>,
     tx_frequency: Arc<AtomicU32>,
     power_high: Arc<AtomicBool>,
-    current_squelch: Arc<AtomicU8>,  // Desired squelch level (0-9)
+    current_squelch: Arc<AtomicU8>,  // Desired squelch level (0-9) - mirrors Android's desiredState.squelch
     smeter_cb: Arc<Mutex<Option<SmeterCallback>>>,
     state_cb: Arc<Mutex<Option<StateCallback>>>,
     phys_ptt_cb: Arc<Mutex<Option<PhysPttCallback>>>,  // Physical PTT callback
@@ -75,6 +75,9 @@ pub struct KV4PRadio {
     connect_cb: Arc<Mutex<Option<ConnectCallback>>>,
     last_phys_ptt: Arc<AtomicBool>,  // Track previous PTT state
     rx_audio_cb: Arc<Mutex<Option<RxAudioCallback>>>,  // Callback for received audio
+    // State tracking (mirrors Android's RadioModuleController)
+    desired_state_sent: Arc<Mutex<Option<HostDesiredState>>>,  // Last state actually sent to device
+    squelch_user_set: Arc<AtomicBool>,  // Track if user has explicitly set squelch
 }
 
 impl KV4PRadio {
@@ -91,7 +94,7 @@ impl KV4PRadio {
             frequency: Arc::new(AtomicU32::new(145500)),
             tx_frequency: Arc::new(AtomicU32::new(145500)),
             power_high: Arc::new(AtomicBool::new(true)),
-            current_squelch: Arc::new(AtomicU8::new(4)),  // Default, will be seeded from firmware
+            current_squelch: Arc::new(AtomicU8::new(0)),  // Default matches Android (0 = lowest threshold)
             smeter_cb: Arc::new(Mutex::new(None)),
             state_cb: Arc::new(Mutex::new(None)),
             phys_ptt_cb: Arc::new(Mutex::new(None)),
@@ -100,18 +103,14 @@ impl KV4PRadio {
             last_phys_ptt: Arc::new(AtomicBool::new(false)),
             rx_audio_cb: Arc::new(Mutex::new(None)),
             write_shutdown: Arc::new(AtomicBool::new(false)),
+            desired_state_sent: Arc::new(Mutex::new(None)),
+            squelch_user_set: Arc::new(AtomicBool::new(false)),
         }
     }
     
-    /// Seed current_squelch from firmware's DeviceState if we haven't done so yet
-    fn seed_squelch_from_firmware(&self, state: &DeviceState) {
-        // If firmware has valid config and we haven't received state yet, seed squelch
-        if (state.flags & 0x01) != 0 && self.device_state.lock().unwrap().is_none() {
-            let old = self.current_squelch.load(Ordering::SeqCst);
-            self.current_squelch.store(state.squelch, Ordering::SeqCst);
-            eprintln!("[radio] Seeded squelch from firmware: {} (was {})", state.squelch, old);
-        }
-    }
+    // Note: We intentionally do NOT seed squelch from firmware.
+    // Android app keeps desiredState.squelch at 0 until user changes it via slider.
+    // This means desired squelch is independent of what firmware reports.
 
     pub fn on_smeter<F>(&mut self, cb: F) where F: Fn(i32) + Send + Sync + 'static {
         *self.smeter_cb.lock().unwrap() = Some(Box::new(cb));
@@ -138,9 +137,128 @@ impl KV4PRadio {
         *self.phys_ptt_cb.lock().unwrap() = Some(Box::new(cb));
     }
     
-    /// Get the current squelch level (seeded from firmware on connect)
+    /// Get the desired squelch level (mirrors Android's getDesiredSquelch())
     pub fn get_squelch(&self) -> u8 {
         self.current_squelch.load(Ordering::SeqCst)
+    }
+    
+    /// Check if device state is in sync with our desired state
+    fn is_state_in_sync(&self) -> bool {
+        let dev_state = self.device_state.lock().unwrap();
+        let last_sent = self.desired_state_sent.lock().unwrap();
+        
+        if let (Some(ds), Some(ls)) = (dev_state.as_ref(), last_sent.as_ref()) {
+            // Check error code
+            if ds.last_error != 0 {
+                return false;
+            }
+            // Check sequence matches
+            if ds.applied_sequence != ls.sequence {
+                return false;
+            }
+            // Check flags (mask out session-specific flags)
+            let desired_mask = HostStateFlags::RADIO_CONFIG_VALID.bits() as u16 | 
+                               HostStateFlags::HIGH_POWER.bits() as u16 | 
+                               HostStateFlags::RSSI_ENABLED.bits() as u16 | 
+                               HostStateFlags::ENABLE_STATUS_REPORTS.bits() as u16 |
+                               HostStateFlags::TX_ALLOWED.bits() as u16;
+            if (ds.flags & desired_mask) != (ls.flags & desired_mask) {
+                return false;
+            }
+            // If radio config valid, check bandwidth, freq, squelch, tones
+            if (ls.flags & HostStateFlags::RADIO_CONFIG_VALID.bits() as u16) != 0 {
+                return ds.bandwidth == ls.bandwidth &&
+                       (ds.squelch as i32 - ls.squelch as i32).abs() <= 1 &&  // Allow ±1 for timing
+                       ds.ctcss_tx == ls.ctcss_tx &&
+                       ds.ctcss_rx == ls.ctcss_rx;
+            }
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Build a HostDesiredState from current settings (mirrors Android's desiredState construction)
+    /// Note: For startup/session state, use build_desired_state_with_firmware_squelch()
+    /// instead, to avoid overriding firmware's squelch before user sets it.
+    fn build_desired_state(&self) -> HostDesiredState {
+        self.build_desired_state_with_firmware_squelch()
+    }
+    
+    /// Send desired state if it changed (mirrors Android's sendDesiredStateIfChanged)
+    fn send_state_if_changed(&mut self) -> Result<(), String> {
+        let new_state = self.build_desired_state();
+        let last_sent = self.desired_state_sent.lock().unwrap();
+        
+        // Only send if state actually changed
+        let needs_send = match last_sent.as_ref() {
+            Some(ls) => ls != &new_state,
+            None => true,
+        };
+        if needs_send {
+            drop(last_sent);  // Release lock before send
+            return self.send_state(&new_state);
+        }
+        Ok(())
+    }
+    
+    /// Build desired state, using firmware's squelch if user hasn't set it yet
+    /// (Mirrors Android's behavior: desiredState.squelch starts at 0 but firmware
+    /// maintains its own squelch until user changes it)
+    fn build_desired_state_with_firmware_squelch(&self) -> HostDesiredState {
+        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
+        let mut flags = HostStateFlags::RADIO_CONFIG_VALID.bits() |
+                       HostStateFlags::HIGH_POWER.bits() |
+                       HostStateFlags::RSSI_ENABLED.bits() |
+                       HostStateFlags::ENABLE_STATUS_REPORTS.bits();
+        if !self.power_high.load(Ordering::SeqCst) {
+            flags &= !HostStateFlags::HIGH_POWER.bits();
+        }
+        let seq = self.sequence.load(Ordering::SeqCst);
+        
+        // If user hasn't set squelch, use firmware's current squelch
+        // This prevents us from overriding firmware's squelch on startup
+        let squelch = if self.squelch_user_set.load(Ordering::SeqCst) {
+            self.current_squelch.load(Ordering::SeqCst)
+        } else {
+            self.device_state.lock().unwrap()
+                .as_ref()
+                .map(|s| s.squelch)
+                .unwrap_or(self.current_squelch.load(Ordering::SeqCst))
+        };
+        
+        HostDesiredState {
+            sequence: seq as i32,
+            memory_id: -1,
+            flags,
+            bandwidth: 1,
+            freq_tx: freq,
+            freq_rx: freq,
+            ctcss_tx: 0,
+            squelch,
+            ctcss_rx: 0,
+        }
+    }
+    
+    /// Send desired state to device (increments sequence)
+    fn send_state(&mut self, state: &HostDesiredState) -> Result<(), String> {
+        let mut s = state.clone();
+        s.sequence = self.sequence.fetch_add(1, Ordering::SeqCst) as i32;
+        
+        let payload = s.to_bytes();
+        let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
+        
+        // Send via write thread channel
+        if let Ok(guard) = self.write_tx.lock() {
+            if let Some(ref tx) = *guard {
+                let _ = tx.send(frame);
+            }
+        }
+        
+        // Track what we sent
+        *self.desired_state_sent.lock().unwrap() = Some(s);
+        
+        Ok(())
     }
 
     pub fn open(&mut self) -> Result<Option<VersionInfo>, String> {
@@ -288,8 +406,10 @@ impl KV4PRadio {
 
     /// Build the initial state packet bytes for direct serial write
     fn build_initial_state(&self) -> Vec<u8> {
+        // Android app does NOT include RX_AUDIO_OPEN in initial state.
+        // It sends RX_AUDIO_OPEN later via openFirmwareAudio() after tuning.
         let flags = (HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED |
-                     HostStateFlags::RX_AUDIO_OPEN | HostStateFlags::ENABLE_STATUS_REPORTS).bits();
+                     HostStateFlags::ENABLE_STATUS_REPORTS).bits();
         let squelch = self.current_squelch.load(Ordering::SeqCst);
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
         let state = HostDesiredState {
@@ -305,19 +425,6 @@ impl KV4PRadio {
         };
         let payload = state.to_bytes();
         build_kv4p_packet(HostCommand::DesiredState, &payload)
-    }
-
-    fn send(&mut self, state: HostDesiredState) -> Result<(), String> {
-        let payload = state.to_bytes();
-        let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
-        
-        // Send via serial I/O thread channel (non-blocking)
-        if let Ok(guard) = self.write_tx.lock() {
-            if let Some(ref tx) = *guard {
-                let _ = tx.send(frame);  // Will be picked up in reader loop
-            }
-        }
-        Ok(())
     }
 
     fn spawn_reader_thread(&mut self) {
@@ -392,13 +499,8 @@ impl KV4PRadio {
                                     // Also parse DeviceState from HELLO payload (starts at offset 17)
                                     if payload.len() >= 43 {  // 17 (Version) + 26 (DeviceState)
                                         if let Some(state) = DeviceState::from_bytes(&payload[17..]) {
-                                            // Seed squelch from firmware if this is first state
-                                            if (state.flags & 0x01) != 0 && device_state.lock().unwrap().is_none() {
-                                                let old = current_squelch.load(Ordering::SeqCst);
-                                                current_squelch.store(state.squelch, Ordering::SeqCst);
-                                                eprintln!("[radio] Seeded squelch from firmware: {} (was {})", state.squelch, old);
-                                            }
                                             *device_state.lock().unwrap() = Some(state.clone());
+
                                             if let Some(ref cb) = *state_cb.lock().unwrap() { cb(&state); }
                                             if let Some(ref cb) = *rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
                                             if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
@@ -406,13 +508,9 @@ impl KV4PRadio {
                                     }
                                 } else if cmd == DeviceCommand::DeviceState as u8 {
                                     if let Some(state) = DeviceState::from_bytes(payload) {
-                                        // Seed squelch from firmware if this is first state
-                                        if (state.flags & 0x01) != 0 && device_state.lock().unwrap().is_none() {
-                                            let old = current_squelch.load(Ordering::SeqCst);
-                                            current_squelch.store(state.squelch, Ordering::SeqCst);
-                                            eprintln!("[radio] Seeded squelch from firmware: {} (was {})", state.squelch, old);
-                                        }
                                         *device_state.lock().unwrap() = Some(state.clone());
+
+
                                         if let Some(ref cb) = *state_cb.lock().unwrap() { cb(&state); }
                                         if let Some(ref cb) = *rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
                                         if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
@@ -496,8 +594,8 @@ impl KV4PRadio {
                 // Also parse DeviceState from HELLO payload (starts at offset 17)
                 if payload.len() >= 43 {  // 17 (Version) + 26 (DeviceState)
                     if let Some(state) = DeviceState::from_bytes(&payload[17..]) {
-                        self.seed_squelch_from_firmware(&state);
                         *self.device_state.lock().unwrap() = Some(state.clone());
+    
                         if let Some(ref cb) = *self.state_cb.lock().unwrap() { cb(&state); }
                         if let Some(ref cb) = *self.rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
                         if let Some(ref cb) = *self.smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
@@ -506,8 +604,8 @@ impl KV4PRadio {
             }
             x if x == DeviceCommand::DeviceState as u8 => {
                 if let Some(state) = DeviceState::from_bytes(payload) {
-                    self.seed_squelch_from_firmware(&state);
                     *self.device_state.lock().unwrap() = Some(state.clone());
+
                     if let Some(ref cb) = *self.state_cb.lock().unwrap() { cb(&state); }
                     if let Some(ref cb) = *self.rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
                     if let Some(ref cb) = *self.smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
@@ -534,7 +632,7 @@ impl KV4PRadio {
             squelch: 9,
             ctcss_rx: 0,
         };
-        let _ = self.send(shutdown_state);
+        let _ = self.send_state(&shutdown_state);
         
         // Give time for final command to be sent
         thread::sleep(Duration::from_millis(50));
@@ -582,64 +680,41 @@ impl KV4PRadio {
         }
     }
 
-    pub fn tune(&mut self, rx_khz: u32, tx_khz: u32, squelch: u8, bandwidth: u8) -> Result<(), String> {
+    pub fn tune(&mut self, rx_khz: u32, tx_khz: u32, squelch: u8, _bandwidth: u8) -> Result<(), String> {
         self.frequency.store(rx_khz, Ordering::SeqCst);
         self.tx_frequency.store(tx_khz, Ordering::SeqCst);
-        let freq_rx = rx_khz as f32 / 1000.0;
-        let freq_tx = tx_khz as f32 / 1000.0;
-        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
-        
-        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::HIGH_POWER | 
-                         HostStateFlags::RSSI_ENABLED | HostStateFlags::ENABLE_STATUS_REPORTS | 
-                         HostStateFlags::RX_AUDIO_OPEN;
-        if self.power_high.load(Ordering::SeqCst) { flags |= HostStateFlags::HIGH_POWER; }
-        
-        let state = HostDesiredState {
-            sequence: seq as i32,
-            memory_id: -1,
-            flags: flags.bits(),
-            bandwidth,
-            freq_tx,
-            freq_rx,
-            ctcss_tx: 0,
-            squelch,
-            ctcss_rx: 0,
-        };
-        self.send(state)
+        // Update current_squelch and mark as user-set when explicitly passed to tune()
+        self.current_squelch.store(squelch, Ordering::SeqCst);
+        self.squelch_user_set.store(true, Ordering::SeqCst);
+        self.send_state_if_changed()
+    }
+
+    /// Tune frequency without changing squelch - uses firmware's squelch until user sets it
+    /// Use for startup to preserve firmware's default squelch
+    pub fn tune_freq(&mut self, rx_khz: u32, tx_khz: u32) -> Result<(), String> {
+        self.frequency.store(rx_khz, Ordering::SeqCst);
+        self.tx_frequency.store(tx_khz, Ordering::SeqCst);
+        // Don't touch current_squelch or squelch_user_set - preserves firmware's squelch
+        self.send_state_if_changed()
     }
 
     pub fn set_frequency(&mut self, khz: u32) -> Result<(), String> {
-        self.tune(khz, khz, 4, 1)
+        let squelch = self.current_squelch.load(Ordering::SeqCst);
+        self.tune(khz, khz, squelch, 1)
     }
     
     pub fn set_squelch(&mut self, level: u8) -> Result<(), String> {
         eprintln!("[radio] set_squelch: level={}", level);
         self.current_squelch.store(level, Ordering::SeqCst);
-        let khz = self.frequency.load(Ordering::SeqCst);
-        let tx_khz = self.tx_frequency.load(Ordering::SeqCst);
-        eprintln!("[radio] set_squelch: calling tune({}, {}, {})", khz, tx_khz, level);
-        self.tune(khz, tx_khz, level, 1)
+        self.squelch_user_set.store(true, Ordering::SeqCst);  // Mark as user-set
+        // Mirror Android: just update desired state and send if changed (no tune() call)
+        self.send_state_if_changed()
     }
     
     pub fn set_power(&mut self, high: bool) -> Result<(), String> {
         self.power_high.store(high, Ordering::SeqCst);
-        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::RSSI_ENABLED | 
-                         HostStateFlags::ENABLE_STATUS_REPORTS;
-        if high { flags |= HostStateFlags::HIGH_POWER; }
-        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let state = HostDesiredState {
-            sequence: seq as i32,
-            memory_id: -1,
-            flags: flags.bits(),
-            bandwidth: 1,
-            freq_tx: freq,
-            freq_rx: freq,
-            ctcss_tx: 0,
-            squelch: self.current_squelch.load(Ordering::SeqCst),
-            ctcss_rx: 0,
-        };
-        self.send(state)
+        // Mirror Android: just send state if changed
+        self.send_state_if_changed()
     }
     
     pub fn set_tx_power(&mut self, high: bool) -> Result<(), String> {
@@ -681,66 +756,36 @@ impl KV4PRadio {
         Ok(())
     }
 
+    /// Open firmware audio - sends RX_AUDIO_OPEN flag
+    /// Called after app starts, like Android's openFirmwareAudio()
+    pub fn open_audio(&mut self) -> Result<(), String> {
+        eprintln!("[radio] open_audio() called");
+        // Build state with RX_AUDIO_OPEN flag
+        let mut state = self.build_desired_state();
+        state.flags |= HostStateFlags::RX_AUDIO_OPEN.bits();
+        self.send_state(&state)
+    }
+    
     pub fn enable_smeter(&mut self, enabled: bool) -> Result<(), String> {
-        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::HIGH_POWER | 
-                         HostStateFlags::ENABLE_STATUS_REPORTS;
-        if enabled { flags |= HostStateFlags::RSSI_ENABLED; }
-        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let state = HostDesiredState {
-            sequence: seq as i32,
-            memory_id: -1,
-            flags: flags.bits(),
-            bandwidth: 1,
-            freq_tx: freq,
-            freq_rx: freq,
-            ctcss_tx: 0,
-            squelch: self.current_squelch.load(Ordering::SeqCst),
-            ctcss_rx: 0,
-        };
-        self.send(state)
+        // RSSI is controlled via flags - for now just rebuild and send state
+        // Note: This is a simplified approach; Android controls it separately
+        self.send_state_if_changed()
     }
 
     pub fn ptt_on(&mut self) -> Result<(), String> {
-        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::RADIO_CONFIG_VALID | HostStateFlags::HIGH_POWER | 
-                         HostStateFlags::RSSI_ENABLED | HostStateFlags::TX_ALLOWED |
-                         HostStateFlags::ENABLE_STATUS_REPORTS;
-        if self.power_high.load(Ordering::SeqCst) { flags |= HostStateFlags::HIGH_POWER; }
-        flags |= HostStateFlags::PTT_REQUESTED;
-        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let state = HostDesiredState {
-            sequence: seq as i32,
-            memory_id: -1,
-            flags: flags.bits(),
-            bandwidth: 1,
-            freq_tx: freq,
-            freq_rx: freq,
-            ctcss_tx: 0,
-            squelch: self.current_squelch.load(Ordering::SeqCst),
-            ctcss_rx: 0,
-        };
-        self.send(state)
+        // Build state with PTT flag set
+        let mut state = self.build_desired_state();
+        state.flags |= HostStateFlags::PTT_REQUESTED.bits() | HostStateFlags::TX_ALLOWED.bits();
+        self.send_state(&state)
     }
 
     pub fn ptt_off(&mut self) -> Result<(), String> {
-        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        // Keep ENABLE_STATUS_REPORTS so we continue receiving DeviceState updates
-        let mut flags = HostStateFlags::RSSI_ENABLED | HostStateFlags::ENABLE_STATUS_REPORTS;
-        if self.power_high.load(Ordering::SeqCst) { flags |= HostStateFlags::HIGH_POWER; }
-        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let state = HostDesiredState {
-            sequence: seq as i32,
-            memory_id: -1,
-            flags: flags.bits(),  // TX_ALLOWED (bit 11) not set = TX off
-            bandwidth: 1,
-            freq_tx: freq,
-            freq_rx: freq,
-            ctcss_tx: 0,
-            squelch: self.current_squelch.load(Ordering::SeqCst),
-            ctcss_rx: 0,
-        };
-        self.send(state)
+        // Build base state, then clear PTT flags
+        let mut state = self.build_desired_state();
+        // Keep RX_AUDIO_OPEN so we receive audio
+        state.flags |= HostStateFlags::RX_AUDIO_OPEN.bits();
+        // Note: TX_ALLOWED not set = TX off, PTT_REQUESTED not set = no PTT
+        self.send_state(&state)
     }
 
     /// Send Opus-encoded audio frame to the radio for TX

@@ -111,7 +111,7 @@ pub enum RfModuleType {
 }
 
 /// Host Desired State (22 bytes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HostDesiredState {
     pub sequence: i32,
     pub memory_id: i32,

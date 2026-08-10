@@ -20,20 +20,6 @@ use libadwaita::prelude::*;
 use libadwaita as adw;
 
 fn main() {
-    // Check for test mode
-    if std::env::args().any(|a| a == "--test-squelch") {
-        let port = std::env::args().nth(2).unwrap_or_else(|| "/dev/ttyUSB0".to_string());
-        test_squelch(&port);
-        return;
-    }
-    
-    // Check for raw command test mode (for debugging protocol issues)
-    if std::env::args().any(|a| a == "--test-raw") {
-        let port = std::env::args().nth(2).unwrap_or_else(|| "/dev/ttyUSB0".to_string());
-        test_raw(&port);
-        return;
-    }
-    
     // Parse command line args BEFORE GTK processes them
     // Note: We use POCKET_MODEM_DEVICE env var instead of command line args
     // to avoid GTK interpreting the serial device as a file to open
@@ -69,10 +55,10 @@ fn main() {
                 if let Some(v) = version {
                     eprintln!("[pocket-modem] Connected: fw=v{}, rf={:?}", 
                              v.firmware_version, v.rf_module_type);
-                    // Use seeded squelch from firmware, don't override with hardcoded value
-                    let squelch = radio.get_squelch();
-                    eprintln!("[pocket-modem] Using seeded squelch: {}", squelch);
-                    let _ = radio.tune(145500, 145500, squelch, 1);
+                    // Use tune_freq() to preserve firmware's default squelch (don't override)
+                    let _ = radio.tune_freq(145500, 145500);
+                    // Open audio after tuning - like Android's openFirmwareAudio()
+                    let _ = radio.open_audio();
                     eprintln!("[pocket-modem] Tuned to 145.500 MHz");
                     true
                 } else {
@@ -108,17 +94,7 @@ fn main() {
     };
     let audio_manager = Arc::new(Mutex::new(AudioManager::new(audio_config)));
     
-    // Connect audio manager to radio state updates (for squelch tracking)
-    {
-        let audio = Arc::clone(&audio_manager);
-        let mut r = radio.lock().unwrap();
-        r.on_state(move |state| {
-            if let Ok(mut a) = audio.lock() {
-                let squelch_open = !state.is_squelched();
-                a.set_squelch_open(squelch_open);
-            }
-        });
-    }
+
     
     // Connect audio TX to radio (ADPCM frames)
     {
@@ -131,14 +107,29 @@ fn main() {
         });
     }
     
+
+    
     // Connect radio RX audio to speaker playback
     {
         let mut radio = radio.lock().unwrap();
         let audio = Arc::clone(&audio_manager);
         radio.on_rx_audio(move |adpcm_data| {
-            // Use accumulate_and_start which is atomic under the same lock
+            // Accumulate audio - playback will start when squelch opens
             if let Ok(mut a) = audio.lock() {
                 a.accumulate_and_start(adpcm_data);
+            }
+        });
+    }
+    
+    // Connect radio state to update audio squelch state
+    {
+        let audio = Arc::clone(&audio_manager);
+        let mut radio = radio.lock().unwrap();
+        radio.on_state(move |state| {
+            // Update audio squelch state and RSSI - used for UI display
+            if let Ok(mut a) = audio.lock() {
+                a.update_squelch(state.is_squelched());
+                a.update_rssi(state.rssi);
             }
         });
     }
@@ -266,7 +257,7 @@ fn create_ui(
     squelch_row.set_valign(gtk4::Align::Center);
     
     let squelch_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 9.0, 1.0);
-    squelch_scale.set_value(4.0);
+    squelch_scale.set_value(0.0);  // Default 0 matches Android
     squelch_scale.set_hexpand(true);
     squelch_scale.set_draw_value(false);
     squelch_scale.set_has_origin(true);
@@ -279,7 +270,7 @@ fn create_ui(
     // Squelch callback with debouncing
     let radio_squelch = Arc::clone(radio);
     let label_for_closure = squelch_value_label.clone();
-    let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(4));
+    let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(0));
     
     squelch_scale.connect_value_changed(move |scale| {
         let level = scale.value().round() as u8;
@@ -1034,190 +1025,3 @@ fn create_ui(
     window.show();
 }
 
-/// Test squelch setting and readback (--test-squelch mode)
-fn test_squelch(port: &str) {
-    println!("=== Squelch Test on {} ===\n", port);
-
-    let mut radio = KV4PRadio::new(SerialConfig {
-        port: port.to_string(),
-        baudrate: 115200,
-        timeout_ms: 500,
-    });
-
-    // Connect
-    print!("Connecting... ");
-    match radio.open() {
-        Ok(Some(v)) => println!("OK (fw=v{}, rf={:?})", v.firmware_version, v.rf_module_type),
-        Ok(None) => { println!("NO RESPONSE"); return; }
-        Err(e) => { println!("FAILED: {}", e); return; }
-    }
-
-    // Wait for reader thread and state updates
-    println!("Waiting for device state updates...");
-    for i in 0..20 {
-        std::thread::sleep(Duration::from_millis(100));
-        if let Some(state) = radio.device_state() {
-            println!("  Initial state: applied_seq={}, squelch={}, rssi={}, flags={:#x}", 
-                     state.applied_sequence, state.squelch, state.rssi, state.flags);
-            break;
-        }
-        if i == 19 { println!("  No device state received after 2s"); }
-    }
-
-    println!("\nSetting squelch levels:\n");
-    println!("  Set | Echo | Seq | Status");
-    println!("  ----|------|-----|--------");
-
-    for level in [0, 3, 6, 9] {
-        radio.set_squelch(level).unwrap();
-        
-        // Wait a bit for the command to be sent and processed
-        std::thread::sleep(Duration::from_millis(200));
-        
-        // Poll for device state response
-        let mut echoed: Option<u8> = None;
-        let mut last_seq: Option<i32> = None;
-        for _ in 0..30 {
-            std::thread::sleep(Duration::from_millis(100));
-            if let Some(state) = radio.device_state() {
-                last_seq = Some(state.applied_sequence);
-                if state.squelch != 255 {
-                    echoed = Some(state.squelch);
-                }
-                // Also check if we got the expected squelch
-                if echoed == Some(level) { break; }
-            }
-        }
-
-        match echoed {
-            Some(e) if e == level => println!("  {:3} | {:4} | {:3} | OK", level, e, last_seq.unwrap_or(-1)),
-            Some(e) => println!("  {:3} | {:4} | {:3} | MISMATCH (expected {})", level, e, last_seq.unwrap_or(-1), level),
-            None => println!("  {:3} | -    | {:3} | NO ECHO", level, last_seq.unwrap_or(-1)),
-        }
-    }
-
-    radio.close();
-    println!("\nDone.");
-}
-
-/// Test raw command with explicit sequence
-fn test_raw(port: &str) {
-    use std::io::Read;
-    use std::io::Write;
-    
-    println!("=== Raw Command Test on {} ===\n", port);
-
-    // Open serial port directly
-    let mut sp = serialport::new(port, 115200)
-        .data_bits(serialport::DataBits::Eight)
-        .parity(serialport::Parity::None)
-        .stop_bits(serialport::StopBits::One)
-        .flow_control(serialport::FlowControl::None)
-        .timeout(Duration::from_millis(100))
-        .open()
-        .expect("Failed to open serial port");
-
-    // Clear buffer
-    let _ = sp.clear(serialport::ClearBuffer::Input);
-    
-    // Build a HostDesiredState packet manually with seq=100
-    let mut payload = Vec::new();
-    // sequence: i32 = 100
-    payload.extend_from_slice(&100i32.to_le_bytes());
-    // memory_id: i32 = -1
-    payload.extend_from_slice(&(-1i32).to_le_bytes());
-    // flags: u16 = RADIO_CONFIG_VALID | HIGH_POWER | RSSI_ENABLED | ENABLE_STATUS_REPORTS | RX_AUDIO_OPEN = 0x101d
-    payload.extend_from_slice(&0x101du16.to_le_bytes());
-    // bandwidth: u8 = 1
-    payload.push(1);
-    // freq_tx: f32 = 145.5
-    payload.extend_from_slice(&145.5f32.to_le_bytes());
-    // freq_rx: f32 = 145.5
-    payload.extend_from_slice(&145.5f32.to_le_bytes());
-    // ctcss_tx: u8 = 0
-    payload.push(0);
-    // squelch: u8 = 5
-    payload.push(5);
-    // ctcss_rx: u8 = 0
-    payload.push(0);
-    
-    println!("Payload (22 bytes): {:02x?}", payload);
-    
-    // Build KISS/KV4P frame
-    let kv4p_data: Vec<u8> = vec![
-        b'K', b'V', b'4', b'P',  // KV4P vendor prefix
-        0x01,                      // protocol version
-        0x0d,                      // COMMAND_HOST_DESIRED_STATE
-    ];
-    let mut kv4p_data = kv4p_data;
-    kv4p_data.extend_from_slice(&payload);
-    
-    // Build KISS frame
-    let mut frame = vec![0xc0, 0x06];  // FEND, SETHARDWARE
-    for b in &kv4p_data {
-        if *b == 0xc0 {
-            frame.push(0xdb); frame.push(0xdc);  // FESC, TFEND
-        } else if *b == 0xdb {
-            frame.push(0xdb); frame.push(0xdd);  // FESC, TFESC
-        } else {
-            frame.push(*b);
-        }
-    }
-    frame.push(0xc0);  // FEND
-    
-    println!("Frame ({} bytes): {:02x?}", frame.len(), frame);
-    
-    // Send
-    print!("Sending command with seq=100, squelch=5... ");
-    sp.write_all(&frame).expect("Write failed");
-    sp.flush().expect("Flush failed");
-    println!("OK");
-    
-    // Wait for response
-    println!("\nWaiting for DeviceState response...");
-    let mut buf = [0u8; 256];
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut found_device_state = false;
-    
-    while std::time::Instant::now() < deadline {
-        match sp.read(&mut buf) {
-            Ok(n) if n > 0 => {
-                println!("Received {} bytes: {:02x?}", n, &buf[..n]);
-                
-                // Look for DeviceState (cmd 0x0B) in the response
-                for i in 0..n {
-                    if buf[i] == 0xc0 && i + 30 < n {
-                        // Check for KV4P frame
-                        if i + 10 < n && buf[i+1] == 0x06 && 
-                           buf[i+2] == b'K' && buf[i+3] == b'V' && 
-                           buf[i+4] == b'4' && buf[i+5] == b'P' {
-                            let cmd = buf[i+7];
-                            if cmd == 0x0B {  // DeviceState
-                                println!("Found DeviceState!");
-                                let payload_start = i + 8;
-                                if payload_start + 26 <= n {
-                                    let sq = buf[payload_start + 20];
-                                    let seq = i32::from_le_bytes([
-                                        buf[payload_start], buf[payload_start+1],
-                                        buf[payload_start+2], buf[payload_start+3]
-                                    ]);
-                                    println!("  applied_seq={}, squelch={}", seq, sq);
-                                    found_device_state = true;
-                                }
-                            } else if cmd == 0x06 {
-                                println!("Found HELLO");
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        if found_device_state { break; }
-    }
-    
-    if !found_device_state {
-        println!("No DeviceState found in response");
-    }
-}

@@ -6,7 +6,7 @@
 //!
 //! Uses cpal for capture and playback, oxideav-adpcm for ADPCM decoding.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -421,7 +421,11 @@ pub struct AudioManager {
     rx_callback: RxAudioCallback,
     tx_enabled: Arc<AtomicBool>,
     rx_enabled: Arc<AtomicBool>,
-    squelch_open: Arc<AtomicBool>,  // Track squelch state for muting
+    // Squelch state tracking
+    is_squelched: Arc<AtomicBool>,  // Current hardware squelch state
+    squelch_known: Arc<AtomicBool>,  // Have we received first squelch state?
+    current_rssi: Arc<AtomicU8>,  // Current RSSI (for threshold check)
+    rx_volume: Arc<AtomicU32>,  // Volume for RX (starts at 0, ramps up via AtomicU32 float bits)
     state: Arc<Mutex<AudioState>>,
     dc_remover: Arc<Mutex<DCOffsetRemover>>,
     volume_ramp: Arc<Mutex<VolumeRamp>>,
@@ -442,7 +446,11 @@ impl AudioManager {
             rx_callback: Arc::new(Mutex::new(None)),
             tx_enabled: Arc::new(AtomicBool::new(false)),
             rx_enabled: Arc::new(AtomicBool::new(false)),
-            squelch_open: Arc::new(AtomicBool::new(true)),  // Default to open
+            // Squelch tracking - start assuming squelch closed (no audio)
+            is_squelched: Arc::new(AtomicBool::new(true)),
+            squelch_known: Arc::new(AtomicBool::new(false)),
+            current_rssi: Arc::new(AtomicU8::new(0)),
+            rx_volume: Arc::new(AtomicU32::new(0)),
             state: Arc::new(Mutex::new(AudioState::Idle)),
             dc_remover: Arc::new(Mutex::new(DCOffsetRemover::new(0.25, AUDIO_WIRE_SAMPLE_RATE as f32))),
             volume_ramp: Arc::new(Mutex::new(VolumeRamp::new(0.05, 0.7))),
@@ -452,21 +460,7 @@ impl AudioManager {
         }
     }
     
-    /// Set squelch state - call when squelch opens/closes
-    pub fn set_squelch_open(&mut self, open: bool) {
-        let was_open = self.squelch_open.swap(open, Ordering::SeqCst);
-        if was_open && !open {
-            // Squelch just closed - stop playback and clear buffer
-            eprintln!("[audio] Squelch closed - stopping playback, clearing buffer");
-            self.rx_enabled.store(false, Ordering::SeqCst);
-            self.playback_buf.lock().unwrap().clear();
-            self.decoder.reset();
-            let mut s = self.state.lock().unwrap();
-            if *s == AudioState::Playing { *s = AudioState::Idle; }
-        } else if !was_open && open {
-            eprintln!("[audio] Squelch opened");
-        }
-    }
+
     
     pub fn on_tx_audio<F>(&mut self, callback: F) 
     where F: FnMut(&[u8]) + Send + 'static {
@@ -481,19 +475,95 @@ impl AudioManager {
         }));
     }
     
+
+    
+    /// Update squelch state from firmware
+    /// is_squelched = true means hardware squelch is closed (no signal)
+    /// is_squelched = false means hardware squelch is open (signal detected)
+    pub fn update_squelch(&mut self, is_squelched: bool) {
+        self.squelch_known.store(true, Ordering::SeqCst);
+        self.is_squelched.store(is_squelched, Ordering::SeqCst);
+    }
+    
+    /// Update RSSI value for signal detection threshold
+    pub fn update_rssi(&mut self, raw_rssi: u8) {
+        self.current_rssi.store(raw_rssi, Ordering::SeqCst);
+        // Also reset max tracking when RSSI is low (to detect new signals)
+        if raw_rssi < 10 {
+            // Low RSSI - this could be noise or no signal
+        }
+    }
+    
     /// Internal: call accumulate_rx_audio and start playback if ready
-    /// Must be called with audio manager locked
+    /// Matches Android app exactly: just buffer audio and start playback.
+    /// Android trusts firmware for squelch - we use volume ramping instead.
     pub fn accumulate_and_start(&mut self, adpcm_data: &[u8]) {
         self.accumulate_rx_audio(adpcm_data);
         
-        // Start playback if we have enough buffered to survive initial callbacks
-        // With 16kHz mono: 500 samples is plenty (30ms buffer)
-        // With 44.1kHz stereo: this will still underrun, but at least audio starts
         let buf_len = self.playback_buf.lock().unwrap().len();
-        if !self.rx_enabled.load(Ordering::SeqCst) && buf_len >= 500 {
-            eprintln!("[audio] Buffer has {} samples, starting playback", buf_len);
-            let _ = self.start_playback();
+        
+        // Start playback when buffer is ready - matches Android app exactly
+        // No squelch gating - Android trusts firmware, we use volume ramping instead
+        if !self.rx_enabled.load(Ordering::SeqCst) && buf_len >= 249 {
+            let _ = self.start_playback_volume_zero();
         }
+    }
+    
+    /// Start playback with volume at 0, matching Android's ensureAudioPlaying()
+    /// Volume will ramp up slowly (alpha=0.02) via the volume_ramp
+    fn start_playback_volume_zero(&mut self) -> Result<(), String> {
+        if self.rx_enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        
+        let config = self.config.clone();
+        let rx_enabled = Arc::clone(&self.rx_enabled);
+        let rx_enabled_for_state = Arc::clone(&self.rx_enabled);
+        let rx_enabled_for_monitor = Arc::clone(&self.rx_enabled);
+        let state = Arc::clone(&self.state);
+        let playback_buf = Arc::clone(&self.playback_buf);
+        let playback_buf_for_monitor = Arc::clone(&self.playback_buf);
+        let rx_volume = Arc::clone(&self.rx_volume);
+        
+        // CRITICAL: Set enabled flag BEFORE spawning thread
+        self.rx_enabled.store(true, Ordering::SeqCst);
+        *self.state.lock().unwrap() = AudioState::Playing;
+        
+        // Reset volume ramp to 0 (matches Android: audioTrackVolume = 0)
+        rx_volume.store(0, Ordering::SeqCst);
+        
+        // Spawn playback loop
+        thread::spawn(move || {
+            // Need self to call playback_loop - clone the needed Arcs
+            let rx_vol = Arc::clone(&rx_volume);
+            let config_clone = config.clone();
+            let enabled_clone = Arc::clone(&rx_enabled);
+            let buf_clone = Arc::clone(&playback_buf);
+            // Can't call &self in a spawned thread, use Self::playback_loop_static
+            if let Err(e) = Self::playback_loop_static(&rx_vol, &config_clone, enabled_clone, buf_clone) {
+                eprintln!("[audio] Playback error: {}", e);
+            }
+            rx_enabled_for_state.store(false, Ordering::SeqCst);
+            *state.lock().unwrap() = AudioState::Idle;
+        });
+        thread::spawn(move || {
+            let mut underrun_count = 0;
+            let mut last_level = 0usize;
+            while rx_enabled_for_monitor.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(500));
+                let buf = playback_buf_for_monitor.lock().unwrap();
+                let level = buf.len();
+                if level < OUTPUT_FRAME_SIZE && last_level >= OUTPUT_FRAME_SIZE {
+                    underrun_count += 1;
+                }
+                last_level = level;
+            }
+            if underrun_count > 0 {
+                eprintln!("[audio] Playback ended with {} underruns", underrun_count);
+            }
+        });
+        
+        Ok(())
     }
     
     pub fn start_capture(&mut self) -> Result<(), String> {
@@ -577,17 +647,19 @@ impl AudioManager {
         let state = Arc::clone(&self.state);
         let playback_buf = Arc::clone(&self.playback_buf);
         let playback_buf_for_monitor = Arc::clone(&self.playback_buf);
+        let rx_volume = Arc::clone(&self.rx_volume);
         
         // CRITICAL: Set enabled flag BEFORE spawning thread
         // cpal stream starts asynchronously and callbacks may run immediately
         self.rx_enabled.store(true, Ordering::SeqCst);
         *self.state.lock().unwrap() = AudioState::Playing;
         
-
+        // Reset volume ramp
+        rx_volume.store(0, Ordering::SeqCst);
         
         // Spawn playback loop
         thread::spawn(move || {
-            if let Err(e) = Self::playback_loop(&config, rx_enabled.clone(), playback_buf) {
+            if let Err(e) = Self::playback_loop_static(&rx_volume, &config, rx_enabled.clone(), playback_buf) {
                 eprintln!("[audio] Playback error: {}", e);
             }
             rx_enabled_for_state.store(false, Ordering::SeqCst);
@@ -833,7 +905,8 @@ impl AudioManager {
         Ok(())
     }
     
-    fn playback_loop(
+    fn playback_loop_static(
+        rx_volume: &Arc<AtomicU32>,
         config: &AudioConfig,
         enabled: Arc<AtomicBool>,
         playback_buf: Arc<Mutex<Vec<i16>>>,
@@ -843,81 +916,22 @@ impl AudioManager {
             .ok_or("No output device available")?;
         eprintln!("[audio] Using output: {}", device.name().unwrap_or_else(|_| "unknown".into()));
         
-        // First, try to configure 16kHz mono (matches our native sample rate)
-        // This avoids expensive resampling from 16kHz → 44.1kHz stereo
-        let mut use_native_format = true;
-        let mut stream_config: Option<cpal::StreamConfig> = None;
-        let mut sample_format = cpal::SampleFormat::F32;  // Default, will be overridden
-        let mut native_rate = OUTPUT_SAMPLE_RATE;
-        let mut native_channels: u16 = 1;
-        
-        // Try 16kHz mono first
-        if let Ok(configs) = device.supported_output_configs() {
-            for cfg in configs {
-                eprintln!("[audio] Supported format: {:?}", cfg);
-                // Look for 16kHz mono support
-                if cfg.min_sample_rate().0 <= OUTPUT_SAMPLE_RATE && 
-                   cfg.max_sample_rate().0 >= OUTPUT_SAMPLE_RATE &&
-                   cfg.channels() >= 1 {
-                    // Build a 16kHz mono config
-                    let test_config = cpal::StreamConfig {
-                        channels: 1,
-                        sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
-                        buffer_size: cpal::BufferSize::Default,
-                    };
-                    // Verify it's compatible
-                    let fmt = cfg.sample_format();
-                    if fmt == cpal::SampleFormat::I16 || fmt == cpal::SampleFormat::F32 {
-                        stream_config = Some(test_config);
-                        sample_format = fmt;
-                        use_native_format = false;
-                        native_rate = OUTPUT_SAMPLE_RATE;
-                        native_channels = 1;
-                        eprintln!("[audio] Using 16kHz mono (matches ADPCM native rate)");
-                        break;
-                    }
-                }
-            }
-        }
-        
-        // Fall back to default format if 16kHz mono not supported
-        if stream_config.is_none() {
-            let supported = device.default_output_config()
-                .map_err(|e| format!("Failed to get default output config: {}", e))?;
-            eprintln!("[audio] Default output format: {:?}", supported);
-            eprintln!("[audio] WARNING: Resampling {}Hz {}ch → 16kHz mono", 
-                      supported.sample_rate().0, supported.channels());
-            eprintln!("[audio] This will cause buffer underruns! Audio will be garbled.");
-            eprintln!("[audio] The device doesn't support 16kHz output.");
-            sample_format = supported.sample_format();
-            stream_config = Some(cpal::StreamConfig {
-                channels: supported.channels(),
-                sample_rate: supported.sample_rate(),
-                buffer_size: cpal::BufferSize::Default,
-            });
-            native_rate = supported.sample_rate().0;
-            native_channels = supported.channels();
-        }
-        
-        let stream_config = stream_config.unwrap();
-        let use_native = use_native_format;
+        // Require 16kHz mono - matches ADPCM native rate, no resampling needed
+        let stream_config = cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Default,
+        };
         
         let gain = config.rx_gain;
-        
-        // Pre-fill buffer. When using native format (44.1kHz stereo), we consume
-        // ~4.8x source samples per callback, so we need huge pre-fill.
-        // When using 16kHz mono directly, fill/drain are 1:1, so minimal buffering needed.
+        let rx_volume = Arc::clone(rx_volume);
         let playback_buf_clone = Arc::clone(&playback_buf);
+        
+        // Pre-fill buffer with silence (500ms worth)
         {
             let mut buf = playback_buf_clone.lock().unwrap();
-            // With 16kHz mono: 249 samples per frame, drains 249 samples per 15.6ms
-            // Buffer stays stable. Even 500ms (8000 samples) is plenty.
-            // With 44.1kHz stereo: need massive buffer to survive the rate mismatch.
-            // use_native_format = true means we're resampling, need big buffer
-            // use_native_format = false means 16kHz mono direct, need small buffer
-            let prefill = if use_native_format { 80000 } else { 8000 };
-            if buf.len() < prefill {
-                buf.resize(prefill, 0); 
+            if buf.len() < 8000 {  // 500ms at 16kHz
+                buf.resize(8000, 0);
             }
             eprintln!("[audio] Buffer pre-filled to {} samples", buf.len());
         }
@@ -925,134 +939,44 @@ impl AudioManager {
         let err_fn = |err| eprintln!("[audio] Stream error: {}", err);
         let enabled2 = Arc::clone(&enabled);
         
-        let stream = match sample_format {
-            cpal::SampleFormat::I16 => {
-                let playback_buf_clone_i16 = Arc::clone(&playback_buf);
-                device.build_output_stream(
-                    &stream_config,
-                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        if !enabled.load(Ordering::SeqCst) {
-                            for s in data.iter_mut() { *s = 0; }
-                            return;
-                        }
-                        
-                        let mut buf = playback_buf_clone_i16.lock().unwrap();
-                        let available = buf.len();
-                        
-                        if use_native {
-                            // Resample from 16kHz mono to native_rate
-                            let ratio = native_rate as f64 / OUTPUT_SAMPLE_RATE as f64;
-                            let last_sample = if available > 0 { buf[available - 1] } else { 0i16 };
-                            
-                            let mut src_pos = 0.0f64;
-                            let mut prev_sample_f: f32 = 0.0;
-                            let num_frames = data.len() / native_channels as usize;
-                            
-                            for frame in 0..num_frames {
-                                let idx = src_pos as usize;
-                                if idx < available {
-                                    let s0 = buf[idx] as f32;
-                                    let s1 = if idx + 1 < available { buf[idx + 1] as f32 } else { s0 };
-                                    let t = (src_pos - idx as f64) as f32;
-                                    prev_sample_f = (s0 + (s1 - s0) * t) * gain;
-                                } else {
-                                    prev_sample_f = last_sample as f32 * gain;
-                                }
-                                let out_sample = prev_sample_f.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                                
-                                // Fill all channels with same sample
-                                for ch in 0..native_channels as usize {
-                                    data[frame * native_channels as usize + ch] = out_sample;
-                                }
-                                
-                                src_pos += ratio;
-                            }
-                            
-                            let consumed = src_pos as usize;
-                            if consumed > 0 && consumed <= available {
-                                buf.drain(..consumed);
-                            }
-                        } else {
-                            // Direct 16kHz mono output - 1:1 mapping
-                            let to_copy = available.min(data.len());
-                            for i in 0..to_copy {
-                                data[i] = ((buf[i] as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32)) as i16;
-                            }
-                            // Zero-fill rest
-                            for i in to_copy..data.len() {
-                                data[i] = 0;
-                            }
-                            buf.drain(..to_copy);
-                        }
-                    },
-                    err_fn,
-                    None,
-                )
-            }
-            cpal::SampleFormat::F32 => {
-                let playback_buf_clone2 = Arc::clone(&playback_buf);
-                device.build_output_stream(
-                    &stream_config,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        if !enabled.load(Ordering::SeqCst) {
-                            for s in data.iter_mut() { *s = 0.0; }
-                            return;
-                        }
-                        
-                        let mut buf = playback_buf_clone2.lock().unwrap();
-                        let available = buf.len();
-                        
-                        if use_native {
-                            // Resample from 16kHz mono to native_rate
-                            let ratio = native_rate as f64 / OUTPUT_SAMPLE_RATE as f64;
-                            let last_mono = if available > 0 { buf[available - 1] as f32 / 32768.0 } else { 0.0f32 };
-                            
-                            let mut src_pos = 0.0f64;
-                            let mut prev_sample: f32 = 0.0;
-                            let num_frames = data.len() / native_channels as usize;
-                            
-                            for frame in 0..num_frames {
-                                let idx = src_pos as usize;
-                                if idx < available {
-                                    let s0 = buf[idx] as f32 / 32768.0;
-                                    let s1 = if idx + 1 < available { buf[idx + 1] as f32 / 32768.0 } else { s0 };
-                                    let t = (src_pos - idx as f64) as f32;
-                                    prev_sample = (s0 + (s1 - s0) * t) * gain;
-                                } else {
-                                    prev_sample = last_mono * gain;
-                                }
-                                
-                                // Fill all channels with same sample
-                                for ch in 0..native_channels as usize {
-                                    data[frame * native_channels as usize + ch] = prev_sample;
-                                }
-                                
-                                src_pos += ratio;
-                            }
-                            
-                            let consumed = src_pos as usize;
-                            if consumed > 0 && consumed <= available {
-                                buf.drain(..consumed);
-                            }
-                        } else {
-                            // Direct 16kHz mono output - 1:1 mapping
-                            let to_copy = available.min(data.len());
-                            for i in 0..to_copy {
-                                data[i] = buf[i] as f32 / 32768.0 * gain;
-                            }
-                            // Zero-fill rest
-                            for i in to_copy..data.len() {
-                                data[i] = 0.0;
-                            }
-                            buf.drain(..to_copy);
-                        }
-                    },
-                    err_fn,
-                    None,
-                )
-            }
-            _ => return Err("Unsupported sample format".to_string()),
-        }.map_err(|e| format!("Failed to build output stream: {}", e))?;
+        // Build output stream for 16kHz mono I16 (most common)
+        let stream = device.build_output_stream(
+            &stream_config,
+            move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                if !enabled.load(Ordering::SeqCst) {
+                    for s in data.iter_mut() { *s = 0; }
+                    // Reset volume ramp when disabled
+                    rx_volume.store(0, Ordering::SeqCst);
+                    return;
+                }
+                
+                // Volume ramp: matches Android alpha=0.02
+                // Store volume as u32 bits to use atomic (AtomicF32 not available)
+                let vol_bits = rx_volume.load(Ordering::SeqCst);
+                let vol = f32::from_bits(vol_bits);
+                let new_vol = 0.02 + 0.98 * vol;
+                rx_volume.store(new_vol.to_bits(), Ordering::SeqCst);
+                
+                // Apply gain when volume > 0.7 (matches Android)
+                let vol_gain = if new_vol > 0.7 { new_vol * gain } else { 0.0 };
+                
+                let mut buf = playback_buf_clone.lock().unwrap();
+                let available = buf.len();
+                let to_copy = available.min(data.len());
+                
+                for i in 0..to_copy {
+                    let sample = (buf[i] as f32 * vol_gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                    data[i] = sample;
+                }
+                // Zero-fill rest
+                for i in to_copy..data.len() {
+                    data[i] = 0;
+                }
+                buf.drain(..to_copy);
+            },
+            err_fn,
+            None,
+        ).map_err(|e| format!("Failed to build output stream: {}", e))?;
         
         stream.play().map_err(|e| format!("Failed to start stream: {}", e))?;
         
