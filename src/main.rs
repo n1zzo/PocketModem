@@ -59,6 +59,9 @@ fn main() {
                     let _ = radio.tune_freq(145500, 145500);
                     // Open audio after tuning - like Android's openFirmwareAudio()
                     let _ = radio.open_audio();
+                    
+                    // TEST: set squelch to 8 (slider right = strict)
+                    let _ = radio.set_squelch(8);
                     eprintln!("[pocket-modem] Tuned to 145.500 MHz");
                     true
                 } else {
@@ -256,8 +259,8 @@ fn create_ui(
     let squelch_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
     squelch_row.set_valign(gtk4::Align::Center);
     
-    let squelch_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 9.0, 1.0);
-    squelch_scale.set_value(0.0);  // Default 0 matches Android
+    let squelch_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 8.0, 1.0);
+    squelch_scale.set_value(4.0);  // Default 4 (0-8 range, inverted to firmware: 8-4=4)
     squelch_scale.set_hexpand(true);
     squelch_scale.set_draw_value(false);
     squelch_scale.set_has_origin(true);

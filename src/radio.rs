@@ -94,7 +94,8 @@ impl KV4PRadio {
             frequency: Arc::new(AtomicU32::new(145500)),
             tx_frequency: Arc::new(AtomicU32::new(145500)),
             power_high: Arc::new(AtomicBool::new(true)),
-            current_squelch: Arc::new(AtomicU8::new(0)),  // Default matches Android (0 = lowest threshold)
+            // Default squelch = 4 (matches typical radio usage)
+            current_squelch: Arc::new(AtomicU8::new(4)),
             smeter_cb: Arc::new(Mutex::new(None)),
             state_cb: Arc::new(Mutex::new(None)),
             phys_ptt_cb: Arc::new(Mutex::new(None)),
@@ -179,10 +180,14 @@ impl KV4PRadio {
     }
     
     /// Build a HostDesiredState from current settings (mirrors Android's desiredState construction)
-    /// Note: For startup/session state, use build_desired_state_with_firmware_squelch()
-    /// instead, to avoid overriding firmware's squelch before user sets it.
     fn build_desired_state(&self) -> HostDesiredState {
-        self.build_desired_state_with_firmware_squelch()
+        self.build_desired_state_with_firmware_squelch(false)
+    }
+    
+    /// Build a HostDesiredState for initial startup without RADIO_CONFIG_VALID
+    /// This mirrors Android's approach where initial state doesn't trigger radio reconfiguration.
+    fn build_initial_desired_state(&self) -> HostDesiredState {
+        self.build_desired_state_with_firmware_squelch(false)
     }
     
     /// Send desired state if it changed (mirrors Android's sendDesiredStateIfChanged)
@@ -202,15 +207,23 @@ impl KV4PRadio {
         Ok(())
     }
     
-    /// Build desired state, using firmware's squelch if user hasn't set it yet
-    /// (Mirrors Android's behavior: desiredState.squelch starts at 0 but firmware
-    /// maintains its own squelch until user changes it)
-    fn build_desired_state_with_firmware_squelch(&self) -> HostDesiredState {
+    /// Build desired state, optionally with RADIO_CONFIG_VALID
+    /// 
+    /// Mirrors Android's behavior:
+    /// - Initial state (radio_config_valid=false): Just sets session flags, doesn't touch radio config
+    /// - After tune() call (radio_config_valid=true): Triggers firmware to apply radio settings
+    /// 
+    /// If user hasn't explicitly set squelch, we preserve firmware's squelch to avoid overriding
+    /// persistent settings. This is critical because sending squelch with RADIO_CONFIG_VALID
+    /// causes the firmware to reconfigure the SA818 with potentially wrong squelch.
+    fn build_desired_state_with_firmware_squelch(&self, include_radio_config_valid: bool) -> HostDesiredState {
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::RADIO_CONFIG_VALID.bits() |
-                       HostStateFlags::HIGH_POWER.bits() |
+        let mut flags = HostStateFlags::HIGH_POWER.bits() |
                        HostStateFlags::RSSI_ENABLED.bits() |
                        HostStateFlags::ENABLE_STATUS_REPORTS.bits();
+        if include_radio_config_valid {
+            flags |= HostStateFlags::RADIO_CONFIG_VALID.bits();
+        }
         if !self.power_high.load(Ordering::SeqCst) {
             flags &= !HostStateFlags::HIGH_POWER.bits();
         }
@@ -248,15 +261,18 @@ impl KV4PRadio {
         let payload = s.to_bytes();
         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
         
+        // Track what we're about to send BEFORE sending
+        *self.desired_state_sent.lock().unwrap() = Some(s.clone());
+        
         // Send via write thread channel
         if let Ok(guard) = self.write_tx.lock() {
             if let Some(ref tx) = *guard {
                 let _ = tx.send(frame);
+            } else {
+                eprintln!("[radio] send_state: write_tx not ready");
+                return Err("Write channel not ready".to_string());
             }
         }
-        
-        // Track what we sent
-        *self.desired_state_sent.lock().unwrap() = Some(s);
         
         Ok(())
     }
@@ -359,6 +375,9 @@ impl KV4PRadio {
         
         let version = self.version.lock().unwrap().clone();
         if version.as_ref().map(|v| v.is_valid).unwrap_or(false) {
+            // Seed squelch from firmware's DeviceState (mirrors Android's seedFromDeviceState)
+            self.seed_squelch_from_device();
+            
             eprintln!("[radio] Connected: fw=v{}, rf={:?}", 
                      version.as_ref().unwrap().firmware_version, 
                      version.as_ref().unwrap().rf_module_type);
@@ -390,6 +409,20 @@ impl KV4PRadio {
             thread::sleep(Duration::from_millis(1000));
         }
     }
+    
+    /// Seed current_squelch from firmware's reported DeviceState
+    /// Called after receiving HELLO with initial DeviceState
+    /// Mirrors Android's RadioModuleController.seedFromDeviceState()
+    fn seed_squelch_from_device(&mut self) {
+        if let Some(ref state) = *self.device_state.lock().unwrap() {
+            // Only seed if user hasn't explicitly set squelch yet
+            if !self.squelch_user_set.load(Ordering::SeqCst) {
+                let firmware_squelch = state.squelch;
+                eprintln!("[radio] Seeding squelch from firmware: {}", firmware_squelch);
+                self.current_squelch.store(firmware_squelch, Ordering::SeqCst);
+            }
+        }
+    }
 
     /// Legacy method kept for compatibility - now uses write thread channel
     fn send_initial_state(&mut self) -> Result<(), String> {
@@ -399,18 +432,33 @@ impl KV4PRadio {
         if let Ok(guard) = self.write_tx.lock() {
             if let Some(ref tx) = *guard {
                 let _ = tx.send(data);
+            } else {
+                eprintln!("[radio] send_initial_state: write_tx not ready");
+                return Err("Write channel not ready".to_string());
             }
         }
         Ok(())
     }
 
     /// Build the initial state packet bytes for direct serial write
+    /// Does NOT include RADIO_CONFIG_VALID - this mirrors Android's approach where
+    /// initial state doesn't trigger radio reconfiguration.
     fn build_initial_state(&self) -> Vec<u8> {
         // Android app does NOT include RX_AUDIO_OPEN in initial state.
         // It sends RX_AUDIO_OPEN later via openFirmwareAudio() after tuning.
         let flags = (HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED |
                      HostStateFlags::ENABLE_STATUS_REPORTS).bits();
-        let squelch = self.current_squelch.load(Ordering::SeqCst);
+        
+        // Use firmware's squelch if user hasn't set it
+        let squelch = if self.squelch_user_set.load(Ordering::SeqCst) {
+            self.current_squelch.load(Ordering::SeqCst)
+        } else {
+            self.device_state.lock().unwrap()
+                .as_ref()
+                .map(|s| s.squelch)
+                .unwrap_or(self.current_squelch.load(Ordering::SeqCst))
+        };
+        
         let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
         let state = HostDesiredState {
             sequence: 1,
@@ -429,7 +477,7 @@ impl KV4PRadio {
 
     fn spawn_reader_thread(&mut self) {
         let serial = Arc::clone(&self.serial);
-        let _write_tx = Arc::clone(&self.write_tx);
+        let write_tx = Arc::clone(&self.write_tx);
         let parser = Arc::clone(&self.parser);
         let running = Arc::clone(&self.running);
         let write_shutdown = Arc::clone(&self.write_shutdown);
@@ -444,7 +492,7 @@ impl KV4PRadio {
         let last_phys_ptt = Arc::clone(&self.last_phys_ptt);
         let current_squelch = Arc::clone(&self.current_squelch);  // For squelch seeding
 
-        // Spawn write thread
+        // Create channel for serial writes - keep both ends alive!
         let (tx, rx) = mpsc::channel();
         {
             let mut guard = self.write_tx.lock().unwrap();
@@ -510,7 +558,6 @@ impl KV4PRadio {
                                     if let Some(state) = DeviceState::from_bytes(payload) {
                                         *device_state.lock().unwrap() = Some(state.clone());
 
-
                                         if let Some(ref cb) = *state_cb.lock().unwrap() { cb(&state); }
                                         if let Some(ref cb) = *rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
                                         if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
@@ -566,6 +613,7 @@ impl KV4PRadio {
                     break;
                 }
             }
+            eprintln!("[reader] Thread exiting");
         });
     }
 
@@ -686,16 +734,22 @@ impl KV4PRadio {
         // Update current_squelch and mark as user-set when explicitly passed to tune()
         self.current_squelch.store(squelch, Ordering::SeqCst);
         self.squelch_user_set.store(true, Ordering::SeqCst);
-        self.send_state_if_changed()
+        
+        // Build state WITH RADIO_CONFIG_VALID to trigger firmware to apply settings
+        let state = self.build_desired_state_with_firmware_squelch(true);
+        self.send_state(&state)
     }
 
     /// Tune frequency without changing squelch - uses firmware's squelch until user sets it
+    /// Does NOT set RADIO_CONFIG_VALID - just updates session flags
     /// Use for startup to preserve firmware's default squelch
     pub fn tune_freq(&mut self, rx_khz: u32, tx_khz: u32) -> Result<(), String> {
         self.frequency.store(rx_khz, Ordering::SeqCst);
         self.tx_frequency.store(tx_khz, Ordering::SeqCst);
         // Don't touch current_squelch or squelch_user_set - preserves firmware's squelch
-        self.send_state_if_changed()
+        // Build state WITHOUT RADIO_CONFIG_VALID (session-only update)
+        let state = self.build_desired_state_with_firmware_squelch(false);
+        self.send_state(&state)
     }
 
     pub fn set_frequency(&mut self, khz: u32) -> Result<(), String> {
@@ -704,8 +758,10 @@ impl KV4PRadio {
     }
     
     pub fn set_squelch(&mut self, level: u8) -> Result<(), String> {
-        eprintln!("[radio] set_squelch: level={}", level);
-        self.current_squelch.store(level, Ordering::SeqCst);
+        // Invert: slider 0 (left) = permissive (firmware 8), slider 8 (right) = strict (firmware 0)
+        let firmware_squelch = 8 - level.min(8);
+        eprintln!("[radio] set_squelch: slider={} -> firmware={}", level, firmware_squelch);
+        self.current_squelch.store(firmware_squelch, Ordering::SeqCst);
         self.squelch_user_set.store(true, Ordering::SeqCst);  // Mark as user-set
         // Mirror Android: just update desired state and send if changed (no tune() call)
         self.send_state_if_changed()
@@ -758,10 +814,11 @@ impl KV4PRadio {
 
     /// Open firmware audio - sends RX_AUDIO_OPEN flag
     /// Called after app starts, like Android's openFirmwareAudio()
+    /// Does NOT set RADIO_CONFIG_VALID - audio open is a session flag only
     pub fn open_audio(&mut self) -> Result<(), String> {
         eprintln!("[radio] open_audio() called");
-        // Build state with RX_AUDIO_OPEN flag
-        let mut state = self.build_desired_state();
+        // Build state WITHOUT RADIO_CONFIG_VALID - audio open is session-only
+        let mut state = self.build_desired_state_with_firmware_squelch(false);
         state.flags |= HostStateFlags::RX_AUDIO_OPEN.bits();
         self.send_state(&state)
     }
