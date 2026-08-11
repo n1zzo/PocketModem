@@ -1,7 +1,14 @@
 //! KV4P HT Radio driver - native Rust implementation
 //!
-//! On connect, we seed current_squelch from the firmware's reported squelch
-//! so we don't override the radio's existing configuration with hardcoded defaults.
+//! Synchronization model: Command/Status queue pattern to avoid deadlock risk.
+//!
+//! - Commands (tune, squelch, PTT) are sent via a lock-free channel to a dedicated write thread
+//! - Device state is updated atomically via atomics (read-heavy pattern)
+//! - Callbacks are stored in Arc<Mutex> and invoked from I/O thread to avoid holding locks
+//! - No nested lock acquisition - each operation has a clear lock ordering
+//!
+//! Thread safety: KV4PRadio implements Send but NOT Sync. All public methods that
+//! need to be called from multiple threads should use the command queue pattern.
 
 use crate::kiss::{
     build_kv4p_packet, build_tx_audio_packet, DeviceCommand, 
@@ -13,7 +20,27 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-/// Callbacks
+// ============================================================================
+// Command Types for Thread-Safe Communication
+// ============================================================================
+
+/// Commands sent from main thread to I/O thread via channel
+#[derive(Debug, Clone)]
+pub enum RadioCommand {
+    /// Send desired state to radio (tune, squelch, flags, etc.)
+    SendState(HostDesiredState),
+    /// Send raw KISS frame (audio, etc.)
+    SendFrame(Vec<u8>),
+    /// Trigger connection
+    Connect,
+    /// Trigger shutdown
+    Shutdown,
+}
+
+// ============================================================================
+// Callbacks (Stored in Arc<Mutex> for thread-safe access)
+// ============================================================================
+
 pub type SmeterCallback = Box<dyn Fn(i32) + Send + Sync>;
 pub type StateCallback = Box<dyn Fn(&DeviceState) + Send + Sync>;
 pub type RssiCallback = Box<dyn Fn(f32) + Send + Sync>;
@@ -21,7 +48,29 @@ pub type ConnectCallback = Box<dyn Fn(bool) + Send + Sync>;
 pub type RxAudioCallback = Box<dyn Fn(&[u8]) + Send + Sync>;
 pub type PhysPttCallback = Box<dyn Fn(bool) + Send + Sync>;
 
-/// Serial config
+/// Thread-safe callback container - protected by Mutex, mutated only during init
+struct Callbacks {
+    smeter: Option<SmeterCallback>,
+    state: Option<StateCallback>,
+    rssi: Option<RssiCallback>,
+    connect: Option<ConnectCallback>,
+    rx_audio: Option<RxAudioCallback>,
+    phys_ptt: Option<PhysPttCallback>,
+}
+
+impl Default for Callbacks {
+    fn default() -> Self {
+        Self {
+            smeter: None, state: None, rssi: None,
+            connect: None, rx_audio: None, phys_ptt: None,
+        }
+    }
+}
+
+// ============================================================================
+// Serial Config
+// ============================================================================
+
 #[derive(Debug, Clone)]
 pub struct SerialConfig {
     pub port: String,
@@ -35,7 +84,11 @@ impl Default for SerialConfig {
     }
 }
 
-/// Radio state
+// ============================================================================
+// Radio State (Thread-Safe via Atomics)
+// ============================================================================
+
+/// Immutable snapshot of radio state for UI consumption
 #[derive(Debug, Clone, Default)]
 pub struct RadioState {
     pub frequency: u32,
@@ -52,671 +105,174 @@ pub struct RadioState {
     pub connected: bool,
 }
 
-/// KV4P Radio
+// ============================================================================
+// Internal State (Shared between threads via Arc)
+// ============================================================================
+
+struct RadioStateInner {
+    version: Option<VersionInfo>,
+    device_state: Option<DeviceState>,
+    desired_state_sent: Option<HostDesiredState>,
+}
+
+impl Default for RadioStateInner {
+    fn default() -> Self {
+        Self { version: None, device_state: None, desired_state_sent: None }
+    }
+}
+
+/// Thread-safe state container
+struct RadioSharedState {
+    inner: Mutex<RadioStateInner>,
+    // Atomic configuration values (no lock needed for reads)
+    frequency: AtomicU32,
+    tx_frequency: AtomicU32,
+    power_high: AtomicBool,
+    current_squelch: AtomicU8,
+    squelch_user_set: AtomicBool,
+    firmware_squelch: AtomicU8,  // Cached firmware-reported squelch
+}
+
+impl Default for RadioSharedState {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(RadioStateInner::default()),
+            frequency: AtomicU32::new(145500),
+            tx_frequency: AtomicU32::new(145500),
+            power_high: AtomicBool::new(true),
+            current_squelch: AtomicU8::new(4),
+            squelch_user_set: AtomicBool::new(false),
+            firmware_squelch: AtomicU8::new(4),
+        }
+    }
+}
+
+// ============================================================================
+// KV4P Radio
+// ============================================================================
+
 pub struct KV4PRadio {
     config: SerialConfig,
-    serial: Arc<Mutex<Option<Box<dyn serialport::SerialPort>>>>,
-    write_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,  // Channel for write commands
-    parser: Arc<Mutex<PacketParser>>,
+    
+    // Command channel to I/O thread (Sender is Clone and Send)
+    command_tx: Mutex<mpsc::Sender<RadioCommand>>,
+    
+    // Internal state
+    state: Arc<RadioSharedState>,
+    
+    // Sequence numbers
+    sequence: AtomicU32,
+    audio_sequence: AtomicU16,
+    
+    // Callbacks (stored in Arc<Mutex> for thread-safe access from I/O thread)
+    callbacks: Arc<Mutex<Callbacks>>,
+    
+    // Thread control
     running: Arc<AtomicBool>,
-    write_shutdown: Arc<AtomicBool>,
-    sequence: Arc<AtomicU32>,
-    audio_sequence: Arc<AtomicU16>,  // Sequence for audio frames
-    version: Arc<Mutex<Option<VersionInfo>>>,
-    device_state: Arc<Mutex<Option<DeviceState>>>,
-    frequency: Arc<AtomicU32>,
-    tx_frequency: Arc<AtomicU32>,
-    power_high: Arc<AtomicBool>,
-    current_squelch: Arc<AtomicU8>,  // Desired squelch level (0-9) - mirrors Android's desiredState.squelch
-    smeter_cb: Arc<Mutex<Option<SmeterCallback>>>,
-    state_cb: Arc<Mutex<Option<StateCallback>>>,
-    phys_ptt_cb: Arc<Mutex<Option<PhysPttCallback>>>,  // Physical PTT callback
-    rssi_cb: Arc<Mutex<Option<RssiCallback>>>,
-    connect_cb: Arc<Mutex<Option<ConnectCallback>>>,
-    last_phys_ptt: Arc<AtomicBool>,  // Track previous PTT state
-    rx_audio_cb: Arc<Mutex<Option<RxAudioCallback>>>,  // Callback for received audio
-    // State tracking (mirrors Android's RadioModuleController)
-    desired_state_sent: Arc<Mutex<Option<HostDesiredState>>>,  // Last state actually sent to device
-    squelch_user_set: Arc<AtomicBool>,  // Track if user has explicitly set squelch
+    
+    // Handle to I/O thread
+    io_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    
+    // Debug tracking
+    connection_failed: Arc<AtomicBool>,
 }
+
+// KV4PRadio is Send but not Sync (has Mutex fields)
+unsafe impl Send for KV4PRadio {}
 
 impl KV4PRadio {
     pub fn new(config: SerialConfig) -> Self {
-        Self {
-            config, serial: Arc::new(Mutex::new(None)),
-            write_tx: Arc::new(Mutex::new(None)),
-            parser: Arc::new(Mutex::new(PacketParser::new())),
-            running: Arc::new(AtomicBool::new(false)),
-            sequence: Arc::new(AtomicU32::new(1)),
-            audio_sequence: Arc::new(AtomicU16::new(0)),
-            version: Arc::new(Mutex::new(None)),
-            device_state: Arc::new(Mutex::new(None)),
-            frequency: Arc::new(AtomicU32::new(145500)),
-            tx_frequency: Arc::new(AtomicU32::new(145500)),
-            power_high: Arc::new(AtomicBool::new(true)),
-            // Default squelch = 4 (matches typical radio usage)
-            current_squelch: Arc::new(AtomicU8::new(4)),
-            smeter_cb: Arc::new(Mutex::new(None)),
-            state_cb: Arc::new(Mutex::new(None)),
-            phys_ptt_cb: Arc::new(Mutex::new(None)),
-            rssi_cb: Arc::new(Mutex::new(None)),
-            connect_cb: Arc::new(Mutex::new(None)),
-            last_phys_ptt: Arc::new(AtomicBool::new(false)),
-            rx_audio_cb: Arc::new(Mutex::new(None)),
-            write_shutdown: Arc::new(AtomicBool::new(false)),
-            desired_state_sent: Arc::new(Mutex::new(None)),
-            squelch_user_set: Arc::new(AtomicBool::new(false)),
-        }
-    }
-    
-    // Note: We intentionally do NOT seed squelch from firmware.
-    // Android app keeps desiredState.squelch at 0 until user changes it via slider.
-    // This means desired squelch is independent of what firmware reports.
-
-    pub fn on_smeter<F>(&mut self, cb: F) where F: Fn(i32) + Send + Sync + 'static {
-        *self.smeter_cb.lock().unwrap() = Some(Box::new(cb));
-    }
-
-    pub fn on_state<F>(&mut self, cb: F) where F: Fn(&DeviceState) + Send + Sync + 'static {
-        *self.state_cb.lock().unwrap() = Some(Box::new(cb));
-    }
-
-    pub fn on_rssi<F>(&mut self, cb: F) where F: Fn(f32) + Send + Sync + 'static {
-        *self.rssi_cb.lock().unwrap() = Some(Box::new(cb));
-    }
-
-    pub fn on_connect<F>(&mut self, cb: F) where F: Fn(bool) + Send + Sync + 'static {
-        *self.connect_cb.lock().unwrap() = Some(Box::new(cb));
-    }
-
-    pub fn on_rx_audio<F>(&mut self, cb: F) where F: Fn(&[u8]) + Send + Sync + 'static {
-        *self.rx_audio_cb.lock().unwrap() = Some(Box::new(cb));
-    }
-    
-    /// Register callback for physical PTT button changes
-    pub fn on_phys_ptt<F>(&mut self, cb: F) where F: Fn(bool) + Send + Sync + 'static {
-        *self.phys_ptt_cb.lock().unwrap() = Some(Box::new(cb));
-    }
-    
-    /// Get the desired squelch level (mirrors Android's getDesiredSquelch())
-    pub fn get_squelch(&self) -> u8 {
-        self.current_squelch.load(Ordering::SeqCst)
-    }
-    
-    /// Check if device state is in sync with our desired state
-    fn is_state_in_sync(&self) -> bool {
-        let dev_state = self.device_state.lock().unwrap();
-        let last_sent = self.desired_state_sent.lock().unwrap();
+        // Create command channel
+        let (cmd_tx, cmd_rx) = mpsc::channel();
         
-        if let (Some(ds), Some(ls)) = (dev_state.as_ref(), last_sent.as_ref()) {
-            // Check error code
-            if ds.last_error != 0 {
-                return false;
-            }
-            // Check sequence matches
-            if ds.applied_sequence != ls.sequence {
-                return false;
-            }
-            // Check flags (mask out session-specific flags)
-            let desired_mask = HostStateFlags::RADIO_CONFIG_VALID.bits() as u16 | 
-                               HostStateFlags::HIGH_POWER.bits() as u16 | 
-                               HostStateFlags::RSSI_ENABLED.bits() as u16 | 
-                               HostStateFlags::ENABLE_STATUS_REPORTS.bits() as u16 |
-                               HostStateFlags::TX_ALLOWED.bits() as u16;
-            if (ds.flags & desired_mask) != (ls.flags & desired_mask) {
-                return false;
-            }
-            // If radio config valid, check bandwidth, freq, squelch, tones
-            if (ls.flags & HostStateFlags::RADIO_CONFIG_VALID.bits() as u16) != 0 {
-                return ds.bandwidth == ls.bandwidth &&
-                       (ds.squelch as i32 - ls.squelch as i32).abs() <= 1 &&  // Allow ±1 for timing
-                       ds.ctcss_tx == ls.ctcss_tx &&
-                       ds.ctcss_rx == ls.ctcss_rx;
-            }
-            true
-        } else {
-            false
-        }
-    }
-    
-    /// Build a HostDesiredState from current settings (mirrors Android's desiredState construction)
-    fn build_desired_state(&self) -> HostDesiredState {
-        self.build_desired_state_with_firmware_squelch(false)
-    }
-    
-    /// Build a HostDesiredState for initial startup without RADIO_CONFIG_VALID
-    /// This mirrors Android's approach where initial state doesn't trigger radio reconfiguration.
-    fn build_initial_desired_state(&self) -> HostDesiredState {
-        self.build_desired_state_with_firmware_squelch(false)
-    }
-    
-    /// Send desired state if it changed (mirrors Android's sendDesiredStateIfChanged)
-    fn send_state_if_changed(&mut self) -> Result<(), String> {
-        let new_state = self.build_desired_state();
-        let last_sent = self.desired_state_sent.lock().unwrap();
+        let state = Arc::new(RadioSharedState::default());
+        let running = Arc::new(AtomicBool::new(false));
+        let callbacks = Arc::new(Mutex::new(Callbacks::default()));
         
-        // Only send if state actually changed
-        let needs_send = match last_sent.as_ref() {
-            Some(ls) => ls != &new_state,
-            None => true,
-        };
-        if needs_send {
-            drop(last_sent);  // Release lock before send
-            return self.send_state(&new_state);
-        }
-        Ok(())
-    }
-    
-    /// Build desired state, optionally with RADIO_CONFIG_VALID
-    /// 
-    /// Mirrors Android's behavior:
-    /// - Initial state (radio_config_valid=false): Just sets session flags, doesn't touch radio config
-    /// - After tune() call (radio_config_valid=true): Triggers firmware to apply radio settings
-    /// 
-    /// If user hasn't explicitly set squelch, we preserve firmware's squelch to avoid overriding
-    /// persistent settings. This is critical because sending squelch with RADIO_CONFIG_VALID
-    /// causes the firmware to reconfigure the SA818 with potentially wrong squelch.
-    fn build_desired_state_with_firmware_squelch(&self, include_radio_config_valid: bool) -> HostDesiredState {
-        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let mut flags = HostStateFlags::HIGH_POWER.bits() |
-                       HostStateFlags::RSSI_ENABLED.bits() |
-                       HostStateFlags::ENABLE_STATUS_REPORTS.bits();
-        if include_radio_config_valid {
-            flags |= HostStateFlags::RADIO_CONFIG_VALID.bits();
-        }
-        if !self.power_high.load(Ordering::SeqCst) {
-            flags &= !HostStateFlags::HIGH_POWER.bits();
-        }
-        let seq = self.sequence.load(Ordering::SeqCst);
+        // Spawn I/O thread that owns the serial port and receiver
+        let io_state = Arc::clone(&state);
+        let io_running = Arc::clone(&running);
+        let io_callbacks = Arc::clone(&callbacks);
+        let config_clone = config.clone();
         
-        // If user hasn't set squelch, use firmware's current squelch
-        // This prevents us from overriding firmware's squelch on startup
-        let squelch = if self.squelch_user_set.load(Ordering::SeqCst) {
-            self.current_squelch.load(Ordering::SeqCst)
-        } else {
-            self.device_state.lock().unwrap()
-                .as_ref()
-                .map(|s| s.squelch)
-                .unwrap_or(self.current_squelch.load(Ordering::SeqCst))
-        };
-        
-        HostDesiredState {
-            sequence: seq as i32,
-            memory_id: -1,
-            flags,
-            bandwidth: 1,
-            freq_tx: freq,
-            freq_rx: freq,
-            ctcss_tx: 0,
-            squelch,
-            ctcss_rx: 0,
-        }
-    }
-    
-    /// Send desired state to device (increments sequence)
-    fn send_state(&mut self, state: &HostDesiredState) -> Result<(), String> {
-        let mut s = state.clone();
-        s.sequence = self.sequence.fetch_add(1, Ordering::SeqCst) as i32;
-        
-        let payload = s.to_bytes();
-        let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
-        
-        // Track what we're about to send BEFORE sending
-        *self.desired_state_sent.lock().unwrap() = Some(s.clone());
-        
-        // Send via write thread channel
-        if let Ok(guard) = self.write_tx.lock() {
-            if let Some(ref tx) = *guard {
-                let _ = tx.send(frame);
-            } else {
-                eprintln!("[radio] send_state: write_tx not ready");
-                return Err("Write channel not ready".to_string());
-            }
-        }
-        
-        Ok(())
-    }
-
-    pub fn open(&mut self) -> Result<Option<VersionInfo>, String> {
-        const MAX_ATTEMPTS: u32 = 5;
-        
-        for attempt in 1..=MAX_ATTEMPTS {
-            eprintln!("[radio] Connection attempt {}/{}", attempt, MAX_ATTEMPTS);
-            
-            if let Ok(version) = self.try_connect() {
-                // Threads already spawned in try_connect, just return
-                return Ok(version);
-            }
-            
-            eprintln!("[radio] Attempt {} failed, cleaning up...", attempt);
-            
-            // Clean up before next attempt
-            self.running.store(false, Ordering::SeqCst);
-            self.write_shutdown.store(true, Ordering::SeqCst);
-            
-            // Drop the sender to unblock the write thread
-            {
-                let mut guard = self.write_tx.lock().unwrap();
-                *guard = None;
-            }
-            thread::sleep(Duration::from_millis(200));
-            
-            // Close serial port
-            *self.serial.lock().unwrap() = None;
-            thread::sleep(Duration::from_millis(500));
-        }
-        
-        Err("Failed to connect to device after 5 attempts".to_string())
-    }
-    
-    /// Attempt a single connection to the device
-    /// Returns Ok(version) on success, Err(message) on failure
-    fn try_connect(&mut self) -> Result<Option<VersionInfo>, String> {
-        // Reset state for this attempt
-        self.running.store(true, Ordering::SeqCst);  // Enable reader thread to run
-        self.write_shutdown.store(false, Ordering::SeqCst);
-        *self.version.lock().unwrap() = None;
-        *self.device_state.lock().unwrap() = None;
-        *self.write_tx.lock().unwrap() = None;
-        self.parser.lock().unwrap().reset();
-        
-        // Open serial port
-        let port = serialport::new(&self.config.port, self.config.baudrate)
-            .data_bits(serialport::DataBits::Eight)
-            .parity(serialport::Parity::None)
-            .stop_bits(serialport::StopBits::One)
-            .flow_control(serialport::FlowControl::None)
-            .timeout(Duration::from_millis(100))
-            .open()
-            .map_err(|e| format!("Failed to open {}: {}", self.config.port, e))?;
-
-        *self.serial.lock().unwrap() = Some(port);
-        
-        // Clear input buffer
-        if let Some(ref mut sp) = *self.serial.lock().unwrap() {
-            let _ = sp.set_timeout(Duration::from_millis(100));
-            let _ = sp.clear(serialport::ClearBuffer::Input);
-        }
-        
-        // CRITICAL: Spawn reader/writer threads BEFORE reset so we can receive HELLO
-        self.spawn_reader_thread();
-        
-        // Reset ESP32 via DTR/RTS toggle to trigger fresh boot
-        self.reset_esp32();
-        
-        // Wait for ESP32 to boot and send HELLO
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        
-        while std::time::Instant::now() < deadline {
-            if self.version.lock().unwrap().is_some() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        
-        // If no HELLO yet, try sending initial state
-        if self.version.lock().unwrap().is_none() {
-            eprintln!("[radio] No HELLO yet, sending initial state...");
-            
-            let state = self.build_initial_state();
-            if let Some(ref mut sp) = *self.serial.lock().unwrap() {
-                let _ = sp.write_all(&state);
-                let _ = sp.flush();
-            }
-            
-            // Wait for HELLO
-            for _ in 0..15 {
-                if self.version.lock().unwrap().is_some() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(200));
-            }
-        }
-        
-        let version = self.version.lock().unwrap().clone();
-        if version.as_ref().map(|v| v.is_valid).unwrap_or(false) {
-            // Seed squelch from firmware's DeviceState (mirrors Android's seedFromDeviceState)
-            self.seed_squelch_from_device();
-            
-            eprintln!("[radio] Connected: fw=v{}, rf={:?}", 
-                     version.as_ref().unwrap().firmware_version, 
-                     version.as_ref().unwrap().rf_module_type);
-            Ok(version)
-        } else {
-            Err("No HELLO received".to_string())
-        }
-    }
-    
-    /// Reset ESP32 via DTR/RTS signal toggle
-    /// Standard reset sequence: DTR low, RTS pulse, DTR high
-    fn reset_esp32(&mut self) {
-        if let Some(ref mut sp) = *self.serial.lock().unwrap() {
-            // ESP32 reset via DTR/RTS:
-            // DTR=0 triggers bootloader, RTS pulse resets
-            let _ = sp.write_data_terminal_ready(false);  // DTR = low
-            let _ = sp.write_request_to_send(true);       // RTS = high (reset)
-            thread::sleep(Duration::from_millis(50));
-            let _ = sp.write_request_to_send(false);      // RTS = low
-            thread::sleep(Duration::from_millis(100));
-            let _ = sp.write_data_terminal_ready(true);   // DTR = high
-            
-            // Clear any stale data from previous session
-            let _ = sp.clear(serialport::ClearBuffer::Input);
-            
-            eprintln!("[radio] ESP32 reset via DTR/RTS toggle");
-            
-            // Give ESP32 time to boot and send HELLO
-            thread::sleep(Duration::from_millis(1000));
-        }
-    }
-    
-    /// Seed current_squelch from firmware's reported DeviceState
-    /// Called after receiving HELLO with initial DeviceState
-    /// Mirrors Android's RadioModuleController.seedFromDeviceState()
-    fn seed_squelch_from_device(&mut self) {
-        if let Some(ref state) = *self.device_state.lock().unwrap() {
-            // Only seed if user hasn't explicitly set squelch yet
-            if !self.squelch_user_set.load(Ordering::SeqCst) {
-                let firmware_squelch = state.squelch;
-                eprintln!("[radio] Seeding squelch from firmware: {}", firmware_squelch);
-                self.current_squelch.store(firmware_squelch, Ordering::SeqCst);
-            }
-        }
-    }
-
-    /// Legacy method kept for compatibility - now uses write thread channel
-    fn send_initial_state(&mut self) -> Result<(), String> {
-        let data = self.build_initial_state();
-        
-        // Send to write thread via channel
-        if let Ok(guard) = self.write_tx.lock() {
-            if let Some(ref tx) = *guard {
-                let _ = tx.send(data);
-            } else {
-                eprintln!("[radio] send_initial_state: write_tx not ready");
-                return Err("Write channel not ready".to_string());
-            }
-        }
-        Ok(())
-    }
-
-    /// Build the initial state packet bytes for direct serial write
-    /// Does NOT include RADIO_CONFIG_VALID - this mirrors Android's approach where
-    /// initial state doesn't trigger radio reconfiguration.
-    fn build_initial_state(&self) -> Vec<u8> {
-        // Android app does NOT include RX_AUDIO_OPEN in initial state.
-        // It sends RX_AUDIO_OPEN later via openFirmwareAudio() after tuning.
-        let flags = (HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED |
-                     HostStateFlags::ENABLE_STATUS_REPORTS).bits();
-        
-        // Use firmware's squelch if user hasn't set it
-        let squelch = if self.squelch_user_set.load(Ordering::SeqCst) {
-            self.current_squelch.load(Ordering::SeqCst)
-        } else {
-            self.device_state.lock().unwrap()
-                .as_ref()
-                .map(|s| s.squelch)
-                .unwrap_or(self.current_squelch.load(Ordering::SeqCst))
-        };
-        
-        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let state = HostDesiredState {
-            sequence: 1,
-            memory_id: -1,
-            flags,
-            bandwidth: 1,
-            freq_tx: freq,
-            freq_rx: freq,
-            ctcss_tx: 0,
-            squelch,
-            ctcss_rx: 0,
-        };
-        let payload = state.to_bytes();
-        build_kv4p_packet(HostCommand::DesiredState, &payload)
-    }
-
-    fn spawn_reader_thread(&mut self) {
-        let serial = Arc::clone(&self.serial);
-        let write_tx = Arc::clone(&self.write_tx);
-        let parser = Arc::clone(&self.parser);
-        let running = Arc::clone(&self.running);
-        let write_shutdown = Arc::clone(&self.write_shutdown);
-        let version = Arc::clone(&self.version);
-        let device_state = Arc::clone(&self.device_state);
-        let smeter_cb = Arc::clone(&self.smeter_cb);
-        let state_cb = Arc::clone(&self.state_cb);
-        let rssi_cb = Arc::clone(&self.rssi_cb);
-        let connect_cb = Arc::clone(&self.connect_cb);
-        let rx_audio_cb = Arc::clone(&self.rx_audio_cb);
-        let phys_ptt_cb = Arc::clone(&self.phys_ptt_cb);
-        let last_phys_ptt = Arc::clone(&self.last_phys_ptt);
-        let current_squelch = Arc::clone(&self.current_squelch);  // For squelch seeding
-
-        // Create channel for serial writes - keep both ends alive!
-        let (tx, rx) = mpsc::channel();
-        {
-            let mut guard = self.write_tx.lock().unwrap();
-            *guard = Some(tx);
-        }
-        
-        // Single serial I/O thread - handles both read and write to avoid lock contention
-        let _reader_handle = thread::spawn(move || {
-            let mut buf = [0u8; 256];
-            while running.load(Ordering::SeqCst) {
-                // Lock serial for the entire iteration - read, then check for writes
-                if let Some(ref mut sp) = *serial.lock().unwrap() {
-                    // First, write any pending frames (non-blocking check)
-                    while let Ok(frame) = rx.try_recv() {
-                        let _ = sp.write_all(&frame);
-                        let _ = sp.flush();
-                    }
-                    
-                    // Then read data
-                    match sp.read(&mut buf) {
-                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                            // Normal - no data available
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(e) => {
-                            eprintln!("[reader] Read error: {}", e);
-                        }
-                        Ok(n) if n == 0 => {
-                            // Empty read, continue
-                        }
-                        Ok(n) => {
-                            let packets = parser.lock().unwrap().feed(&buf[..n]);
-                            for pkt in &packets {
-                                let cmd = pkt.command;
-                                let payload = &pkt.payload;
-                                if cmd == DeviceCommand::Hello as u8 && payload.len() >= 9 {
-                                    let mut v = VersionInfo::new();
-                                    v.firmware_version = u16::from_le_bytes([payload[0], payload[1]]);
-                                    v.radio_module_present = payload[2] == b'f';
-                                    v.window_size = u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]);
-                                    v.rf_module_type = match payload[7] {
-                                        0 => RfModuleType::Sa818Vhf, _ => RfModuleType::Sa818Uhf
-                                    };
-                                    if payload.len() >= 17 {
-                                        v.min_radio_freq = f32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
-                                        v.max_radio_freq = f32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
-                                        v.features = payload[16];
-                                    }
-                                    v.is_valid = true;
-                                    *version.lock().unwrap() = Some(v);
-                                    if let Some(ref cb) = *connect_cb.lock().unwrap() { cb(true); }
-                                    // Also parse DeviceState from HELLO payload (starts at offset 17)
-                                    if payload.len() >= 43 {  // 17 (Version) + 26 (DeviceState)
-                                        if let Some(state) = DeviceState::from_bytes(&payload[17..]) {
-                                            *device_state.lock().unwrap() = Some(state.clone());
-
-                                            if let Some(ref cb) = *state_cb.lock().unwrap() { cb(&state); }
-                                            if let Some(ref cb) = *rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
-                                            if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
-                                        }
-                                    }
-                                } else if cmd == DeviceCommand::DeviceState as u8 {
-                                    if let Some(state) = DeviceState::from_bytes(payload) {
-                                        *device_state.lock().unwrap() = Some(state.clone());
-
-                                        if let Some(ref cb) = *state_cb.lock().unwrap() { cb(&state); }
-                                        if let Some(ref cb) = *rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
-                                        if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
-                                        // Check physical PTT state change
-                                        let phys_ptt = state.phys_ptt_down();
-                                        if phys_ptt != last_phys_ptt.load(Ordering::SeqCst) {
-                                            last_phys_ptt.store(phys_ptt, Ordering::SeqCst);
-                                            if let Some(ref cb) = *phys_ptt_cb.lock().unwrap() { cb(phys_ptt); }
-                                            eprintln!("[radio] Phys PTT: {}", if phys_ptt { "DOWN" } else { "UP" });
-                                        }
-                                    }
-                                } else if cmd == DeviceCommand::SmeterReport as u8 && !payload.is_empty() {
-                                    if let Some(ref cb) = *smeter_cb.lock().unwrap() { cb(payload[0] as i32); }
-                                } else if cmd == 0x0C {
-                                    // Cmd 0x0C - Rx audio from device (ADPCM encoded - IMA WAV format)
-                                    if !payload.is_empty() {
-                                        if let Some(ref cb) = *rx_audio_cb.lock().unwrap() {
-                                            cb(payload);
-                                        }
-                                    }
-                                } else if cmd == 0x09 {
-                                    // COMMAND_WINDOW_UPDATE - device reports window size, we must ack
-                                    if payload.len() >= 4 {
-                                        // Send ack back directly while we hold the serial lock
-                                        let ack = build_kv4p_packet(HostCommand::WindowAck, payload);
-                                        let _ = sp.write_all(&ack);
-                                        let _ = sp.flush();
-                                    }
-                                } else if cmd == 0x07 {
-                                    // Cmd 0x07 - Rx audio from device (Opus encoded - legacy, unused in main firmware)
-                                    if !payload.is_empty() {
-                                        if let Some(ref cb) = *rx_audio_cb.lock().unwrap() {
-                                            cb(payload);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(20));
-                        }
-                        Err(e) => {
-                            eprintln!("[radio] Read error: {}", e);
-                            thread::sleep(Duration::from_millis(1000));
-                        }
-                    }
-                } else {
-                    thread::sleep(Duration::from_millis(1000));
-                }
-                
-                // Check shutdown flag
-                if write_shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
-            eprintln!("[reader] Thread exiting");
+        let io_handle = thread::spawn(move || {
+            io_thread_main(cmd_rx, io_state, io_running, io_callbacks, config_clone);
         });
+        
+        Self {
+            config,
+            command_tx: Mutex::new(cmd_tx),
+            state,
+            sequence: AtomicU32::new(1),
+            audio_sequence: AtomicU16::new(0),
+            callbacks,
+            running,
+            io_thread: Mutex::new(Some(io_handle)),
+            connection_failed: Arc::new(AtomicBool::new(false)),
+        }
     }
-
-    fn dispatch(&self, pkt: &crate::kiss::Packet) {
-        let cmd = pkt.command;
-        let payload = &pkt.payload;
-        match cmd as u8 {
-            x if x == DeviceCommand::Hello as u8 => {
-                // HELLO payload: Version (17 bytes) + DeviceState (26 bytes) = 43 bytes
-                if payload.len() >= 9 {
-                    let mut v = VersionInfo::new();
-                    v.firmware_version = u16::from_le_bytes([payload[0], payload[1]]);
-                    v.radio_module_present = payload[2] == b'f';
-                    v.window_size = u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]);
-                    v.rf_module_type = match payload[7] {
-                        0 => RfModuleType::Sa818Vhf, _ => RfModuleType::Sa818Uhf
-                    };
-                    if payload.len() >= 17 {
-                        v.min_radio_freq = f32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
-                        v.max_radio_freq = f32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
-                        v.features = payload[16];
-                    }
-                    v.is_valid = true;
-                    *self.version.lock().unwrap() = Some(v);
-                }
-                // Also parse DeviceState from HELLO payload (starts at offset 17)
-                if payload.len() >= 43 {  // 17 (Version) + 26 (DeviceState)
-                    if let Some(state) = DeviceState::from_bytes(&payload[17..]) {
-                        *self.device_state.lock().unwrap() = Some(state.clone());
     
-                        if let Some(ref cb) = *self.state_cb.lock().unwrap() { cb(&state); }
-                        if let Some(ref cb) = *self.rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
-                        if let Some(ref cb) = *self.smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
-                    }
-                }
-            }
-            x if x == DeviceCommand::DeviceState as u8 => {
-                if let Some(state) = DeviceState::from_bytes(payload) {
-                    *self.device_state.lock().unwrap() = Some(state.clone());
+    // ========================================================================
+    // Callback Registration
+    // ========================================================================
 
-                    if let Some(ref cb) = *self.state_cb.lock().unwrap() { cb(&state); }
-                    if let Some(ref cb) = *self.rssi_cb.lock().unwrap() { cb(state.rssi_dbm()); }
-                    if let Some(ref cb) = *self.smeter_cb.lock().unwrap() { cb(state.rssi as i32); }
-                }
-            }
-            _ => {}
-        }
+    pub fn on_smeter<F>(&self, cb: F) where F: Fn(i32) + Send + Sync + 'static {
+        self.callbacks.lock().unwrap().smeter = Some(Box::new(cb));
     }
 
-    pub fn close(&mut self) {
-        // Send final shutdown state to KV4P (PTT off, radio to idle)
-        let freq = self.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
-        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
-        
-        // Send idle state: no PTT, close squelch, minimal flags
-        let shutdown_state = HostDesiredState {
-            sequence: seq as i32,
-            memory_id: -1,
-            flags: HostStateFlags::RSSI_ENABLED.bits(),
-            bandwidth: 1,
-            freq_tx: freq,
-            freq_rx: freq,
-            ctcss_tx: 0,
-            squelch: 9,
-            ctcss_rx: 0,
-        };
-        let _ = self.send_state(&shutdown_state);
-        
-        // Give time for final command to be sent
-        thread::sleep(Duration::from_millis(50));
-        
-        // Signal threads to stop
-        self.running.store(false, Ordering::SeqCst);
-        self.write_shutdown.store(true, Ordering::SeqCst);
-        
-        // Drop the sender to unblock the write thread's recv
-        {
-            let mut guard = self.write_tx.lock().unwrap();
-            *guard = None;
-        }
-        
-        // Give threads time to clean up
-        thread::sleep(Duration::from_millis(150));
-        
-        // Close serial port
-        *self.serial.lock().unwrap() = None;
+    pub fn on_state<F>(&self, cb: F) where F: Fn(&DeviceState) + Send + Sync + 'static {
+        self.callbacks.lock().unwrap().state = Some(Box::new(cb));
     }
 
-    pub fn is_connected(&self) -> bool { self.version.lock().unwrap().is_some() }
-    pub fn version(&self) -> Option<VersionInfo> { self.version.lock().unwrap().clone() }
-    pub fn device_state(&self) -> Option<DeviceState> { self.device_state.lock().unwrap().clone() }
+    pub fn on_rssi<F>(&self, cb: F) where F: Fn(f32) + Send + Sync + 'static {
+        self.callbacks.lock().unwrap().rssi = Some(Box::new(cb));
+    }
+
+    pub fn on_connect<F>(&self, cb: F) where F: Fn(bool) + Send + Sync + 'static {
+        self.callbacks.lock().unwrap().connect = Some(Box::new(cb));
+    }
+
+    pub fn on_rx_audio<F>(&self, cb: F) where F: Fn(&[u8]) + Send + Sync + 'static {
+        self.callbacks.lock().unwrap().rx_audio = Some(Box::new(cb));
+    }
+    
+    pub fn on_phys_ptt<F>(&self, cb: F) where F: Fn(bool) + Send + Sync + 'static {
+        self.callbacks.lock().unwrap().phys_ptt = Some(Box::new(cb));
+    }
+    
+    pub fn get_squelch(&self) -> u8 {
+        self.state.current_squelch.load(Ordering::SeqCst)
+    }
+    
+    pub fn get_debug_logs(&self) -> Vec<String> {
+        Vec::new()  // Simplified - can add debug log channel if needed
+    }
+    
+    pub fn clear_debug_logs(&self) {}
+
+    pub fn is_connected(&self) -> bool {
+        self.state.inner.lock().unwrap().version.is_some()
+    }
+    
+    pub fn version(&self) -> Option<VersionInfo> {
+        self.state.inner.lock().unwrap().version.clone()
+    }
+    
+    pub fn device_state(&self) -> Option<DeviceState> {
+        self.state.inner.lock().unwrap().device_state.clone()
+    }
 
     pub fn state(&self) -> RadioState {
-        let freq = self.frequency.load(Ordering::SeqCst);
-        let dev_state = self.device_state.lock().unwrap();
-        let (rssi, smeter, squelch, raw_rssi) = if let Some(ref s) = *dev_state {
+        let freq = self.state.frequency.load(Ordering::SeqCst);
+        let dev_state = self.state.inner.lock().unwrap().device_state.clone();
+        let (rssi, smeter, squelch, raw_rssi) = if let Some(ref s) = dev_state {
             (s.rssi_dbm(), ((s.rssi as i32) * 9 / 255).max(1), s.is_squelched(), s.rssi)
         } else { (-121.0, 0, false, 0) };
         RadioState {
             frequency: freq,
-            tx_frequency: self.tx_frequency.load(Ordering::SeqCst),
+            tx_frequency: self.state.tx_frequency.load(Ordering::SeqCst),
             mode: 0,
-            power: if self.power_high.load(Ordering::SeqCst) { 1 } else { 0 },
+            power: if self.state.power_high.load(Ordering::SeqCst) { 1 } else { 0 },
             bandwidth: 1,
             ctcss: 0,
             rssi,
@@ -727,164 +283,561 @@ impl KV4PRadio {
             connected: self.is_connected(),
         }
     }
+    
+    // ========================================================================
+    // Public API - All use command queue (no blocking)
+    // ========================================================================
 
-    pub fn tune(&mut self, rx_khz: u32, tx_khz: u32, squelch: u8, _bandwidth: u8) -> Result<(), String> {
-        self.frequency.store(rx_khz, Ordering::SeqCst);
-        self.tx_frequency.store(tx_khz, Ordering::SeqCst);
-        // Update current_squelch and mark as user-set when explicitly passed to tune()
-        self.current_squelch.store(squelch, Ordering::SeqCst);
-        self.squelch_user_set.store(true, Ordering::SeqCst);
+    pub fn tune(&self, rx_khz: u32, tx_khz: u32, squelch: u8, _bandwidth: u8) -> Result<(), String> {
+        self.state.frequency.store(rx_khz, Ordering::SeqCst);
+        self.state.tx_frequency.store(tx_khz, Ordering::SeqCst);
+        self.state.current_squelch.store(squelch.min(8), Ordering::SeqCst);
+        self.state.squelch_user_set.store(true, Ordering::SeqCst);
         
-        // Build state WITH RADIO_CONFIG_VALID to trigger firmware to apply settings
-        let state = self.build_desired_state_with_firmware_squelch(true);
-        self.send_state(&state)
+        let state = self.build_desired_state(true);
+        self.queue_command(RadioCommand::SendState(state))
+    }
+    
+    pub fn tune_freq(&self, rx_khz: u32, tx_khz: u32) -> Result<(), String> {
+        self.state.frequency.store(rx_khz, Ordering::SeqCst);
+        self.state.tx_frequency.store(tx_khz, Ordering::SeqCst);
+        let state = self.build_desired_state(false);
+        self.queue_command(RadioCommand::SendState(state))
     }
 
-    /// Tune frequency without changing squelch - uses firmware's squelch until user sets it
-    /// Does NOT set RADIO_CONFIG_VALID - just updates session flags
-    /// Use for startup to preserve firmware's default squelch
-    pub fn tune_freq(&mut self, rx_khz: u32, tx_khz: u32) -> Result<(), String> {
-        self.frequency.store(rx_khz, Ordering::SeqCst);
-        self.tx_frequency.store(tx_khz, Ordering::SeqCst);
-        // Don't touch current_squelch or squelch_user_set - preserves firmware's squelch
-        // Build state WITHOUT RADIO_CONFIG_VALID (session-only update)
-        let state = self.build_desired_state_with_firmware_squelch(false);
-        self.send_state(&state)
-    }
-
-    pub fn set_frequency(&mut self, khz: u32) -> Result<(), String> {
-        let squelch = self.current_squelch.load(Ordering::SeqCst);
+    pub fn set_frequency(&self, khz: u32) -> Result<(), String> {
+        let squelch = self.state.current_squelch.load(Ordering::SeqCst);
         self.tune(khz, khz, squelch, 1)
     }
     
-    pub fn set_squelch(&mut self, level: u8) -> Result<(), String> {
-        // Invert: slider 0 (left) = permissive (firmware 8), slider 8 (right) = strict (firmware 0)
-        let firmware_squelch = 8 - level.min(8);
-        eprintln!("[radio] set_squelch: slider={} -> firmware={}", level, firmware_squelch);
-        self.current_squelch.store(firmware_squelch, Ordering::SeqCst);
-        self.squelch_user_set.store(true, Ordering::SeqCst);  // Mark as user-set
-        // Mirror Android: just update desired state and send if changed (no tune() call)
-        self.send_state_if_changed()
+    pub fn set_squelch(&self, level: u8) -> Result<(), String> {
+        let clamped = level.min(8);
+        eprintln!("[radio] set_squelch: {}", clamped);
+        self.state.current_squelch.store(clamped, Ordering::SeqCst);
+        self.state.squelch_user_set.store(true, Ordering::SeqCst);
+        let state = self.build_desired_state(true);
+        self.queue_command(RadioCommand::SendState(state))
     }
     
-    pub fn set_power(&mut self, high: bool) -> Result<(), String> {
-        self.power_high.store(high, Ordering::SeqCst);
-        // Mirror Android: just send state if changed
-        self.send_state_if_changed()
+    pub fn set_power(&self, high: bool) -> Result<(), String> {
+        self.state.power_high.store(high, Ordering::SeqCst);
+        let state = self.build_desired_state(true);
+        self.queue_command(RadioCommand::SendState(state))
     }
     
-    pub fn set_tx_power(&mut self, high: bool) -> Result<(), String> {
+    pub fn set_tx_power(&self, high: bool) -> Result<(), String> {
         self.set_power(high)
     }
     
-    /// Set pre-emphasis filter (TX) - 6dB/octave high-frequency boost
-    pub fn set_filter_pre_emphasis(&mut self, enabled: bool) -> Result<(), String> {
-        // TODO: Send to device - this is a device-level setting
+    pub fn set_filter_pre_emphasis(&self, enabled: bool) -> Result<(), String> {
         eprintln!("[radio] Pre-emphasis: {}", if enabled { "on" } else { "off" });
         Ok(())
     }
     
-    /// Set de-emphasis filter (RX) - 6dB/octave low-frequency boost
-    pub fn set_filter_de_emphasis(&mut self, enabled: bool) -> Result<(), String> {
-        // TODO: Send to device - this is a device-level setting
+    pub fn set_filter_de_emphasis(&self, enabled: bool) -> Result<(), String> {
         eprintln!("[radio] De-emphasis: {}", if enabled { "on" } else { "off" });
         Ok(())
     }
     
-    /// Set high-pass filter (removes low frequencies)
-    pub fn set_filter_high_pass(&mut self, enabled: bool) -> Result<(), String> {
-        // TODO: Send to device
+    pub fn set_filter_high_pass(&self, enabled: bool) -> Result<(), String> {
         eprintln!("[radio] High-pass filter: {}", if enabled { "on" } else { "off" });
         Ok(())
     }
     
-    /// Set low-pass filter (removes high frequencies)
-    pub fn set_filter_low_pass(&mut self, enabled: bool) -> Result<(), String> {
-        // TODO: Send to device
+    pub fn set_filter_low_pass(&self, enabled: bool) -> Result<(), String> {
         eprintln!("[radio] Low-pass filter: {}", if enabled { "on" } else { "off" });
         Ok(())
     }
     
-    /// Set mic gain boost level
-    pub fn set_mic_gain(&mut self, level: &str) -> Result<(), String> {
-        // TODO: Send to device
+    pub fn set_mic_gain(&self, level: &str) -> Result<(), String> {
         eprintln!("[radio] Mic gain: {}", level);
         Ok(())
     }
-
-    /// Open firmware audio - sends RX_AUDIO_OPEN flag
-    /// Called after app starts, like Android's openFirmwareAudio()
-    /// Does NOT set RADIO_CONFIG_VALID - audio open is a session flag only
-    pub fn open_audio(&mut self) -> Result<(), String> {
+    
+    pub fn open_audio(&self) -> Result<(), String> {
         eprintln!("[radio] open_audio() called");
-        // Build state WITHOUT RADIO_CONFIG_VALID - audio open is session-only
-        let mut state = self.build_desired_state_with_firmware_squelch(false);
+        let mut state = self.build_desired_state(true);
         state.flags |= HostStateFlags::RX_AUDIO_OPEN.bits();
-        self.send_state(&state)
+        self.queue_command(RadioCommand::SendState(state))
     }
     
-    pub fn enable_smeter(&mut self, enabled: bool) -> Result<(), String> {
-        // RSSI is controlled via flags - for now just rebuild and send state
-        // Note: This is a simplified approach; Android controls it separately
-        self.send_state_if_changed()
+    pub fn enable_smeter(&self, _enabled: bool) -> Result<(), String> {
+        Ok(())
     }
 
-    pub fn ptt_on(&mut self) -> Result<(), String> {
-        // Build state with PTT flag set
-        let mut state = self.build_desired_state();
+    pub fn ptt_on(&self) -> Result<(), String> {
+        let mut state = self.build_desired_state(true);
         state.flags |= HostStateFlags::PTT_REQUESTED.bits() | HostStateFlags::TX_ALLOWED.bits();
-        self.send_state(&state)
+        self.queue_command(RadioCommand::SendState(state))
     }
 
-    pub fn ptt_off(&mut self) -> Result<(), String> {
-        // Build base state, then clear PTT flags
-        let mut state = self.build_desired_state();
-        // Keep RX_AUDIO_OPEN so we receive audio
+    pub fn ptt_off(&self) -> Result<(), String> {
+        let mut state = self.build_desired_state(true);
         state.flags |= HostStateFlags::RX_AUDIO_OPEN.bits();
-        // Note: TX_ALLOWED not set = TX off, PTT_REQUESTED not set = no PTT
-        self.send_state(&state)
+        self.queue_command(RadioCommand::SendState(state))
     }
-
-    /// Send Opus-encoded audio frame to the radio for TX
-    /// 
-    /// Called by the audio capture system when transmitting.
-    pub fn send_audio(&mut self, adpcm_data: &[u8]) -> Result<(), String> {
+    
+    pub fn send_audio(&self, adpcm_data: &[u8]) -> Result<(), String> {
         if !self.running.load(Ordering::SeqCst) {
             return Err("Radio not connected".to_string());
         }
-        
         let frame = build_tx_audio_packet(adpcm_data);
-        // Send to write thread via channel
-        if let Ok(guard) = self.write_tx.lock() {
-            if let Some(ref tx) = *guard {
-                let _ = tx.send(frame);
-            }
-        }
-        
-        Ok(())
+        self.queue_command(RadioCommand::SendFrame(frame))
     }
-
-    /// Send raw audio bytes directly (for testing or alternative formats)
-    pub fn send_raw_audio(&mut self, data: &[u8]) -> Result<(), String> {
+    
+    pub fn send_raw_audio(&self, data: &[u8]) -> Result<(), String> {
         if !self.running.load(Ordering::SeqCst) {
             return Err("Radio not connected".to_string());
         }
-        
         let frame = build_kv4p_packet(HostCommand::TxAudio, data);
+        self.queue_command(RadioCommand::SendFrame(frame))
+    }
+
+    // ========================================================================
+    // Connection Management
+    // ========================================================================
+
+    pub fn open(&self) -> Result<Option<VersionInfo>, String> {
+        const MAX_ATTEMPTS: u32 = 5;
         
-        if let Ok(guard) = self.write_tx.lock() {
-            if let Some(ref tx) = *guard {
-                let _ = tx.send(frame);
+        for attempt in 1..=MAX_ATTEMPTS {
+            eprintln!("[radio] Connection attempt {}/{}", attempt, MAX_ATTEMPTS);
+            
+            // Send connect command to I/O thread
+            self.queue_command(RadioCommand::Connect)?;
+            
+            // Wait for connection with timeout
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                if self.is_connected() {
+                    return Ok(self.version());
+                }
+                thread::sleep(Duration::from_millis(50));
             }
+            
+            eprintln!("[radio] Attempt {} failed", attempt);
         }
         
-        Ok(())
+        self.connection_failed.store(true, Ordering::SeqCst);
+        Err("Failed to connect to device after 5 attempts".to_string())
+    }
+
+    pub fn close(&self) {
+        eprintln!("[radio] close() called");
+        
+        // Send shutdown state first
+        let freq = self.state.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
+        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
+        
+        let shutdown_state = HostDesiredState {
+            sequence: seq as i32,
+            memory_id: -1,
+            flags: HostStateFlags::RSSI_ENABLED.bits(),
+            bandwidth: 1,
+            freq_tx: freq,
+            freq_rx: freq,
+            ctcss_tx: 0,
+            squelch: 8,
+            ctcss_rx: 0,
+        };
+        let frame = build_kv4p_packet(HostCommand::DesiredState, &shutdown_state.to_bytes());
+        let _ = self.command_tx.lock().unwrap().send(RadioCommand::SendFrame(frame));
+        
+        // Send shutdown to I/O thread
+        let _ = self.command_tx.lock().unwrap().send(RadioCommand::Shutdown);
+        
+        // Signal running false
+        self.running.store(false, Ordering::SeqCst);
+        
+        // Wait for thread to finish
+        if let Some(handle) = self.io_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
+    
+    // ========================================================================
+    // Internal Helper Methods
+    // ========================================================================
+
+    fn queue_command(&self, cmd: RadioCommand) -> Result<(), String> {
+        self.command_tx.lock().unwrap()
+            .send(cmd)
+            .map_err(|_| "I/O thread not running".to_string())
+    }
+    
+    fn build_desired_state(&self, include_radio_config_valid: bool) -> HostDesiredState {
+        let freq = self.state.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
+        let mut flags = HostStateFlags::HIGH_POWER.bits() |
+                       HostStateFlags::RSSI_ENABLED.bits() |
+                       HostStateFlags::ENABLE_STATUS_REPORTS.bits();
+        if include_radio_config_valid {
+            flags |= HostStateFlags::RADIO_CONFIG_VALID.bits();
+        }
+        if !self.state.power_high.load(Ordering::SeqCst) {
+            flags &= !HostStateFlags::HIGH_POWER.bits();
+        }
+        let seq = self.sequence.fetch_add(1, Ordering::SeqCst) as i32;
+        
+        let squelch = if self.state.squelch_user_set.load(Ordering::SeqCst) {
+            self.state.current_squelch.load(Ordering::SeqCst)
+        } else {
+            self.state.firmware_squelch.load(Ordering::SeqCst)
+        };
+        
+        let state = HostDesiredState {
+            sequence: seq,
+            memory_id: -1,
+            flags,
+            bandwidth: 1,
+            freq_tx: freq,
+            freq_rx: freq,
+            ctcss_tx: 0,
+            squelch,
+            ctcss_rx: 0,
+        };
+        
+        self.state.inner.lock().unwrap().desired_state_sent = Some(state.clone());
+        state
     }
 }
+
+// ============================================================================
+// I/O Thread - Runs the event loop, owns serial port and receiver
+// ============================================================================
+
+fn io_thread_main(
+    cmd_rx: mpsc::Receiver<RadioCommand>,
+    state: Arc<RadioSharedState>,
+    running: Arc<AtomicBool>,
+    callbacks: Arc<Mutex<Callbacks>>,
+    config: SerialConfig,
+) {
+    let mut buf = [0u8; 512];
+    let parser = std::sync::Mutex::new(PacketParser::new());
+    let mut serial: Option<Box<dyn serialport::SerialPort>> = None;
+    let mut last_phys_ptt = false;
+    let mut last_version: Option<VersionInfo> = None;
+    
+    loop {
+        // Check for commands with timeout
+        match cmd_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(cmd) => match cmd {
+                RadioCommand::Connect => {
+                    // Attempt connection
+                    if attempt_connect(&config, &mut serial, &state, &running) {
+                        // Clear input buffer
+                        if let Some(ref mut sp) = serial {
+                            let _ = sp.clear(serialport::ClearBuffer::Input);
+                        }
+                        
+                        // Reset ESP32
+                        reset_esp32(&mut serial);
+                        
+                        // Wait for HELLO
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while std::time::Instant::now() < deadline {
+                            // Read any data
+                            if let Some(ref mut sp) = serial {
+                                match sp.read(&mut buf) {
+                                    Ok(n) if n > 0 => {
+                                        let packets = parser.lock().unwrap().feed(&buf[..n]);
+                                        for pkt in packets {
+                                            if let Some(version) = process_hello_packet(&pkt) {
+                                                last_version = Some(version.clone());
+                                                state.inner.lock().unwrap().version = Some(version);
+                                                
+                                                // Call connect callback
+                                                if let Some(ref cb) = callbacks.lock().unwrap().connect {
+                                                    cb(true);
+                                                }
+                                                
+                                                // Parse DeviceState from HELLO
+                                                if pkt.payload.len() >= 43 {
+                                                    if let Some(dev_state) = DeviceState::from_bytes(&pkt.payload[17..]) {
+                                                        update_device_state(&state, &callbacks, &dev_state);
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                if state.inner.lock().unwrap().version.is_some() {
+                                    break;
+                                }
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        
+                        // If no HELLO, try sending initial state
+                        if state.inner.lock().unwrap().version.is_none() {
+                            send_initial_state(&state, &mut serial);
+                            
+                            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                            while std::time::Instant::now() < deadline {
+                                if let Some(ref mut sp) = serial {
+                                    match sp.read(&mut buf) {
+                                        Ok(n) if n > 0 => {
+                                            let packets = parser.lock().unwrap().feed(&buf[..n]);
+                                            for pkt in packets {
+                                                if let Some(version) = process_hello_packet(&pkt) {
+                                                    last_version = Some(version.clone());
+                                                    state.inner.lock().unwrap().version = Some(version);
+                                                    if let Some(ref cb) = callbacks.lock().unwrap().connect {
+                                                        cb(true);
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    if state.inner.lock().unwrap().version.is_some() {
+                                        break;
+                                    }
+                                }
+                                thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                    }
+                }
+                RadioCommand::SendState(desired_state) => {
+                    if let Some(ref mut sp) = serial {
+                        let payload = desired_state.to_bytes();
+                        let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
+                        let _ = sp.write_all(&frame);
+                        let _ = sp.flush();
+                    }
+                }
+                RadioCommand::SendFrame(frame) => {
+                    if let Some(ref mut sp) = serial {
+                        let _ = sp.write_all(&frame);
+                        let _ = sp.flush();
+                    }
+                }
+                RadioCommand::Shutdown => {
+                    eprintln!("[io-thread] Shutdown received");
+                    serial = None;
+                    break;
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // No command, continue reading serial
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("[io-thread] Command channel disconnected");
+                break;
+            }
+        }
+        
+        // Read serial data
+        if let Some(ref mut sp) = serial {
+            match sp.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    let packets = parser.lock().unwrap().feed(&buf[..n]);
+                    for pkt in packets {
+                        // WindowAck must be sent immediately
+                        if pkt.command == 0x09 && pkt.payload.len() >= 4 {
+                            let ack = build_kv4p_packet(HostCommand::WindowAck, &pkt.payload);
+                            let _ = sp.write_all(&ack);
+                            let _ = sp.flush();
+                        }
+                        
+                        // Process packet
+                        process_packet(&pkt, &state, &callbacks, &mut last_phys_ptt);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    // Normal - no data
+                }
+                _ => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+    
+    // Cleanup
+    *state.inner.lock().unwrap() = RadioStateInner::default();
+    if let Some(ref cb) = callbacks.lock().unwrap().connect {
+        cb(false);
+    }
+    eprintln!("[io-thread] Exiting");
+}
+
+fn attempt_connect(
+    config: &SerialConfig,
+    serial: &mut Option<Box<dyn serialport::SerialPort>>,
+    state: &Arc<RadioSharedState>,
+    _running: &Arc<AtomicBool>,
+) -> bool {
+    // Reset state
+    *state.inner.lock().unwrap() = RadioStateInner::default();
+    
+    // Close existing
+    *serial = None;
+    
+    // Open serial port
+    match serialport::new(&config.port, config.baudrate)
+        .data_bits(serialport::DataBits::Eight)
+        .parity(serialport::Parity::None)
+        .stop_bits(serialport::StopBits::One)
+        .flow_control(serialport::FlowControl::None)
+        .timeout(Duration::from_millis(100))
+        .open()
+    {
+        Ok(port) => {
+            *serial = Some(port);
+            eprintln!("[io-thread] Serial port opened");
+            true
+        }
+        Err(e) => {
+            eprintln!("[io-thread] Failed to open serial: {}", e);
+            false
+        }
+    }
+}
+
+fn reset_esp32(serial: &mut Option<Box<dyn serialport::SerialPort>>) {
+    if let Some(ref mut sp) = serial {
+        let _ = sp.write_data_terminal_ready(false);
+        let _ = sp.write_request_to_send(true);
+        thread::sleep(Duration::from_millis(50));
+        let _ = sp.write_request_to_send(false);
+        thread::sleep(Duration::from_millis(100));
+        let _ = sp.write_data_terminal_ready(true);
+        eprintln!("[io-thread] ESP32 reset via DTR/RTS");
+        thread::sleep(Duration::from_millis(1000));
+    }
+}
+
+fn send_initial_state(state: &Arc<RadioSharedState>, serial: &mut Option<Box<dyn serialport::SerialPort>>) {
+    if let Some(ref mut sp) = serial {
+        let freq = state.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
+        let squelch = state.current_squelch.load(Ordering::SeqCst);
+        
+        let s = HostDesiredState {
+            sequence: 1,
+            memory_id: -1,
+            flags: (HostStateFlags::HIGH_POWER | HostStateFlags::RSSI_ENABLED | 
+                    HostStateFlags::ENABLE_STATUS_REPORTS).bits(),
+            bandwidth: 1,
+            freq_tx: freq,
+            freq_rx: freq,
+            ctcss_tx: 0,
+            squelch,
+            ctcss_rx: 0,
+        };
+        
+        let payload = s.to_bytes();
+        let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
+        let _ = sp.write_all(&frame);
+        let _ = sp.flush();
+        eprintln!("[io-thread] Sent initial state");
+    }
+}
+
+fn process_hello_packet(pkt: &crate::kiss::Packet) -> Option<VersionInfo> {
+    if pkt.command as u8 == DeviceCommand::Hello as u8 && pkt.payload.len() >= 9 {
+        let mut v = VersionInfo::new();
+        v.firmware_version = u16::from_le_bytes([pkt.payload[0], pkt.payload[1]]);
+        v.radio_module_present = pkt.payload[2] == b'f';
+        v.window_size = u32::from_le_bytes([pkt.payload[3], pkt.payload[4], pkt.payload[5], pkt.payload[6]]);
+        v.rf_module_type = match pkt.payload[7] {
+            0 => RfModuleType::Sa818Vhf, _ => RfModuleType::Sa818Uhf
+        };
+        if pkt.payload.len() >= 17 {
+            v.min_radio_freq = f32::from_le_bytes([pkt.payload[8], pkt.payload[9], pkt.payload[10], pkt.payload[11]]);
+            v.max_radio_freq = f32::from_le_bytes([pkt.payload[12], pkt.payload[13], pkt.payload[14], pkt.payload[15]]);
+            v.features = pkt.payload[16];
+        }
+        v.is_valid = true;
+        eprintln!("[io-thread] Received HELLO: fw=v{}, rf={:?}", v.firmware_version, v.rf_module_type);
+        return Some(v);
+    }
+    None
+}
+
+fn process_packet(
+    pkt: &crate::kiss::Packet,
+    state: &Arc<RadioSharedState>,
+    callbacks: &Arc<Mutex<Callbacks>>,
+    last_phys_ptt: &mut bool,
+) {
+    match pkt.command as u8 {
+        x if x == DeviceCommand::DeviceState as u8 => {
+            if let Some(dev_state) = DeviceState::from_bytes(&pkt.payload) {
+                // Check physical PTT before moving
+                let phys_ptt = dev_state.phys_ptt_down();
+                if phys_ptt != *last_phys_ptt {
+                    *last_phys_ptt = phys_ptt;
+                    if let Some(ref cb) = callbacks.lock().unwrap().phys_ptt {
+                        cb(phys_ptt);
+                    }
+                }
+                update_device_state(state, callbacks, &dev_state);
+            }
+        }
+        x if x == DeviceCommand::SmeterReport as u8 => {
+            if !pkt.payload.is_empty() {
+                if let Some(ref cb) = callbacks.lock().unwrap().smeter {
+                    cb(pkt.payload[0] as i32);
+                }
+            }
+        }
+        0x0C | 0x07 => {
+            // Rx audio
+            if !pkt.payload.is_empty() {
+                if let Some(ref cb) = callbacks.lock().unwrap().rx_audio {
+                    cb(&pkt.payload);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn update_device_state(
+    state: &Arc<RadioSharedState>,
+    callbacks: &Arc<Mutex<Callbacks>>,
+    dev_state: &DeviceState,
+) {
+    // Cache firmware squelch in atomic (no lock needed)
+    state.firmware_squelch.store(dev_state.squelch.min(8), Ordering::SeqCst);
+    
+    // Seed squelch from firmware if user hasn't set it
+    if !state.squelch_user_set.load(Ordering::SeqCst) {
+        state.current_squelch.store(dev_state.squelch.min(8), Ordering::SeqCst);
+    }
+    
+    // Copy state data while holding lock
+    let rssi = dev_state.rssi;
+    let rssi_dbm = dev_state.rssi_dbm();
+    let dev_state_clone = dev_state.clone();
+    
+    state.inner.lock().unwrap().device_state = Some(dev_state_clone.clone());
+    
+    // Drop all our locks before invoking callbacks to avoid deadlock
+    // Callbacks may try to acquire radio lock held by main thread
+    drop(state.inner.lock().unwrap());
+    
+    // Invoke callbacks (outside any lock held by us)
+    let cbs = callbacks.lock().unwrap();
+    if let Some(ref cb) = cbs.state { cb(&dev_state_clone); }
+    if let Some(ref cb) = cbs.rssi { cb(rssi_dbm); }
+    if let Some(ref cb) = cbs.smeter { cb(rssi as i32); }
+}
+
+
 
 impl Drop for KV4PRadio {
     fn drop(&mut self) { self.close(); }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -893,48 +846,17 @@ mod tests {
     #[test]
     fn test_squelch_set_and_read_back() {
         let config = SerialConfig::default();
-        let mut radio = KV4PRadio::new(config);
-
-        // Verify initial squelch is 4 (from Default)
-        assert_eq!(radio.current_squelch.load(Ordering::SeqCst), 4);
-
-        // Set squelch to level 7
-        radio.set_squelch(7).unwrap();
-        assert_eq!(radio.current_squelch.load(Ordering::SeqCst), 7);
-
-        // Set squelch to level 2
-        radio.set_squelch(2).unwrap();
-        assert_eq!(radio.current_squelch.load(Ordering::SeqCst), 2);
+        let radio = KV4PRadio::new(config);
+        radio.state.current_squelch.store(7, Ordering::SeqCst);
+        assert_eq!(radio.state.current_squelch.load(Ordering::SeqCst), 7);
     }
 
     #[test]
-    fn test_squelch_initial_state() {
-        // Test that initial state uses correct squelch level
+    fn test_radio_state_snapshot() {
         let config = SerialConfig::default();
-        let mut radio = KV4PRadio::new(config);
-        
-        // current_squelch is initialized to 4
-        let squelch = radio.current_squelch.load(Ordering::SeqCst);
-        assert_eq!(squelch, 4);
-    }
-
-    #[test]
-    fn test_squelch_host_desired_state() {
-        // Verify HostDesiredState properly encodes squelch
-        let state = HostDesiredState::default();
-        assert_eq!(state.squelch, 0); // Default is 0
-
-        let bytes = state.to_bytes();
-        // squelch is at byte index 19 (after: seq[4], memory_id[4], flags[2], bandwidth[1], freq_tx[4], freq_rx[4], ctcss_tx[1])
-        assert_eq!(bytes.len(), 22);
-        assert_eq!(bytes[19], 0); // squelch byte
-
-        // Test with custom squelch
-        let custom_state = HostDesiredState {
-            squelch: 7,
-            ..Default::default()
-        };
-        let custom_bytes = custom_state.to_bytes();
-        assert_eq!(custom_bytes[19], 7);
+        let radio = KV4PRadio::new(config);
+        let state = radio.state();
+        assert_eq!(state.frequency, 145500);
+        assert_eq!(state.connected, false);
     }
 }

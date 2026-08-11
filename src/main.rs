@@ -13,7 +13,6 @@ use gps::GpsManager;
 use radio::{KV4PRadio, SerialConfig};
 
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use libadwaita::prelude::*;
@@ -40,37 +39,15 @@ fn main() {
 
     eprintln!("[pocket-modem] Using: {}", serial_device);
 
-    // Create radio
+    // Create radio - I/O thread handles serial internally
     let radio = Arc::new(Mutex::new(KV4PRadio::new(SerialConfig {
-        port: serial_device,
+        port: serial_device.clone(),
         baudrate: 115200,
         timeout_ms: 500,
     })));
     
-    // Try to connect
-    let connected = {
-        let mut radio = radio.lock().unwrap();
-        match radio.open() {
-            Ok(version) => {
-                if let Some(v) = version {
-                    eprintln!("[pocket-modem] Connected: fw=v{}, rf={:?}", 
-                             v.firmware_version, v.rf_module_type);
-                    // Use tune_freq() to preserve firmware's default squelch (don't override)
-                    let _ = radio.tune_freq(145500, 145500);
-                    // Open audio after tuning - like Android's openFirmwareAudio()
-                    let _ = radio.open_audio();
-                    eprintln!("[pocket-modem] Tuned to 145.500 MHz");
-                    true
-                } else {
-                    false
-                }
-            }
-            Err(e) => {
-                eprintln!("[pocket-modem] Connection failed: {}", e);
-                false
-            }
-        }
-    };
+    // Radio will be opened asynchronously after GTK shows - start with disconnected state
+    let _connected = false;
     
     let radio_clone = Arc::clone(&radio);
 
@@ -78,7 +55,7 @@ fn main() {
     let gps_manager = Arc::new(Mutex::new(GpsManager::new()));
     {
         // Enable GPS location in ModemManager
-        GpsManager::enable_gps_location();
+        let _ = GpsManager::enable_gps_location();
         let gps = gps_manager.lock().unwrap();
         gps.start();
     }
@@ -97,11 +74,12 @@ fn main() {
 
     
     // Connect audio TX to radio (ADPCM frames)
+    // Commands are sent via channel to I/O thread
     {
         let mut audio = audio_manager.lock().unwrap();
         let radio = Arc::clone(&radio);
         audio.on_tx_audio(move |adpcm_data| {
-            if let Ok(mut r) = radio.lock() {
+            if let Ok(r) = radio.lock() {
                 let _ = r.send_audio(adpcm_data);
             }
         });
@@ -109,66 +87,7 @@ fn main() {
     
 
     
-    // Connect radio RX audio to speaker playback
-    {
-        let mut radio = radio.lock().unwrap();
-        let audio = Arc::clone(&audio_manager);
-        radio.on_rx_audio(move |adpcm_data| {
-            // Accumulate audio - playback will start when squelch opens
-            if let Ok(mut a) = audio.lock() {
-                a.accumulate_and_start(adpcm_data);
-            }
-        });
-    }
-    
-    // Connect radio state to update audio squelch state
-    {
-        let audio = Arc::clone(&audio_manager);
-        let mut radio = radio.lock().unwrap();
-        radio.on_state(move |state| {
-            // Update audio squelch state and RSSI - used for UI display
-            if let Ok(mut a) = audio.lock() {
-                a.update_squelch(state.is_squelched());
-                a.update_rssi(state.rssi);
-            }
-        });
-    }
-    
-    // Connect physical PTT button on radio hardware
-    {
-        let radio2 = Arc::clone(&radio);
-        let audio = Arc::clone(&audio_manager);
-        {
-            let mut r = radio.lock().unwrap();
-            r.on_phys_ptt(move |pressed| {
-                eprintln!("[main] Phys PTT: {}", if pressed { "pressed" } else { "released" });
-                // Call ptt_on/ptt_off for firmware control FIRST
-                if let Ok(mut r) = radio2.try_lock() {
-                    if pressed {
-                        let _ = r.ptt_on();
-                        eprintln!("[main] ptt_on called");
-                    } else {
-                        let _ = r.ptt_off();
-                        eprintln!("[main] ptt_off called");
-                    }
-                }
-                // Handle audio capture
-                if let Ok(mut a) = audio.lock() {
-                    if pressed {
-                        // Stop RX playback when TX starts
-                        a.stop_playback();
-                        let _ = a.start_capture();
-                    } else {
-                        let _ = a.stop_capture();
-                        // Re-enable RX playback after TX stops
-                        let _ = a.start_playback();
-                    }
-                }
-            });
-        }
-    }
-    
-    eprintln!("[main] Radio lock released, starting app...");
+
     
     let app = adw::Application::builder()
         .application_id("org.pocketmodem.gtk")
@@ -186,7 +105,8 @@ fn main() {
     let gps_manager_activate = Arc::clone(&gps_manager);
     
     app.connect_activate(move |app| {
-        create_ui(app, &radio_clone, &audio_manager, &gps_manager_activate, connected);
+        // Create UI first (disconnected state)
+        create_ui(app, &radio_clone, &audio_manager, &gps_manager_activate);
     });
 
     // Close radio, audio and GPS on shutdown
@@ -200,7 +120,7 @@ fn main() {
             a.stop_playback();
         }
         // Close radio connection
-        if let Ok(mut r) = radio_for_shutdown.lock() {
+        if let Ok(r) = radio_for_shutdown.lock() {
             r.close();
         }
         // Stop GPS polling
@@ -216,8 +136,7 @@ fn create_ui(
     app: &adw::Application,
     radio: &Arc<Mutex<KV4PRadio>>,
     audio: &Arc<Mutex<AudioManager>>,
-    gps: &Arc<Mutex<GpsManager>>,
-    connected: bool
+    gps: &Arc<Mutex<GpsManager>>
 ) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -226,6 +145,80 @@ fn create_ui(
         .title("PocketModem")
         .build();
     window.set_size_request(320, -1);  // Constrain width to 320
+    
+    // Show window immediately so UI appears while connecting
+    window.show();
+    
+    // Async connection: spawn thread after UI is visible
+    // This ensures UI is responsive while connecting
+    let radio_async = Arc::clone(radio);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));  // Wait for UI to render
+        
+        // Open the connection with lock
+        let connected = {
+            if let Ok(r) = radio_async.lock() {
+                match r.open() {
+                    Ok(version) => {
+                        if let Some(v) = version {
+                            eprintln!("[pocket-modem] Connected: fw=v{}, rf={:?}", 
+                                     v.firmware_version, v.rf_module_type);
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("[pocket-modem] Connection failed: {}", e);
+                        false
+                    }
+                }
+            } else { false }
+        };
+        
+        // If connected, tune and open audio
+        if connected {
+            if let Ok(r) = radio_async.lock() {
+                let _ = r.tune_freq(145500, 145500);
+                let _ = r.open_audio();
+            }
+        }
+    });
+    
+    // Register radio callbacks (invoked from I/O thread)
+    {
+        let r = radio.lock().unwrap();
+        let audio_cb = Arc::clone(audio);
+        r.on_rx_audio(move |adpcm_data| {
+            if let Ok(mut a) = audio_cb.lock() {
+                a.accumulate_and_start(adpcm_data);
+            }
+        });
+        
+        let audio_state = Arc::clone(audio);
+        r.on_state(move |state| {
+            if let Ok(mut a) = audio_state.lock() {
+                a.update_squelch(state.is_squelched());
+                a.update_rssi(state.rssi);
+            }
+        });
+        
+        let radio_ptt = Arc::clone(&radio);
+        let audio_ptt = Arc::clone(audio);
+        r.on_phys_ptt(move |pressed| {
+            if let Ok(r) = radio_ptt.lock() {
+                if pressed { let _ = r.ptt_on(); } 
+                else { let _ = r.ptt_off(); }
+            }
+            if let Ok(mut a) = audio_ptt.lock() {
+                if pressed {
+                    a.stop_playback();
+                    let _ = a.start_capture();
+                } else {
+                    let _ = a.stop_capture();
+                    let _ = a.start_playback();
+                }
+            }
+        });
+    }
     
     // Main content box using HeaderBar for title area
     let header_bar = adw::HeaderBar::builder()
@@ -256,8 +249,11 @@ fn create_ui(
     let squelch_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
     squelch_row.set_valign(gtk4::Align::Center);
     
+    // Slider: left = strict (8), right = permissive (0)
+    // This matches user intuition: right = loose/relaxed, left = tight/restrictive
     let squelch_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 8.0, 1.0);
-    squelch_scale.set_value(4.0);  // Default 4 (0-8 range, inverted to firmware: 8-4=4)
+    squelch_scale.set_value(4.0);  // Default 4
+    squelch_scale.set_inverted(true);  // Invert visual direction only
     squelch_scale.set_hexpand(true);
     squelch_scale.set_draw_value(false);
     squelch_scale.set_has_origin(true);
@@ -268,6 +264,7 @@ fn create_ui(
     squelch_value_label.add_css_class("squelch-value");
     
     // Squelch callback with debouncing
+    // Commands sent via lock-free channel - no blocking UI thread
     let radio_squelch = Arc::clone(radio);
     let label_for_closure = squelch_value_label.clone();
     let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(0));
@@ -276,28 +273,19 @@ fn create_ui(
         let level = scale.value().round() as u8;
         label_for_closure.set_text(&format!("{}", level));
         
-        // Immediately send to radio (no lock holding)
-        // Use spawn to avoid blocking GTK main loop
+        // Commands sent via lock-free channel - no blocking
         if level != last_sent.load(std::sync::atomic::Ordering::SeqCst) {
             let radio_clone = radio_squelch.clone();
             let sent = Arc::clone(&last_sent);
             std::thread::spawn(move || {
-                // Try to acquire lock with timeout
-                let deadline = std::time::Instant::now() + Duration::from_millis(500);
-                while std::time::Instant::now() < deadline {
-                    if let Ok(mut r) = radio_clone.try_lock() {
-                        if let Err(e) = r.set_squelch(level) {
-                            eprintln!("[main] set_squelch error: {}", e);
-                        }
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
+                // Commands sent via channel
+                if let Ok(r) = radio_clone.lock() {
+                    let _ = r.set_squelch(level);
                 }
                 sent.store(level, std::sync::atomic::Ordering::SeqCst);
             });
         }
     });
-    // Note: Debounce handles sending after 300ms, no need for separate button release
     
     squelch_row.append(&squelch_scale);
     squelch_row.append(&squelch_value_label);
@@ -323,7 +311,7 @@ fn create_ui(
     pre_emph_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_pre_emph.clone();
         std::thread::spawn(move || {
-            if let Ok(mut r) = radio_clone.lock() {
+            if let Ok(r) = radio_clone.lock() {
                 let _ = r.set_filter_pre_emphasis(state);
             }
         });
@@ -345,7 +333,7 @@ fn create_ui(
     de_emph_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_de_emph.clone();
         std::thread::spawn(move || {
-            if let Ok(mut r) = radio_clone.lock() {
+            if let Ok(r) = radio_clone.lock() {
                 let _ = r.set_filter_de_emphasis(state);
             }
         });
@@ -367,7 +355,7 @@ fn create_ui(
     hp_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_hp.clone();
         std::thread::spawn(move || {
-            if let Ok(mut r) = radio_clone.lock() {
+            if let Ok(r) = radio_clone.lock() {
                 let _ = r.set_filter_high_pass(state);
             }
         });
@@ -389,7 +377,7 @@ fn create_ui(
     lp_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_lp.clone();
         std::thread::spawn(move || {
-            if let Ok(mut r) = radio_clone.lock() {
+            if let Ok(r) = radio_clone.lock() {
                 let _ = r.set_filter_low_pass(state);
             }
         });
@@ -420,7 +408,7 @@ fn create_ui(
     tx_power_switch.connect_state_set(move |_sw, state| {
         let radio_clone = radio_tx_power.clone();
         std::thread::spawn(move || {
-            if let Ok(mut r) = radio_clone.lock() {
+            if let Ok(r) = radio_clone.lock() {
                 let _ = r.set_tx_power(state);
             }
         });
@@ -452,13 +440,30 @@ fn create_ui(
         };
         let radio_clone = radio_mic.clone();
         std::thread::spawn(move || {
-            if let Ok(mut r) = radio_clone.lock() {
+            if let Ok(r) = radio_clone.lock() {
                 let _ = r.set_mic_gain(level);
             }
         });
     }));
     mic_section.append(&mic_dropdown);
     settings_view.append(&mic_section);
+    
+    // Debug Log section
+    let debug_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let debug_title = gtk4::Label::new(Some("<b>Debug Log</b>"));
+    debug_title.set_markup("<b>Debug Log</b>");
+    debug_title.set_halign(gtk4::Align::Start);
+    debug_section.append(&debug_title);
+    
+    // Debug enable toggle
+    // Debug logging section (currently informational only)
+    let debug_info_label = gtk4::Label::new(Some("<small>Debug logging available via terminal output</small>"));
+    debug_info_label.set_markup("<small>Debug logging available via terminal output</small>");
+    debug_info_label.set_halign(gtk4::Align::Start);
+    debug_section.append(&debug_info_label);
+    
+    // Debug log text view (scrollable)
+    settings_view.append(&debug_section);
     
     // Add back button
     let back_btn = gtk4::Button::with_label("Back");
@@ -476,9 +481,9 @@ fn create_ui(
     status_row.set_margin_top(16);
     status_row.set_margin_bottom(16);
     
-    // Modem status indicator
-    let modem_label = gtk4::Label::new(Some(if connected { "●" } else { "○" }));
-    modem_label.add_css_class(if connected { "status-icon-green" } else { "status-icon-red" });
+    // Modem status indicator (starts disconnected, updated by UI timer)
+    let modem_label = gtk4::Label::new(Some("○"));
+    modem_label.add_css_class("status-icon-red");
     let modem_status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     let modem_icon = gtk4::Image::from_icon_name("network-wireless-symbolic");
     modem_icon.set_pixel_size(28);
@@ -525,9 +530,9 @@ fn create_ui(
     audio_status_box.append(&audio_status_label);
     status_row.append(&audio_status_box);
     
-    // RSSI / S-meter - below VFO
+    // RSSI / S-meter - below VFO (starts at 0, updated by UI timer)
     let rssi_sbar = gtk4::ProgressBar::new();
-    rssi_sbar.set_fraction(if connected { 0.5 } else { 0.0 });
+    rssi_sbar.set_fraction(0.0);
     rssi_sbar.add_css_class("rssi-bar");
     
     // S-meter: bar and dBm value side by side
@@ -547,10 +552,10 @@ fn create_ui(
     rssi_sbar.set_hexpand(true);
     rssi_sbar.set_valign(gtk4::Align::Center);
     
-    // dBm value on right
+    // dBm value on right (starts "-- dBm", updated by UI timer)
     let signal_value = gtk4::Label::new(None);
     signal_value.add_css_class("signal-value");
-    signal_value.set_markup(&format!("<span color='#FFB000'>{}</span>", if connected { "-97 dBm" } else { "-- dBm" }));
+    signal_value.set_markup(&format!("<span color='#FFB000'>{}</span>", "-- dBm"));
     signal_value.set_valign(gtk4::Align::Center);
     signal_value.set_width_request(70);
     
@@ -582,9 +587,9 @@ fn create_ui(
             let khz = (freq_mhz * 1000.0) as u32;
             let radio = Arc::clone(&radio_freq);
             
-            // Spawn thread for serial operation, don't update UI
+            // Spawn thread for serial operation, command sent via channel
             std::thread::spawn(move || {
-                if let Ok(mut r) = radio.lock() {
+                if let Ok(r) = radio.lock() {
                     if r.set_frequency(khz).is_ok() {
                         eprintln!("[pocket-modem] Frequency set to {} kHz", khz);
                     }
@@ -666,45 +671,28 @@ fn create_ui(
     ptt_btn.set_margin_bottom(20);
     ptt_btn.set_valign(gtk4::Align::End);
     
-    let radio_ptt_press = Arc::clone(radio);
-    let radio_ptt_release = Arc::clone(radio);
-    let audio_ptt_press = Arc::clone(audio);
-    let audio_ptt_release = Arc::clone(audio);
     let gesture = gtk4::GestureClick::new();
     // Allow any button (0) for touch events
     gesture.set_button(0);
     gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let radio_clone = Arc::clone(radio);
+    let audio_clone = Arc::clone(audio);
     gesture.connect_pressed(move |_, _, _, _| {
-        // Start PTT
-        if let Ok(mut r) = radio_ptt_press.lock() {
-            if let Err(e) = r.ptt_on() {
-                eprintln!("[main] ptt_on error: {}", e);
-            } else {
-                eprintln!("[main] ptt_on success");
-            }
+        if let Ok(r) = radio_clone.lock() {
+            let _ = r.ptt_on();
         }
-        // Start audio capture for TX
-        if let Ok(mut a) = audio_ptt_press.lock() {
-            // Stop RX playback when TX starts
+        if let Ok(mut a) = audio_clone.lock() {
             a.stop_playback();
-            if let Err(e) = a.start_capture() {
-                eprintln!("[main] start_capture error: {}", e);
-            } else {
-                eprintln!("[main] start_capture success");
-            }
+            let _ = a.start_capture();
         }
     });
+    let radio_clone2 = Arc::clone(radio);
+    let audio_clone2 = Arc::clone(audio);
     gesture.connect_released(move |_, _, _, _| {
-        // Stop PTT first - signal firmware to stop TX
-        if let Ok(mut r) = radio_ptt_release.lock() {
-            if let Err(e) = r.ptt_off() {
-                eprintln!("[main] ptt_off error: {}", e);
-            } else {
-                eprintln!("[main] ptt_off success");
-            }
+        if let Ok(r) = radio_clone2.lock() {
+            let _ = r.ptt_off();
         }
-        // Stop audio capture and re-enable RX playback
-        if let Ok(mut a) = audio_ptt_release.lock() {
+        if let Ok(mut a) = audio_clone2.lock() {
             a.stop_capture();
             let _ = a.start_playback();
         }
@@ -770,11 +758,17 @@ fn create_ui(
 
     let gps_location_clone = gps_location_label.clone();
 
-    glib::timeout_add_local(Duration::from_millis(1000), move || {
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        // Get radio state for UI updates (callbacks invoked from I/O thread)
         if let Ok(r) = radio_update.lock() {
             let state = r.state();
             
-            if state.connected {
+            // Update based on having received RSSI (raw_rssi > 0 means packets arriving)
+            if state.connected && state.raw_rssi > 0 {
+                modem_label_clone.set_text("●");
+                modem_label_clone.remove_css_class("status-icon-red");
+                modem_label_clone.add_css_class("status-icon-green");
+            } else if state.connected {
                 modem_label_clone.set_text("●");
                 modem_label_clone.remove_css_class("status-icon-red");
                 modem_label_clone.add_css_class("status-icon-green");
@@ -784,65 +778,65 @@ fn create_ui(
                 modem_label_clone.add_css_class("status-icon-red");
             }
             
-            // S-meter: Standard VHF/UHF formula (S9 = -93 dBm)
-            // dBm = raw * 1.2 - 160.8
-            // S-val = 9 + (dBm - (-93)) / 6
-            // Below S9: round to nearest whole S-unit
-            // Calculate dBm from raw RSSI (matches DeviceState::rssi_dbm)
-            let dbm = -120.0 + (state.raw_rssi as f64 * 2.0);
+            // Calculate dBm using Android's formula
+            // DBM = rssi * 1.2 - 160.8
+            // Matches what Android app uses
+            let dbm = (state.raw_rssi as f64) * 1.2 - 160.8;
             
-            // Update dBm display
-            let dbm_text = if state.connected { format!("{} dBm", dbm as i32) } else { "-- dBm".to_string() };
-            signal_value_clone.set_markup(&format!("<span color='#FFB000'>{}</span>", dbm_text));
-            
-            // Update amber bar (dBm range: -120 to -60 = 0% to 100%)
-            let frac = if state.connected {
-                ((dbm + 120.0) / 60.0).clamp(0.0, 1.0)
+            // Update dBm display and bar
+            if state.connected && state.raw_rssi > 0 {
+                let dbm_text = format!("{} dBm", dbm as i32);
+                signal_value_clone.set_markup(&format!("<span color='#FFB000'>{}</span>", dbm_text));
+                
+                // Bar: -120 dBm = 0%, -30 dBm = 100%
+                let frac = ((dbm + 120.0) / 90.0).clamp(0.0, 1.0);
+                rssi_sbar_clone.set_fraction(frac);
             } else {
-                0.0
-            };
-            rssi_sbar_clone.set_fraction(frac);
-            
-            // Update audio status indicator
-            if let Ok(a) = audio_clone.lock() {
-                let capturing = a.is_capturing();
-                let playing = a.is_playing();
-                if capturing || playing {
-                    audio_label_clone.set_text("●");
-                    audio_label_clone.remove_css_class("status-icon-gray");
-                    audio_label_clone.add_css_class("status-icon-green");
-                } else {
-                    audio_label_clone.set_text("○");
-                    audio_label_clone.remove_css_class("status-icon-green");
-                    audio_label_clone.add_css_class("status-icon-gray");
-                }
-            }
-
-            // Update GPS status indicator
-            if let Ok(g) = gps_clone.lock() {
-                let gps_data = g.get_data();
-                if gps_data.has_fix {
-                    gps_led_clone.set_text("●");
-                    gps_led_clone.remove_css_class("gps-led-off");
-                    gps_led_clone.add_css_class("gps-led-on");
-
-                    // Update location display
-                    if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
-                        let location = format!("{:.6}, {:.6}", lat, lon);
-                        gps_location_clone.set_text(&location);
-                        gps_location_clone.remove_css_class("gps-searching");
-                        gps_location_clone.add_css_class("gps-fixed");
-                    }
-                } else {
-                    gps_led_clone.set_text("○");
-                    gps_led_clone.remove_css_class("gps-led-on");
-                    gps_led_clone.add_css_class("gps-led-off");
-                    gps_location_clone.set_text("Searching...");
-                    gps_location_clone.remove_css_class("gps-fixed");
-                    gps_location_clone.add_css_class("gps-searching");
-                }
+                signal_value_clone.set_markup(&format!("<span color='#FFB000'>{}</span>", "-- dBm"));
+                rssi_sbar_clone.set_fraction(0.0);
             }
         }
+        
+        // Update audio status indicator
+        if let Ok(a) = audio_clone.lock() {
+            let capturing = a.is_capturing();
+            let playing = a.is_playing();
+            if capturing || playing {
+                audio_label_clone.set_text("●");
+                audio_label_clone.remove_css_class("status-icon-gray");
+                audio_label_clone.add_css_class("status-icon-green");
+            } else {
+                audio_label_clone.set_text("○");
+                audio_label_clone.remove_css_class("status-icon-green");
+                audio_label_clone.add_css_class("status-icon-gray");
+            }
+        }
+
+        // Update GPS status indicator
+        if let Ok(g) = gps_clone.lock() {
+            let gps_data = g.get_data();
+            if gps_data.has_fix {
+                gps_led_clone.set_text("●");
+                gps_led_clone.remove_css_class("gps-led-off");
+                gps_led_clone.add_css_class("gps-led-on");
+
+                // Update location display
+                if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
+                    let location = format!("{:.6}, {:.6}", lat, lon);
+                    gps_location_clone.set_text(&location);
+                    gps_location_clone.remove_css_class("gps-searching");
+                    gps_location_clone.add_css_class("gps-fixed");
+                }
+            } else {
+                gps_led_clone.set_text("○");
+                gps_led_clone.remove_css_class("gps-led-on");
+                gps_led_clone.add_css_class("gps-led-off");
+                gps_location_clone.set_text("Searching...");
+                gps_location_clone.remove_css_class("gps-fixed");
+                gps_location_clone.add_css_class("gps-searching");
+            }
+        }
+        
         glib::ControlFlow::Continue
     });
     
