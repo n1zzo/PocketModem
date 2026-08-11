@@ -684,7 +684,7 @@ impl AudioManager {
         Ok(())
     }
     
-    /// Accumulate ADPCM audio frames before starting playback
+        /// Accumulate ADPCM audio frames before starting playback
     /// 
     /// Matches Android app: decode at 16kHz native sample rate.
     pub fn accumulate_rx_audio(&mut self, adpcm_data: &[u8]) {
@@ -707,17 +707,7 @@ impl AudioManager {
         self.decoder.reset();
     }
     
-    /// Check if we have enough buffered to start playback
-    /// 
-    /// With 16kHz mono output (no resampling), we need minimal buffering.
-    /// With 44.1kHz stereo output (resampling), we need huge buffering.
-    /// For now, start as soon as we have any audio to reduce latency.
-    pub fn should_start_playback(&self) -> bool {
-        let buf = self.playback_buf.lock().unwrap();
-        buf.len() >= 500  // ~30ms - enough for smooth startup at any rate
-    }
-    
-    /// Get playback buffer level
+    /// Get playback buffer level (useful for diagnostics)
     pub fn playback_level(&self) -> usize {
         self.playback_buf.lock().unwrap().len()
     }
@@ -901,15 +891,6 @@ impl AudioManager {
         let gain = config.rx_gain;
         let rx_volume = Arc::clone(rx_volume);
         let playback_buf_clone = Arc::clone(&playback_buf);
-        
-        // Pre-fill buffer with silence (500ms worth)
-        {
-            let mut buf = playback_buf_clone.lock().unwrap();
-            if buf.len() < 8000 {  // 500ms at 16kHz
-                buf.resize(8000, 0);
-            }
-            eprintln!("[audio] Buffer pre-filled to {} samples", buf.len());
-        }
         
         let err_fn = |err| eprintln!("[audio] Stream error: {}", err);
         let enabled2 = Arc::clone(&enabled);

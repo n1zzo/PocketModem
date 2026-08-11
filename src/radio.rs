@@ -511,7 +511,6 @@ fn io_thread_main(
     callbacks: Arc<Mutex<Callbacks>>,
     config: SerialConfig,
 ) {
-    eprintln!("[io-thread] Started");
     let mut buf = [0u8; 512];
     let parser = std::sync::Mutex::new(PacketParser::new());
     let mut serial: Option<Box<dyn serialport::SerialPort>> = None;
@@ -617,7 +616,6 @@ fn io_thread_main(
                     }
                 }
                 RadioCommand::Shutdown => {
-                    eprintln!("[io-thread] Shutdown received");
                     serial = None;
                     break;
                 }
@@ -626,11 +624,9 @@ fn io_thread_main(
                 // No command, continue reading serial
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("[io-thread] Command channel disconnected");
                 break;
             }
             Err(e) => {
-                eprintln!("[io-thread] Recv error: {:?}", e);
                 break;
             }
         }
@@ -641,9 +637,7 @@ fn io_thread_main(
                 Ok(0) => {
                     // Zero bytes read, no action
                 }
-                Ok(0) => {}
                 Ok(n) => {
-                    eprintln!("[io-thread] read {} bytes", n);
                     let packets = parser.lock().unwrap().feed(&buf[..n]);
                     for pkt in packets {
                         // WindowAck must be sent immediately
@@ -660,8 +654,7 @@ fn io_thread_main(
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     // Normal - no data
                 }
-                Err(e) => {
-                    eprintln!("[io-thread] read error: {}", e);
+                Err(_) => {
                     thread::sleep(Duration::from_millis(10));
                 }
             }
@@ -669,12 +662,10 @@ fn io_thread_main(
     }
     
     // Cleanup
-    eprintln!("[io-thread] Cleanup: resetting state");
     *state.inner.lock().unwrap() = RadioStateInner::default();
     if let Some(ref cb) = callbacks.lock().unwrap().connect {
         cb(false);
     }
-    eprintln!("[io-thread] Exiting");
 }
 
 fn attempt_connect(
@@ -700,11 +691,9 @@ fn attempt_connect(
     {
         Ok(port) => {
             *serial = Some(port);
-            eprintln!("[io-thread] Serial port opened");
             true
         }
-        Err(e) => {
-            eprintln!("[io-thread] Failed to open serial: {}", e);
+        Err(_) => {
             false
         }
     }
@@ -718,7 +707,6 @@ fn reset_esp32(serial: &mut Option<Box<dyn serialport::SerialPort>>) {
         let _ = sp.write_request_to_send(false);
         thread::sleep(Duration::from_millis(100));
         let _ = sp.write_data_terminal_ready(true);
-        eprintln!("[io-thread] ESP32 reset via DTR/RTS");
         thread::sleep(Duration::from_millis(1000));
     }
 }
@@ -745,7 +733,6 @@ fn send_initial_state(state: &Arc<RadioSharedState>, serial: &mut Option<Box<dyn
         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
         let _ = sp.write_all(&frame);
         let _ = sp.flush();
-        eprintln!("[io-thread] Sent initial state");
     }
 }
 
@@ -764,7 +751,6 @@ fn process_hello_packet(pkt: &crate::kiss::Packet) -> Option<VersionInfo> {
             v.features = pkt.payload[16];
         }
         v.is_valid = true;
-        eprintln!("[io-thread] Received HELLO: fw=v{}, rf={:?}", v.firmware_version, v.rf_module_type);
         return Some(v);
     }
     None
