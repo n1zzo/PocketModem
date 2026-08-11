@@ -19,9 +19,6 @@ use libadwaita::prelude::*;
 use libadwaita as adw;
 
 fn main() {
-    // Parse command line args BEFORE GTK processes them
-    // Note: We use POCKET_MODEM_DEVICE env var instead of command line args
-    // to avoid GTK interpreting the serial device as a file to open
     let serial_device = std::env::var("POCKET_MODEM_DEVICE").ok().unwrap_or_else(|| {
         // Auto-detect if no env var set
         if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
@@ -65,7 +62,7 @@ fn main() {
         sample_rate: 16000,
         tx_gain: 2.0,
         rx_gain: 1.0,
-        gate_threshold: 0.005,
+        gate_threshold: 0.001,  // Lower threshold to allow quieter audio through
         pre_emphasis_alpha: 0.0,
         hard_limit: 0.95,
     };
@@ -663,32 +660,36 @@ fn create_ui(
     ptt_btn.set_margin_bottom(20);
     ptt_btn.set_valign(gtk4::Align::End);
     
+    // PTT using GestureClick for proper press/release detection
+    let radio_pressed = Arc::clone(radio);
+    let audio_pressed = Arc::clone(audio);
+    let radio_released = Arc::clone(radio);
+    let audio_released = Arc::clone(audio);
+    
     let gesture = gtk4::GestureClick::new();
-    // Allow any button (0) for touch events
-    gesture.set_button(0);
     gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let radio_clone = Arc::clone(radio);
-    let audio_clone = Arc::clone(audio);
-    gesture.connect_pressed(move |_, _, _, _| {
-        if let Ok(r) = radio_clone.lock() {
+    gesture.set_button(0); // 0 = any button
+    
+    gesture.connect_pressed(glib::clone!(@strong radio_pressed, @strong audio_pressed => move |_gesture, _n_press, _x, _y| {
+        if let Ok(r) = radio_pressed.lock() {
             let _ = r.ptt_on();
         }
-        if let Ok(mut a) = audio_clone.lock() {
+        if let Ok(mut a) = audio_pressed.lock() {
             a.stop_playback();
             let _ = a.start_capture();
         }
-    });
-    let radio_clone2 = Arc::clone(radio);
-    let audio_clone2 = Arc::clone(audio);
-    gesture.connect_released(move |_, _, _, _| {
-        if let Ok(r) = radio_clone2.lock() {
+    }));
+    
+    gesture.connect_released(glib::clone!(@strong radio_released, @strong audio_released => move |_gesture, _n_press, _x, _y| {
+        if let Ok(r) = radio_released.lock() {
             let _ = r.ptt_off();
         }
-        if let Ok(mut a) = audio_clone2.lock() {
+        if let Ok(mut a) = audio_released.lock() {
             a.stop_capture();
             let _ = a.start_playback();
         }
-    });
+    }));
+    
     ptt_btn.add_controller(gesture);
     
     // Main content area with Clamp for responsive width

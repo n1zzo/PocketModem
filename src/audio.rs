@@ -305,43 +305,68 @@ impl Default for ADPCMDecoder {
 pub struct ADPCMEncoder {
     predictor: i32,
     step_index: i32,
+    step_estimated: bool,  // Only estimate step_index once per session
 }
 
 impl ADPCMEncoder {
     pub fn new() -> Self {
-        Self { predictor: 0, step_index: 0 }
+        Self { predictor: 0, step_index: 0, step_estimated: false }
     }
     
     /// Reset encoder state
     pub fn reset(&mut self) {
         self.predictor = 0;
         self.step_index = 0;
+        self.step_estimated = false;
+    }
+    
+    /// Get current state (for debugging)
+    pub fn state(&self) -> (i32, i32, bool) {
+        (self.predictor, self.step_index, self.step_estimated)
     }
 
     /// Encode PCM samples to IMA WAV ADPCM block.
     /// 
-    /// Matches the Java/Android implementation:
-    /// - Little-endian predictor bytes
-    /// - Low nibble first, then high nibble
-    /// - 249 samples from 128 bytes
+    /// Maintains step_index across blocks for continuous audio.
+    /// Step_index is estimated once on first block, then carried forward.
     pub fn encode(&mut self, samples: &[i16]) -> Vec<u8> {
-        // 128 bytes per block: 4 byte header + 124 bytes data = 249 samples
         let mut out = vec![0u8; ADPCM_FRAME_BYTES];
         
         if samples.is_empty() {
             return out;
         }
         
-        // Initialize state with first sample
-        self.predictor = samples[0] as i32;
+        // For CONTINUOUS audio (live voice TX):
+        // The predictor in header should be the last decoded value from PREVIOUS block
+        // This ensures smooth transitions at block boundaries
         
-        // Write header: predictor (2 bytes, little-endian), step_index (1 byte), reserved (1 byte = 0)
+        // Only estimate step_index ONCE
+        if !self.step_estimated {
+            // First sample becomes predictor for initial block
+            self.predictor = samples[0] as i32;
+            
+            let mut max_delta: i32 = 0;
+            for i in 1..samples.len().min(20) {
+                let delta = (samples[i] as i32 - self.predictor).abs();
+                if delta > max_delta { max_delta = delta; }
+            }
+            for idx in 0..89 {
+                if IMA_STEP_SIZE[idx] >= max_delta {
+                    self.step_index = idx as i32;
+                    self.step_estimated = true;
+                    break;
+                }
+            }
+        }
+        // For subsequent blocks, predictor already carries last value from previous block
+        
+        // Write header: predictor, step_index
         out[0] = (self.predictor & 0xFF) as u8;
         out[1] = ((self.predictor >> 8) & 0xFF) as u8;
         out[2] = self.step_index as u8;
         out[3] = 0;
         
-        // Encode remaining samples (249 - 1 = 248 samples = 124 bytes)
+        // Encode remaining samples
         let mut out_idx = 4;
         let mut high_nibble = false;
         let mut packed = 0u8;
@@ -359,7 +384,6 @@ impl ADPCMEncoder {
             }
         }
         
-        // Pad last nibble if odd number of samples
         if high_nibble {
             out[out_idx] = packed;
         }
@@ -405,7 +429,7 @@ impl ADPCMEncoder {
         // Clamp predictor
         self.predictor = self.predictor.clamp(i16::MIN as i32, i16::MAX as i32);
         
-        // Update step index
+        // Update step index AFTER encoding (same as decoder does)
         self.step_index += IMA_INDEX_ADJUST[code as usize];
         self.step_index = self.step_index.clamp(0, 88);
         
@@ -568,10 +592,15 @@ impl AudioManager {
         let tx_enabled = Arc::clone(&self.tx_enabled);
         let state = Arc::clone(&self.state);
         let dc_remover = Arc::clone(&self.dc_remover);
-        let volume_ramp = Arc::clone(&self.volume_ramp);
         let pre_emphasis = Arc::clone(&self.pre_emphasis);
         
-        volume_ramp.lock().unwrap().start();
+        // Reset encoder state for fresh TX session
+        self.encoder.reset();
+        
+        // Reset TX filters
+        self.dc_remover.lock().unwrap().reset();
+        // VolumeRamp doesn't have reset, just stop it
+        self.volume_ramp.lock().unwrap().stop();
         
         // Set enabled flag BEFORE spawning thread to avoid race
         self.tx_enabled.store(true, Ordering::SeqCst);
@@ -580,7 +609,7 @@ impl AudioManager {
         
         thread::spawn(move || {
             if let Err(e) = Self::capture_loop(&config, tx_callback, tx_enabled.clone(), 
-                                                dc_remover, volume_ramp, pre_emphasis) {
+                                                dc_remover, pre_emphasis) {
                 eprintln!("[audio] Capture error: {}", e);
             }
             tx_enabled.store(false, Ordering::SeqCst);
@@ -756,7 +785,6 @@ impl AudioManager {
         callback: TxAudioCallback,
         enabled: Arc<AtomicBool>,
         dc_remover: Arc<Mutex<DCOffsetRemover>>,
-        volume_ramp: Arc<Mutex<VolumeRamp>>,
         pre_emphasis: Arc<Mutex<PreEmphasis>>,
     ) -> Result<(), String> {
         let host = cpal::default_host();
@@ -773,7 +801,6 @@ impl AudioManager {
         let err_fn = |err| eprintln!("[audio] Stream error: {}", err);
         let callback_clone = Arc::clone(&callback);
         let dc_remover_clone = Arc::clone(&dc_remover);
-        let volume_ramp_clone = Arc::clone(&volume_ramp);
         let pre_emph_clone = Arc::clone(&pre_emphasis);
         let enabled2 = Arc::clone(&enabled);
         
@@ -794,15 +821,20 @@ impl AudioManager {
                             .map(|&s| (s as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16)
                             .collect();
                         
-                        // I16 format branch
+                        // DC removal and pre-emphasis for TX
                         dc_remover_clone.lock().unwrap().process(&mut samples);
-                        volume_ramp_clone.lock().unwrap().process(&mut samples);
                         pre_emph_clone.lock().unwrap().process(&mut samples);
                         
+                        // Check if audio level is above threshold
                         let mut max_amp = 0.0f32;
                         for &s in &samples {
                             let amp = (s as f32).abs() / 32768.0;
                             if amp > max_amp { max_amp = amp; }
+                        }
+                        
+                        // Debug: log mic audio levels
+                        if max_amp > 0.01 {
+                            eprintln!("[audio] TX I16: {} samples, max_amp={:.4}", samples.len(), max_amp);
                         }
                         
                         if max_amp > gate_threshold {
@@ -833,20 +865,15 @@ impl AudioManager {
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         if !enabled.load(Ordering::SeqCst) { return; }
                         
-                        let samples: Vec<i16> = data.iter()
+                        let mut samples: Vec<i16> = data.iter()
                             .map(|&s| {
                                 let s = s * gain;
                                 (s.clamp(-1.0, 1.0) * 32767.0) as i16
                             })
                             .collect();
                         
-                        // F32 format branch
-                        let mut dc = dc_remover_clone.lock().unwrap();
-                        let mut samples = samples;
-                        dc.process(&mut samples);
-                        drop(dc);
-                        
-                        volume_ramp_clone.lock().unwrap().process(&mut samples);
+                        // F32 format branch: DC removal and pre-emphasis
+                        dc_remover_clone.lock().unwrap().process(&mut samples);
                         pre_emph_clone.lock().unwrap().process(&mut samples);
                         
                         let mut max_amp = 0.0f32;

@@ -9,7 +9,7 @@ description = "GTK4 UI for PocketModem Radio - Native KV4P protocol"
 [dependencies]
 serialport = "4.6"
 glib = "0.18"
-gio = "0.19"
+gio = "0.18"
 gtk4 = "0.7"
 libadwaita = "0.5"
 

@@ -35,6 +35,8 @@ pub enum RadioCommand {
     Connect,
     /// Trigger shutdown
     Shutdown,
+    /// Drain queue then send state (for PTT release)
+    DrainAndSendState(HostDesiredState),
 }
 
 // ============================================================================
@@ -380,8 +382,10 @@ impl KV4PRadio {
 
     pub fn ptt_off(&self) -> Result<(), String> {
         let mut state = self.build_desired_state(true);
-        state.flags |= HostStateFlags::RX_AUDIO_OPEN.bits();
-        self.queue_command(RadioCommand::SendState(state))
+        // Clear PTT bits - must clear both to stop transmission
+        state.flags &= !(HostStateFlags::PTT_REQUESTED.bits() | HostStateFlags::TX_ALLOWED.bits());
+        // Use drain+send to clear queued audio frames first, then send PTT off
+        self.queue_command(RadioCommand::DrainAndSendState(state))
     }
     
     pub fn send_audio(&self, adpcm_data: &[u8]) -> Result<(), String> {
@@ -563,6 +567,9 @@ fn io_thread_main(
                                                 last_version = Some(version.clone());
                                                 state.inner.lock().unwrap().version = Some(version);
                                                 
+                                                // Mark radio as running (connected)
+                                                running.store(true, Ordering::SeqCst);
+                                                
                                                 // Call connect callback
                                                 if let Some(ref cb) = callbacks.lock().unwrap().connect {
                                                     cb(true);
@@ -601,6 +608,8 @@ fn io_thread_main(
                                                 if let Some(version) = process_hello_packet(&pkt) {
                                                     last_version = Some(version.clone());
                                                     state.inner.lock().unwrap().version = Some(version);
+                                                    // Mark radio as running (connected)
+                                                    running.store(true, Ordering::SeqCst);
                                                     if let Some(ref cb) = callbacks.lock().unwrap().connect {
                                                         cb(true);
                                                     }
@@ -647,6 +656,17 @@ fn io_thread_main(
                             thread::sleep(Duration::from_micros(500));
                         }
                         flow_window.fetch_sub(frame_len, Ordering::SeqCst);
+                        let _ = sp.write_all(&frame);
+                        let _ = sp.flush();
+                    }
+                }
+                RadioCommand::DrainAndSendState(desired_state) => {
+                    // Drain all pending SendFrame commands from queue
+                    while let Ok(RadioCommand::SendFrame(_)) = cmd_rx.try_recv() {}
+                    // Now send the state immediately
+                    if let Some(ref mut sp) = serial {
+                        let payload = desired_state.to_bytes();
+                        let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
                         let _ = sp.write_all(&frame);
                         let _ = sp.flush();
                     }
