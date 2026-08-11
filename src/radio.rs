@@ -496,7 +496,6 @@ impl KV4PRadio {
             ctcss_rx: 0,
         };
         
-        self.state.inner.lock().unwrap().desired_state_sent = Some(state.clone());
         state
     }
 }
@@ -512,6 +511,7 @@ fn io_thread_main(
     callbacks: Arc<Mutex<Callbacks>>,
     config: SerialConfig,
 ) {
+    eprintln!("[io-thread] Started");
     let mut buf = [0u8; 512];
     let parser = std::sync::Mutex::new(PacketParser::new());
     let mut serial: Option<Box<dyn serialport::SerialPort>> = None;
@@ -629,6 +629,10 @@ fn io_thread_main(
                 eprintln!("[io-thread] Command channel disconnected");
                 break;
             }
+            Err(e) => {
+                eprintln!("[io-thread] Recv error: {:?}", e);
+                break;
+            }
         }
         
         // Read serial data
@@ -659,6 +663,7 @@ fn io_thread_main(
     }
     
     // Cleanup
+    eprintln!("[io-thread] Cleanup: resetting state");
     *state.inner.lock().unwrap() = RadioStateInner::default();
     if let Some(ref cb) = callbacks.lock().unwrap().connect {
         cb(false);
@@ -816,11 +821,11 @@ fn update_device_state(
     let rssi_dbm = dev_state.rssi_dbm();
     let dev_state_clone = dev_state.clone();
     
-    state.inner.lock().unwrap().device_state = Some(dev_state_clone.clone());
-    
-    // Drop all our locks before invoking callbacks to avoid deadlock
-    // Callbacks may try to acquire radio lock held by main thread
-    drop(state.inner.lock().unwrap());
+    // Store device state while holding lock, then drop lock before callbacks
+    {
+        let mut inner = state.inner.lock().unwrap();
+        inner.device_state = Some(dev_state_clone.clone());
+    }
     
     // Invoke callbacks (outside any lock held by us)
     let cbs = callbacks.lock().unwrap();

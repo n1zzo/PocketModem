@@ -9,4 +9,4 @@ Type=Application
 Categories=Utility;Network;HamRadio
 Keywords=radio;ham;kv4p;modem;fm;aprs;m17;transceiver;rf
 StartupNotify=true
-X-Purism-FormFactor=Workplace
+X-Purism-FormFactor=Workstation;Mobile;

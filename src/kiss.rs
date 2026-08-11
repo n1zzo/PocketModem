@@ -236,10 +236,9 @@ impl DeviceState {
     }
     
     /// Calculate RSSI in dBm from raw value (0-255)
-    /// When squelch is closed (no signal), RSSI reading is just noise floor.
-    /// When squelch is open (receiving signal), RSSI shows actual signal strength.
+    /// Uses Android's formula: dbm = rssi * 1.2 - 160.8
     pub fn rssi_dbm(&self) -> f32 {
-        -120.0 + (self.rssi as f32 * 2.0)
+        (self.rssi as f32) * 1.2 - 160.8
     }
     pub fn smeter_bars(&self) -> u8 {
         (self.rssi * 9 / 255) as u8
