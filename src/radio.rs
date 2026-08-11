@@ -517,9 +517,19 @@ fn io_thread_main(
     let mut last_phys_ptt = false;
     let mut last_version: Option<VersionInfo> = None;
     
+    // Flow control window — decremented on each outgoing frame, incremented by WindowAck
+    let flow_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(2048));
+    let flow_window_ack = Arc::clone(&flow_window);
+    
+    // Track whether we're connected (to enable window ack)
+    let connected = Arc::new(AtomicBool::new(false));
+    let connected_for_parse = Arc::clone(&connected);
+    let connected_for_writing = Arc::clone(&connected);
+    
     loop {
-        // Check for commands with timeout
-        match cmd_rx.recv_timeout(Duration::from_millis(100)) {
+        // Check for commands with SHORT timeout — don't block serial reads
+        // Use try_recv so we never block more than one iteration on commands
+        match cmd_rx.try_recv() {
             Ok(cmd) => match cmd {
                 RadioCommand::Connect => {
                     // Attempt connection
@@ -605,12 +615,25 @@ fn io_thread_main(
                     if let Some(ref mut sp) = serial {
                         let payload = desired_state.to_bytes();
                         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
+                        let frame_len = frame.len() as u32;
+                        // Flow control: wait if window exhausted
+                        while flow_window.load(Ordering::SeqCst) < frame_len {
+                            // Wait for WindowAck to free up space — yield to allow ack to arrive
+                            thread::sleep(Duration::from_micros(500));
+                        }
+                        flow_window.fetch_sub(frame_len, Ordering::SeqCst);
                         let _ = sp.write_all(&frame);
                         let _ = sp.flush();
                     }
                 }
                 RadioCommand::SendFrame(frame) => {
                     if let Some(ref mut sp) = serial {
+                        let frame_len = frame.len() as u32;
+                        // Flow control: wait if window exhausted
+                        while flow_window.load(Ordering::SeqCst) < frame_len {
+                            thread::sleep(Duration::from_micros(500));
+                        }
+                        flow_window.fetch_sub(frame_len, Ordering::SeqCst);
                         let _ = sp.write_all(&frame);
                         let _ = sp.flush();
                     }
@@ -620,28 +643,33 @@ fn io_thread_main(
                     break;
                 }
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // No command, continue reading serial
+            Err(mpsc::TryRecvError::Empty) => {
+                // No command pending — continue reading serial immediately
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                break;
-            }
-            Err(e) => {
+            Err(mpsc::TryRecvError::Disconnected) => {
                 break;
             }
         }
         
-        // Read serial data
+        // Read serial data — use short timeout so we loop back fast for commands
         if let Some(ref mut sp) = serial {
             match sp.read(&mut buf) {
                 Ok(0) => {
-                    // Zero bytes read, no action
+                    // Zero bytes read — loop back immediately for commands
                 }
                 Ok(n) => {
                     let packets = parser.lock().unwrap().feed(&buf[..n]);
                     for pkt in packets {
-                        // WindowAck must be sent immediately
+                        // WindowAck (0x09): increment flow control window
                         if pkt.command == 0x09 && pkt.payload.len() >= 4 {
+                            // Parse window size from payload (little-endian u32 at offset 0)
+                            let size = u32::from_le_bytes([
+                                pkt.payload[0], pkt.payload[1],
+                                pkt.payload[2], pkt.payload[3],
+                            ]);
+                            flow_window_ack.fetch_add(size, Ordering::SeqCst);
+                            
+                            // Also send the ack back
                             let ack = build_kv4p_packet(HostCommand::WindowAck, &pkt.payload);
                             let _ = sp.write_all(&ack);
                             let _ = sp.flush();
@@ -652,10 +680,10 @@ fn io_thread_main(
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    // Normal - no data
+                    // Normal — no data. Loop back immediately, don't wait for commands.
                 }
                 Err(_) => {
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(Duration::from_millis(1));
                 }
             }
         }
@@ -686,7 +714,7 @@ fn attempt_connect(
         .parity(serialport::Parity::None)
         .stop_bits(serialport::StopBits::One)
         .flow_control(serialport::FlowControl::None)
-        .timeout(Duration::from_millis(100))
+        .timeout(Duration::from_millis(1))
         .open()
     {
         Ok(port) => {
