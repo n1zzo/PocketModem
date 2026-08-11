@@ -300,8 +300,9 @@ impl PacketParser {
             self.buf.drain(..end + 1);
         }
 
+        // If buffer doesn't start with FEND, clear it (corrupted state)
         if !self.buf.is_empty() && self.buf[0] != KISS_FEND {
-            self.buf.drain(..self.buf.len().saturating_sub(1));
+            self.buf.clear();
         }
 
         packets

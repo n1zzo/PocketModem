@@ -193,14 +193,6 @@ fn create_ui(
             }
         });
         
-        let audio_state = Arc::clone(audio);
-        r.on_state(move |state| {
-            if let Ok(mut a) = audio_state.lock() {
-                a.update_squelch(state.is_squelched());
-                a.update_rssi(state.rssi);
-            }
-        });
-        
         let radio_ptt = Arc::clone(&radio);
         let audio_ptt = Arc::clone(audio);
         r.on_phys_ptt(move |pressed| {
@@ -759,7 +751,9 @@ fn create_ui(
     let gps_location_clone = gps_location_label.clone();
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        // Get radio state for UI updates (callbacks invoked from I/O thread)
+        // Get radio state for UI updates
+        // NOTE: Using lock() (blocking) NOT try_lock() - if we skip updates when lock is
+        // unavailable, RSSI display freezes during squelch/filter changes that hold the lock.
         if let Ok(r) = radio_update.lock() {
             let state = r.state();
             

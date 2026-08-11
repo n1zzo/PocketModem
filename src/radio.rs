@@ -356,9 +356,8 @@ impl KV4PRadio {
     
     pub fn open_audio(&self) -> Result<(), String> {
         eprintln!("[radio] open_audio() called");
-        let mut state = self.build_desired_state(true);
-        state.flags |= HostStateFlags::RX_AUDIO_OPEN.bits();
-        self.queue_command(RadioCommand::SendState(state))
+        // RX_AUDIO_OPEN is now included in build_desired_state() by default
+        self.queue_command(RadioCommand::SendState(self.build_desired_state(true)))
     }
     
     pub fn enable_smeter(&self, _enabled: bool) -> Result<(), String> {
@@ -469,7 +468,8 @@ impl KV4PRadio {
         let freq = self.state.frequency.load(Ordering::SeqCst) as f32 / 1000.0;
         let mut flags = HostStateFlags::HIGH_POWER.bits() |
                        HostStateFlags::RSSI_ENABLED.bits() |
-                       HostStateFlags::ENABLE_STATUS_REPORTS.bits();
+                       HostStateFlags::ENABLE_STATUS_REPORTS.bits() |
+                       HostStateFlags::RX_AUDIO_OPEN.bits();
         if include_radio_config_valid {
             flags |= HostStateFlags::RADIO_CONFIG_VALID.bits();
         }
@@ -638,7 +638,12 @@ fn io_thread_main(
         // Read serial data
         if let Some(ref mut sp) = serial {
             match sp.read(&mut buf) {
-                Ok(n) if n > 0 => {
+                Ok(0) => {
+                    // Zero bytes read, no action
+                }
+                Ok(0) => {}
+                Ok(n) => {
+                    eprintln!("[io-thread] read {} bytes", n);
                     let packets = parser.lock().unwrap().feed(&buf[..n]);
                     for pkt in packets {
                         // WindowAck must be sent immediately
@@ -655,7 +660,8 @@ fn io_thread_main(
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     // Normal - no data
                 }
-                _ => {
+                Err(e) => {
+                    eprintln!("[io-thread] read error: {}", e);
                     thread::sleep(Duration::from_millis(10));
                 }
             }

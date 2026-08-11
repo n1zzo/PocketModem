@@ -6,7 +6,7 @@
 //!
 //! Uses cpal for capture and playback, oxideav-adpcm for ADPCM decoding.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -421,10 +421,6 @@ pub struct AudioManager {
     rx_callback: RxAudioCallback,
     tx_enabled: Arc<AtomicBool>,
     rx_enabled: Arc<AtomicBool>,
-    // Squelch state tracking
-    is_squelched: Arc<AtomicBool>,  // Current hardware squelch state
-    squelch_known: Arc<AtomicBool>,  // Have we received first squelch state?
-    current_rssi: Arc<AtomicU8>,  // Current RSSI (for threshold check)
     rx_volume: Arc<AtomicU32>,  // Volume for RX (starts at 0, ramps up via AtomicU32 float bits)
     state: Arc<Mutex<AudioState>>,
     dc_remover: Arc<Mutex<DCOffsetRemover>>,
@@ -446,10 +442,6 @@ impl AudioManager {
             rx_callback: Arc::new(Mutex::new(None)),
             tx_enabled: Arc::new(AtomicBool::new(false)),
             rx_enabled: Arc::new(AtomicBool::new(false)),
-            // Squelch tracking - start assuming squelch closed (no audio)
-            is_squelched: Arc::new(AtomicBool::new(true)),
-            squelch_known: Arc::new(AtomicBool::new(false)),
-            current_rssi: Arc::new(AtomicU8::new(0)),
             rx_volume: Arc::new(AtomicU32::new(0)),
             state: Arc::new(Mutex::new(AudioState::Idle)),
             dc_remover: Arc::new(Mutex::new(DCOffsetRemover::new(0.25, AUDIO_WIRE_SAMPLE_RATE as f32))),
@@ -476,23 +468,6 @@ impl AudioManager {
     }
     
 
-    
-    /// Update squelch state from firmware
-    /// is_squelched = true means hardware squelch is closed (no signal)
-    /// is_squelched = false means hardware squelch is open (signal detected)
-    pub fn update_squelch(&mut self, is_squelched: bool) {
-        self.squelch_known.store(true, Ordering::SeqCst);
-        self.is_squelched.store(is_squelched, Ordering::SeqCst);
-    }
-    
-    /// Update RSSI value for signal detection threshold
-    pub fn update_rssi(&mut self, raw_rssi: u8) {
-        self.current_rssi.store(raw_rssi, Ordering::SeqCst);
-        // Also reset max tracking when RSSI is low (to detect new signals)
-        if raw_rssi < 10 {
-            // Low RSSI - this could be noise or no signal
-        }
-    }
     
     /// Internal: call accumulate_rx_audio and start playback if ready
     /// Matches Android app exactly: just buffer audio and start playback.
