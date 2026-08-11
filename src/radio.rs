@@ -385,7 +385,11 @@ impl KV4PRadio {
         // Clear PTT bits - must clear both to stop transmission
         state.flags &= !(HostStateFlags::PTT_REQUESTED.bits() | HostStateFlags::TX_ALLOWED.bits());
         // Use drain+send to clear queued audio frames first, then send PTT off
-        self.queue_command(RadioCommand::DrainAndSendState(state))
+        // Send multiple times to ensure reliable release
+        for _ in 0..5 {
+            self.queue_command(RadioCommand::DrainAndSendState(state.clone()));
+        }
+        Ok(())
     }
     
     pub fn send_audio(&self, adpcm_data: &[u8]) -> Result<(), String> {

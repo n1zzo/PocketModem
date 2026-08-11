@@ -437,23 +437,6 @@ fn create_ui(
     mic_section.append(&mic_dropdown);
     settings_view.append(&mic_section);
     
-    // Debug Log section
-    let debug_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    let debug_title = gtk4::Label::new(Some("<b>Debug Log</b>"));
-    debug_title.set_markup("<b>Debug Log</b>");
-    debug_title.set_halign(gtk4::Align::Start);
-    debug_section.append(&debug_title);
-    
-    // Debug enable toggle
-    // Debug logging section (currently informational only)
-    let debug_info_label = gtk4::Label::new(Some("<small>Debug logging available via terminal output</small>"));
-    debug_info_label.set_markup("<small>Debug logging available via terminal output</small>");
-    debug_info_label.set_halign(gtk4::Align::Start);
-    debug_section.append(&debug_info_label);
-    
-    // Debug log text view (scrollable)
-    settings_view.append(&debug_section);
-    
     // Add back button
     let back_btn = gtk4::Button::with_label("Back");
     back_btn.set_margin_top(24);
