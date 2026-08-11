@@ -791,18 +791,47 @@ fn create_ui(
             }
         }
         
-        // Update audio status indicator
-        if let Ok(a) = audio_clone.lock() {
-            let capturing = a.is_capturing();
-            let playing = a.is_playing();
-            if capturing || playing {
-                audio_label_clone.set_text("●");
-                audio_label_clone.remove_css_class("status-icon-gray");
-                audio_label_clone.add_css_class("status-icon-green");
+        // Update audio status indicator based on radio's squelch state and audio thread status
+        {
+            let a = audio_clone.lock().unwrap();
+            let audio_started = a.audio_started();
+            let has_error = a.has_decode_error();
+            drop(a);
+            
+            // Get squelch state from radio
+            let squelch_open = if let Ok(r) = radio_update.lock() {
+                r.state().squelch_open
             } else {
+                false
+            };
+            
+            if has_error {
+                // Red empty dot: error with audio decoding
                 audio_label_clone.set_text("○");
                 audio_label_clone.remove_css_class("status-icon-green");
-                audio_label_clone.add_css_class("status-icon-gray");
+                audio_label_clone.remove_css_class("status-icon-gray-filled");
+                audio_label_clone.add_css_class("status-icon-red");
+            } else if !audio_started {
+                // Grey empty dot: audio thread not started
+                audio_label_clone.set_text("○");
+                audio_label_clone.remove_css_class("status-icon-green");
+                audio_label_clone.remove_css_class("status-icon-red");
+                audio_label_clone.remove_css_class("status-icon-gray-filled");
+                audio_label_clone.add_css_class("status-icon-gray-empty");
+            } else if squelch_open {
+                // Green full dot: audio coming through (squelch open)
+                audio_label_clone.set_text("●");
+                audio_label_clone.remove_css_class("status-icon-gray-empty");
+                audio_label_clone.remove_css_class("status-icon-gray-filled");
+                audio_label_clone.remove_css_class("status-icon-red");
+                audio_label_clone.add_css_class("status-icon-green");
+            } else {
+                // Grey full dot: audio thread started but squelch closed
+                audio_label_clone.set_text("●");
+                audio_label_clone.remove_css_class("status-icon-green");
+                audio_label_clone.remove_css_class("status-icon-red");
+                audio_label_clone.remove_css_class("status-icon-gray-empty");
+                audio_label_clone.add_css_class("status-icon-gray-filled");
             }
         }
 
@@ -933,9 +962,13 @@ fn create_ui(
         .gps-fixed {
             color: #33D17A;
         }
-        .status-icon-gray {
+        .status-icon-gray-empty {
             font-size: 16px;
             color: #666;
+        }
+        .status-icon-gray-filled {
+            font-size: 16px;
+            color: #888;
         }
 
         .squelch-label {

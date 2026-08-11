@@ -74,6 +74,19 @@ impl Default for AudioState {
     fn default() -> Self { Self::Idle }
 }
 
+/// Audio LED status for UI display
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioLedStatus {
+    /// Audio thread not started
+    NotStarted,
+    /// Audio thread started but squelch closed (no audio coming)
+    SquelchClosed,
+    /// Audio coming through
+    AudioActive,
+    /// Error with audio decoding
+    Error,
+}
+
 /// DC offset remover (exponential decay)
 pub struct DCOffsetRemover {
     alpha: f32,
@@ -416,6 +429,9 @@ pub struct AudioManager {
     rx_volume: Arc<AtomicU32>,  // Volume for RX (starts at 0, ramps up via AtomicU32 float bits)
     rx_first_block: Arc<AtomicBool>,  // Track first block for ADPCM state continuity
     state: Arc<Mutex<AudioState>>,
+    audio_ever_started: Arc<AtomicBool>,  // Track if audio thread has ever been started
+    has_decode_error: Arc<AtomicBool>,     // Track decode errors for LED status
+    decode_error_count: Arc<AtomicU32>,    // Count decode errors
     dc_remover: Arc<Mutex<DCOffsetRemover>>,
     dc_remover_rx: Arc<Mutex<DCOffsetRemover>>,  // Separate DC remover for RX
     volume_ramp: Arc<Mutex<VolumeRamp>>,
@@ -440,6 +456,9 @@ impl AudioManager {
             rx_volume: Arc::new(AtomicU32::new(0)),
             rx_first_block: Arc::new(AtomicBool::new(true)),  // Track first block for ADPCM continuity
             state: Arc::new(Mutex::new(AudioState::Idle)),
+            audio_ever_started: Arc::new(AtomicBool::new(false)),
+            has_decode_error: Arc::new(AtomicBool::new(false)),
+            decode_error_count: Arc::new(AtomicU32::new(0)),
             dc_remover: Arc::new(Mutex::new(DCOffsetRemover::new(0.25, AUDIO_WIRE_SAMPLE_RATE as f32))),
             dc_remover_rx: Arc::new(Mutex::new(DCOffsetRemover::new(0.05, AUDIO_WIRE_SAMPLE_RATE as f32))),  // Faster DC removal for RX
             volume_ramp: Arc::new(Mutex::new(VolumeRamp::new(0.05, 0.7))),
@@ -500,6 +519,7 @@ impl AudioManager {
         
         // CRITICAL: Set enabled flag BEFORE spawning thread
         self.rx_enabled.store(true, Ordering::SeqCst);
+        self.audio_ever_started.store(true, Ordering::SeqCst);
         *self.state.lock().unwrap() = AudioState::Playing;
         
         // Reset volume ramp to 0 (matches Android: audioTrackVolume = 0)
@@ -555,6 +575,7 @@ impl AudioManager {
         
         // Set enabled flag BEFORE spawning thread to avoid race
         self.tx_enabled.store(true, Ordering::SeqCst);
+        self.audio_ever_started.store(true, Ordering::SeqCst);
         *self.state.lock().unwrap() = AudioState::Capturing;
         
         thread::spawn(move || {
@@ -626,6 +647,7 @@ impl AudioManager {
         // CRITICAL: Set enabled flag BEFORE spawning thread
         // cpal stream starts asynchronously and callbacks may run immediately
         self.rx_enabled.store(true, Ordering::SeqCst);
+        self.audio_ever_started.store(true, Ordering::SeqCst);
         *self.state.lock().unwrap() = AudioState::Playing;
         
         // Reset volume ramp
@@ -692,7 +714,11 @@ impl AudioManager {
                 let mut buf = self.playback_buf.lock().unwrap();
                 buf.extend_from_slice(&pcm_samples);
             }
-            Err(e) => eprintln!("[audio] ADPCM decode error: {}", e),
+            Err(e) => {
+                eprintln!("[audio] ADPCM decode error: {}", e);
+                self.has_decode_error.store(true, Ordering::SeqCst);
+                self.decode_error_count.fetch_add(1, Ordering::SeqCst);
+            }
         }
         self.rx_first_block.store(false, Ordering::SeqCst);
     }
@@ -944,6 +970,43 @@ impl AudioManager {
     
     pub fn is_playing(&self) -> bool {
         self.rx_enabled.load(Ordering::SeqCst)
+    }
+    
+    /// Get audio LED status for UI display
+    pub fn led_status(&self) -> AudioLedStatus {
+        // Check for decode errors first (only show error when idle)
+        if self.has_decode_error.load(Ordering::SeqCst) && 
+           !self.rx_enabled.load(Ordering::SeqCst) && 
+           !self.tx_enabled.load(Ordering::SeqCst) {
+            return AudioLedStatus::Error;
+        }
+        
+        let ever_started = self.audio_ever_started.load(Ordering::SeqCst);
+        
+        if !ever_started {
+            // Audio thread never started
+            AudioLedStatus::NotStarted
+        } else {
+            // Note: squelch state is now checked from radio in main.rs
+            // This method kept for backwards compatibility
+            AudioLedStatus::SquelchClosed
+        }
+    }
+    
+    /// Clear decode error flag (call when user acknowledges or reconnects)
+    pub fn clear_decode_error(&mut self) {
+        self.has_decode_error.store(false, Ordering::SeqCst);
+        self.decode_error_count.store(0, Ordering::SeqCst);
+    }
+    
+    /// Check if there was a decode error
+    pub fn has_decode_error(&self) -> bool {
+        self.has_decode_error.load(Ordering::SeqCst)
+    }
+    
+    /// Check if audio thread has ever been started (for LED status)
+    pub fn audio_started(&self) -> bool {
+        self.audio_ever_started.load(Ordering::SeqCst)
     }
     
     /// Stop playback from external caller (fade out to avoid click)

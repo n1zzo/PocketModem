@@ -312,10 +312,15 @@ impl KV4PRadio {
     
     pub fn set_squelch(&self, level: u8) -> Result<(), String> {
         let clamped = level.min(8);
-        eprintln!("[radio] set_squelch: {}", clamped);
+        let freq = self.state.frequency.load(Ordering::SeqCst);
+        let tx_freq = self.state.tx_frequency.load(Ordering::SeqCst);
+        let seq = self.sequence.load(Ordering::SeqCst);
+        eprintln!("[radio] set_squelch: {} -> {} (freq={}, tx={}, seq={})", 
+                  self.state.current_squelch.load(Ordering::SeqCst), clamped, freq, tx_freq, seq);
         self.state.current_squelch.store(clamped, Ordering::SeqCst);
         self.state.squelch_user_set.store(true, Ordering::SeqCst);
         let state = self.build_desired_state(true);
+        eprintln!("[radio] set_squelch: built state sq={} flags=0x{:04x}", state.squelch, state.flags);
         self.queue_command(RadioCommand::SendState(state))
     }
     
@@ -356,8 +361,11 @@ impl KV4PRadio {
     
     pub fn open_audio(&self) -> Result<(), String> {
         eprintln!("[radio] open_audio() called");
-        // RX_AUDIO_OPEN is now included in build_desired_state() by default
-        self.queue_command(RadioCommand::SendState(self.build_desired_state(true)))
+        // Build state WITHOUT RADIO_CONFIG_VALID - only session flags (RX_AUDIO_OPEN)
+        // Don't trigger radio reconfiguration, just enable audio path
+        let state = self.build_desired_state(false);
+        eprintln!("[radio] open_audio: sq={} flags=0x{:04x}", state.squelch, state.flags);
+        self.queue_command(RadioCommand::SendState(state))
     }
     
     pub fn enable_smeter(&self, _enabled: bool) -> Result<(), String> {
@@ -616,6 +624,11 @@ fn io_thread_main(
                         let payload = desired_state.to_bytes();
                         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
                         let frame_len = frame.len() as u32;
+                        // Debug: log squelch value being sent with hex payload dump
+                        let payload_hex: Vec<String> = payload.iter().map(|b| format!("{:02x}", b)).collect();
+                        eprintln!("[io-thread] SendState: sq={} flags=0x{:04x} freq={:.3} payload=[{}]", 
+                                  desired_state.squelch, desired_state.flags, desired_state.freq_rx,
+                                  payload_hex.join(" "));
                         // Flow control: wait if window exhausted
                         while flow_window.load(Ordering::SeqCst) < frame_len {
                             // Wait for WindowAck to free up space — yield to allow ack to arrive
@@ -793,6 +806,9 @@ fn process_packet(
     match pkt.command as u8 {
         x if x == DeviceCommand::DeviceState as u8 => {
             if let Some(dev_state) = DeviceState::from_bytes(&pkt.payload) {
+                // Debug: log echoed squelch
+                eprintln!("[io-thread] DeviceState echo: sq={} flags=0x{:04x} rssi={}", 
+                          dev_state.squelch, dev_state.flags, dev_state.rssi);
                 // Check physical PTT before moving
                 let phys_ptt = dev_state.phys_ptt_down();
                 if phys_ptt != *last_phys_ptt {
