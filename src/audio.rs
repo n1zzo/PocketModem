@@ -221,17 +221,11 @@ impl ADPCMDecoder {
     }
 
     /// Decode an IMA WAV ADPCM block (128 bytes -> 249 samples).
-    /// 
-    /// Matches the Java implementation in Android app:
-    /// - Uses block header for initial predictor and step_index
-    /// - Low nibble decoded first, then high nibble
-    /// - Clamps predictor to i16 range
-    pub fn decode_block(&mut self, block: &[u8]) -> Result<Vec<i16>, String> {
+    pub fn decode_block(&mut self, block: &[u8], _is_first_block: bool) -> Result<Vec<i16>, String> {
         if block.len() < 4 {
             return Err("Block too short for IMA WAV header".to_string());
         }
 
-        // Parse block header - little-endian (verified to match Java/Android)
         let predictor_i16 = i16::from_le_bytes([block[0], block[1]]);
         self.predictor = predictor_i16 as i32;
         self.step_index = (block[2] as i32).clamp(0, 88);
@@ -241,10 +235,8 @@ impl ADPCMDecoder {
         let samples = 1 + groups * 8;
         let mut out = Vec::with_capacity(samples);
 
-        // First sample is the header predictor
         out.push(self.predictor as i16);
 
-        // Decode nibbles (matches Java: low nibble first, then high)
         for group in body.chunks(4) {
             for &byte in group {
                 let n_lo = (byte & 0x0F) as u8;
@@ -422,11 +414,14 @@ pub struct AudioManager {
     tx_enabled: Arc<AtomicBool>,
     rx_enabled: Arc<AtomicBool>,
     rx_volume: Arc<AtomicU32>,  // Volume for RX (starts at 0, ramps up via AtomicU32 float bits)
+    rx_first_block: Arc<AtomicBool>,  // Track first block for ADPCM state continuity
     state: Arc<Mutex<AudioState>>,
     dc_remover: Arc<Mutex<DCOffsetRemover>>,
+    dc_remover_rx: Arc<Mutex<DCOffsetRemover>>,  // Separate DC remover for RX
     volume_ramp: Arc<Mutex<VolumeRamp>>,
     pre_emphasis: Arc<Mutex<PreEmphasis>>,
     de_emphasis: Arc<Mutex<DeEmphasis>>,
+    de_emphasis_enabled: bool,
     playback_buf: Arc<Mutex<Vec<i16>>>,
 }
 
@@ -443,11 +438,14 @@ impl AudioManager {
             tx_enabled: Arc::new(AtomicBool::new(false)),
             rx_enabled: Arc::new(AtomicBool::new(false)),
             rx_volume: Arc::new(AtomicU32::new(0)),
+            rx_first_block: Arc::new(AtomicBool::new(true)),  // Track first block for ADPCM continuity
             state: Arc::new(Mutex::new(AudioState::Idle)),
             dc_remover: Arc::new(Mutex::new(DCOffsetRemover::new(0.25, AUDIO_WIRE_SAMPLE_RATE as f32))),
+            dc_remover_rx: Arc::new(Mutex::new(DCOffsetRemover::new(0.05, AUDIO_WIRE_SAMPLE_RATE as f32))),  // Faster DC removal for RX
             volume_ramp: Arc::new(Mutex::new(VolumeRamp::new(0.05, 0.7))),
             pre_emphasis: Arc::new(Mutex::new(pre_emph)),
             de_emphasis: Arc::new(Mutex::new(de_emph)),
+            de_emphasis_enabled: false,  // Default off to match Android (no de-emphasis)
             playback_buf: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -471,16 +469,16 @@ impl AudioManager {
     
     /// Internal: call accumulate_rx_audio and start playback if ready
     /// Matches Android app exactly: just buffer audio and start playback.
-    /// Android trusts firmware for squelch - we use volume ramping instead.
     pub fn accumulate_and_start(&mut self, adpcm_data: &[u8]) {
+        // Decode real audio from radio
         self.accumulate_rx_audio(adpcm_data);
         
         let buf_len = self.playback_buf.lock().unwrap().len();
         
-        // Start playback when buffer is ready - matches Android app exactly
-        // No squelch gating - Android trusts firmware, we use volume ramping instead
+        // Start playback when buffer is ready
         if !self.rx_enabled.load(Ordering::SeqCst) && buf_len >= 249 {
             let _ = self.start_playback_volume_zero();
+            self.rx_volume.store(1.0f32.to_bits(), Ordering::SeqCst);
         }
     }
     
@@ -506,6 +504,7 @@ impl AudioManager {
         
         // Reset volume ramp to 0 (matches Android: audioTrackVolume = 0)
         rx_volume.store(0, Ordering::SeqCst);
+        self.rx_first_block.store(true, Ordering::SeqCst);  // Reset ADPCM state continuity
         
         // Spawn playback loop
         thread::spawn(move || {
@@ -592,11 +591,11 @@ impl AudioManager {
     
     /// Enable or disable de-emphasis filter (RX)
     pub fn set_de_emphasis(&mut self, enabled: bool) {
+        self.de_emphasis_enabled = enabled;
         if enabled {
-            *self.de_emphasis.lock().unwrap() = DeEmphasis::new(0.85);
+            self.de_emphasis.lock().unwrap().reset();  // Reset state when enabling
             eprintln!("[audio] De-emphasis enabled");
         } else {
-            *self.de_emphasis.lock().unwrap() = DeEmphasis::new(0.0);
             eprintln!("[audio] De-emphasis disabled");
         }
     }
@@ -631,6 +630,7 @@ impl AudioManager {
         
         // Reset volume ramp
         rx_volume.store(0, Ordering::SeqCst);
+        self.rx_first_block.store(true, Ordering::SeqCst);  // Reset ADPCM state continuity
         
         // Spawn playback loop
         thread::spawn(move || {
@@ -672,39 +672,35 @@ impl AudioManager {
     pub fn play_adpcm_frame(&mut self, adpcm_data: &[u8]) -> Result<(), String> {
         if !self.rx_enabled.load(Ordering::SeqCst) { return Ok(()); }
         
-        // Decode IMA WAV ADPCM (128 bytes -> 249 samples at 16kHz)
-        match self.decoder.decode_block(adpcm_data) {
+        let is_first = self.rx_first_block.load(Ordering::SeqCst);
+        match self.decoder.decode_block(adpcm_data, is_first) {
             Ok(pcm_samples) => {
-                // Store at native 16kHz (match Android app)
                 let mut buf = self.playback_buf.lock().unwrap();
                 buf.extend_from_slice(&pcm_samples);
             }
             Err(e) => eprintln!("[audio] ADPCM decode error: {}", e),
         }
+        self.rx_first_block.store(false, Ordering::SeqCst);
         Ok(())
     }
     
         /// Accumulate ADPCM audio frames before starting playback
-    /// 
-    /// Matches Android app: decode at 16kHz native sample rate.
     pub fn accumulate_rx_audio(&mut self, adpcm_data: &[u8]) {
-        // Decode and buffer even before playback starts
-        match self.decoder.decode_block(adpcm_data) {
-            Ok(mut pcm_samples) => {
-                // Apply de-emphasis if enabled
-                self.de_emphasis.lock().unwrap().process(&mut pcm_samples);
-                
-                // Store at native 16kHz (match Android app)
+        let is_first = self.rx_first_block.load(Ordering::SeqCst);
+        match self.decoder.decode_block(adpcm_data, is_first) {
+            Ok(pcm_samples) => {
                 let mut buf = self.playback_buf.lock().unwrap();
                 buf.extend_from_slice(&pcm_samples);
             }
             Err(e) => eprintln!("[audio] ADPCM decode error: {}", e),
         }
+        self.rx_first_block.store(false, Ordering::SeqCst);
     }
     
     /// Reset the ADPCM decoder state (call when starting new RX session)
     pub fn reset_decoder(&mut self) {
         self.decoder.reset();
+        self.rx_first_block.store(true, Ordering::SeqCst);
     }
     
     /// Get playback buffer level (useful for diagnostics)
@@ -901,30 +897,23 @@ impl AudioManager {
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                 if !enabled.load(Ordering::SeqCst) {
                     for s in data.iter_mut() { *s = 0; }
-                    // Reset volume ramp when disabled
                     rx_volume.store(0, Ordering::SeqCst);
                     return;
                 }
                 
-                // Volume ramp: matches Android alpha=0.02
-                // Store volume as u32 bits to use atomic (AtomicF32 not available)
+                // Get volume from main AudioManager's rx_volume
+                // This is updated externally - default should be high enough
                 let vol_bits = rx_volume.load(Ordering::SeqCst);
                 let vol = f32::from_bits(vol_bits);
-                let new_vol = 0.02 + 0.98 * vol;
-                rx_volume.store(new_vol.to_bits(), Ordering::SeqCst);
-                
-                // Apply gain when volume > 0.7 (matches Android)
-                let vol_gain = if new_vol > 0.7 { new_vol * gain } else { 0.0 };
+                let vol_gain = if vol > 0.0 { vol.min(1.0) } else { 1.0 };  // Default to full volume if 0
                 
                 let mut buf = playback_buf_clone.lock().unwrap();
-                let available = buf.len();
-                let to_copy = available.min(data.len());
+                let to_copy = buf.len().min(data.len());
                 
                 for i in 0..to_copy {
-                    let sample = (buf[i] as f32 * vol_gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                    data[i] = sample;
+                    let s = (buf[i] as f32 * vol_gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                    data[i] = s;
                 }
-                // Zero-fill rest
                 for i in to_copy..data.len() {
                     data[i] = 0;
                 }
