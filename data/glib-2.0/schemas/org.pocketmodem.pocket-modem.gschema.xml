@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.pocketmodem.pocket-modem" path="/org/pocketmodem/pocket-modem/">
+
+    <!-- Schema version for migrations -->
+    <key name="schema-version" type="i">
+      <default>1</default>
+      <summary>Schema version for settings migrations</summary>
+      <description>Incremented when settings schema changes to trigger migration</description>
+    </key>
+
+    <!-- Radio Settings -->
+    <key name="frequency" type="i">
+      <default>144200</default>
+      <summary>Last tuned frequency in kHz</summary>
+      <description>VFO frequency in kilohertz (e.g., 144200 = 144.200 MHz)</description>
+    </key>
+
+    <key name="squelch" type="i">
+      <default>4</default>
+      <summary>Squelch level</summary>
+      <description>0-8 where 0 is most permissive, 8 is strictest</description>
+    </key>
+
+    <key name="tx-power-high" type="b">
+      <default>false</default>
+      <summary>High power TX mode</summary>
+      <description>When true, use high power (1W). When false, use low power (0.5W)</description>
+    </key>
+
+    <!-- Audio Filters -->
+    <key name="pre-emphasis" type="b">
+      <default>false</default>
+      <summary>Pre-emphasis filter for TX</summary>
+      <description>Enable 6dB/octave pre-emphasis on transmitted audio</description>
+    </key>
+
+    <key name="de-emphasis" type="b">
+      <default>false</default>
+      <summary>De-emphasis filter for RX</summary>
+      <description>Enable 6dB/octave de-emphasis on received audio</description>
+    </key>
+
+    <key name="high-pass-filter" type="b">
+      <default>true</default>
+      <summary>High-pass filter</summary>
+      <description>Enable high-pass filter to remove low frequency noise</description>
+    </key>
+
+    <key name="low-pass-filter" type="b">
+      <default>true</default>
+      <summary>Low-pass filter</summary>
+      <description>Enable low-pass filter to remove high frequency noise</description>
+    </key>
+
+    <!-- Channel Management -->
+    <key name="channels" type="s">
+      <default>"[]"</default>
+      <summary>Stored radio channels</summary>
+      <description>JSON array of Channel objects. Use export/import CSV for backup.</description>
+    </key>
+
+    <key name="last-channel-index" type="i">
+      <default>-1</default>
+      <summary>Last selected channel index</summary>
+      <description>-1 means VFO mode, otherwise index into channels array</description>
+    </key>
+
+    <!-- Mic Gain -->
+    <key name="mic-gain" type="s">
+      <default>"none"</default>
+      <summary>Microphone gain boost</summary>
+      <description>Mic gain boost level: "none", "low", "med", or "high"</description>
+    </key>
+
+  </schema>
+</schemalist>

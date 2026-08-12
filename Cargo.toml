@@ -13,6 +13,10 @@ gio = "0.18"
 gtk4 = "0.7"
 libadwaita = "0.5"
 
+# Serialization for settings
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
 # Audio
 cpal = "0.15"
 rodio = "0.19"
@@ -21,15 +25,15 @@ oxideav-adpcm = "0.0.6"
 oxideav-core = "0.1"
 bytemuck = "1"
 
+# Build utilities
+cc = "1.0"
+
 # Async runtime for audio
 futures = "0.3"
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 
 # Ring buffer for audio buffering
 ringbuf = "0.3"
-
-[build-dependencies]
-cc = "1.0"
 
 [[bin]]
 name = "pocket-modem"

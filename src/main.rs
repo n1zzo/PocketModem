@@ -6,21 +6,30 @@ mod audio;
 mod gps;
 mod kiss;
 mod radio;
+mod settings;
 
-use audio::{AudioConfig, AudioManager, ADPCMEncoder, ADPCMDecoder};
+use audio::{AudioConfig, AudioManager};
 use gps::GpsManager;
+use settings::SettingsManager;
 
 use radio::{KV4PRadio, SerialConfig};
-use kiss::{build_kv4p_packet, HostCommand};
 
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use libadwaita::prelude::*;
 use libadwaita as adw;
 
+/// GSettings application ID (matches schema path)
+const APP_ID: &str = "org.pocketmodem.pocket-modem";
+
 fn main() {
+    // Initialize settings (GSettings-backed)
+    let settings = SettingsManager::new();
+    eprintln!("[pocket-modem] Settings loaded: freq={} kHz, squelch={}", 
+              settings.frequency(),
+              settings.squelch());
+    
     let serial_device = std::env::var("POCKET_MODEM_DEVICE").ok().unwrap_or_else(|| {
         // Auto-detect if no env var set
         if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
@@ -43,30 +52,7 @@ fn main() {
         port: serial_device.clone(),
         baudrate: 115200,
         timeout_ms: 500,
-    })));    let serial_device = std::env::var("POCKET_MODEM_DEVICE").ok().unwrap_or_else(|| {
-        // Auto-detect if no env var set
-        if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.path().to_str() {
-                    if name.contains("10c4") || name.contains("CP2102") || name.contains("Silicon_Labs") {
-                        eprintln!("[pocket-modem] Found device: {}", name);
-                        return name.to_string();
-                    }
-                }
-            }
-        }
-        "/dev/ttyUSB0".to_string()
-    });
-
-    eprintln!("[pocket-modem] Using: {}", serial_device);
-
-    // Create radio - I/O thread handles serial internally
-    let radio = Arc::new(Mutex::new(KV4PRadio::new(SerialConfig {
-        port: serial_device.clone(),
-        baudrate: 115200,
-        timeout_ms: 500,
     })));
-    
     let radio_clone = Arc::clone(&radio);
 
     // Create GPS manager
@@ -76,15 +62,6 @@ fn main() {
         let gps = gps_manager.lock().unwrap();
         gps.start();
     }
-
-    // Create audio manager with KV4P settings
-    // Create radio - I/O thread handles serial internally
-    let radio = Arc::new(Mutex::new(KV4PRadio::new(SerialConfig {
-        port: serial_device.clone(),
-        baudrate: 115200,
-        timeout_ms: 500,
-    })));
-    let radio_clone = Arc::clone(&radio);
 
     // Create audio manager with KV4P settings
     let audio_config = AudioConfig {
@@ -108,16 +85,8 @@ fn main() {
         });
     }
 
-    // Create GPS manager
-    let gps_manager = Arc::new(Mutex::new(GpsManager::new()));
-    {
-        let _ = GpsManager::enable_gps_location();
-        let gps = gps_manager.lock().unwrap();
-        gps.start();
-    }
-
     let app = adw::Application::builder()
-        .application_id("org.pocketmodem.gtk")
+        .application_id(APP_ID)
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     
@@ -129,7 +98,7 @@ fn main() {
     let audio_activate = Arc::clone(&audio_manager);
     
     app.connect_activate(move |app| {
-        create_ui(app, &radio_clone, &audio_activate, &gps_manager_activate);
+        create_ui(app, &radio_clone, &audio_activate, &gps_manager_activate, &settings);
     });
 
     // Close radio, audio and GPS on shutdown
@@ -160,6 +129,7 @@ fn create_ui(
     radio: &Arc<Mutex<KV4PRadio>>,
     audio: &Arc<Mutex<AudioManager>>,
     gps: &Arc<Mutex<GpsManager>>,
+    settings: &SettingsManager,
 ) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -167,18 +137,20 @@ fn create_ui(
         .default_height(720)
         .title("PocketModem")
         .build();
-    window.set_size_request(320, -1);  // Constrain width to 320
+    window.set_size_request(320, -1);
     
-    // Show window immediately so UI appears while connecting
     window.show();
     
-    // Async connection: spawn thread after UI is visible
-    // This ensures UI is responsive while connecting
-    let radio_async = Arc::clone(&radio);
+    // Apply saved frequency from settings on startup
+    let saved_freq = settings.frequency();
+    let saved_squelch = settings.squelch();
+    eprintln!("[pocket-modem] Restoring: freq={} kHz, squelch={}", saved_freq, saved_squelch);
+    
+    // Async connection
+    let radio_async = Arc::clone(radio);
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(200));  // Wait for UI to render
+        std::thread::sleep(std::time::Duration::from_millis(200));
         
-        // Open the connection with lock
         let connected = {
             if let Ok(r) = radio_async.lock() {
                 match r.open() {
@@ -197,18 +169,16 @@ fn create_ui(
             } else { false }
         };
         
-        // If connected, tune and open audio
         if connected {
             if let Ok(r) = radio_async.lock() {
-                let state = r.state();
-                let freq = state.frequency;
-                let _ = r.tune_freq(freq, freq);
+                let _ = r.tune_freq(saved_freq, saved_freq);
+                let _ = r.set_squelch(saved_squelch);
                 let _ = r.open_audio();
             }
         }
     });
     
-    // Register radio callbacks (invoked from I/O thread)
+    // Register radio callbacks
     {
         let r = radio.lock().unwrap();
         let audio_cb = Arc::clone(audio);
@@ -237,12 +207,12 @@ fn create_ui(
         });
     }
     
-    // Main content box using HeaderBar for title area
+    // Main content box using HeaderBar
     let header_bar = adw::HeaderBar::builder()
         .title_widget(&adw::WindowTitle::new("PocketModem", ""))
         .build();
     
-    // Settings button - toggles view
+    // Settings button
     let settings_btn = gtk4::ToggleButton::new();
     settings_btn.set_icon_name("emblem-system-symbolic");
     settings_btn.add_css_class("flat");
@@ -256,6 +226,9 @@ fn create_ui(
     settings_view.set_margin_bottom(24);
     settings_view.set_visible(false);
     
+    // === SETTINGS PANEL (operates on main thread) ===
+    let settings_clone = settings as *const SettingsManager as *mut SettingsManager;
+    
     // Squelch section
     let squelch_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     let squelch_title = gtk4::Label::new(Some("<b>Squelch</b>"));
@@ -266,36 +239,37 @@ fn create_ui(
     let squelch_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
     squelch_row.set_valign(gtk4::Align::Center);
     
-    // Slider: left = strict (8), right = permissive (0)
-    // This matches user intuition: right = loose/relaxed, left = tight/restrictive
     let squelch_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 8.0, 1.0);
-    squelch_scale.set_value(4.0);  // Default 4
-    squelch_scale.set_inverted(true);  // Invert visual direction only
+    squelch_scale.set_value(saved_squelch as f64);
+    squelch_scale.set_inverted(true);
     squelch_scale.set_hexpand(true);
     squelch_scale.set_draw_value(false);
     squelch_scale.set_has_origin(true);
     
-    let squelch_value_label = gtk4::Label::new(Some("4"));
+    let squelch_value_label = gtk4::Label::new(Some(&saved_squelch.to_string()));
     squelch_value_label.set_width_request(24);
     squelch_value_label.set_halign(gtk4::Align::Start);
     squelch_value_label.add_css_class("squelch-value");
     
-    // Squelch callback with debouncing
-    // Commands sent via lock-free channel - no blocking UI thread
+    // Squelch callback - settings on main thread, radio on spawned thread
     let radio_squelch = Arc::clone(radio);
     let label_for_closure = squelch_value_label.clone();
-    let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(saved_squelch));
     
     squelch_scale.connect_value_changed(move |scale| {
         let level = scale.value().round() as u8;
         label_for_closure.set_text(&format!("{}", level));
         
-        // Commands sent via lock-free channel - no blocking
         if level != last_sent.load(std::sync::atomic::Ordering::SeqCst) {
+            // Settings on main thread (via unsafe pointer - OK because we're on main thread)
+            unsafe {
+                (*settings_clone).set_squelch(level);
+            }
+            
+            // Radio on spawned thread
             let radio_clone = radio_squelch.clone();
             let sent = Arc::clone(&last_sent);
             std::thread::spawn(move || {
-                // Commands sent via channel
                 if let Ok(r) = radio_clone.lock() {
                     let _ = r.set_squelch(level);
                 }
@@ -324,8 +298,13 @@ fn create_ui(
     pre_emph_label.set_halign(gtk4::Align::Start);
     let pre_emph_switch = gtk4::Switch::new();
     pre_emph_switch.set_valign(gtk4::Align::Center);
+    pre_emph_switch.set_active(false);
+    
     let radio_pre_emph = Arc::clone(radio);
     pre_emph_switch.connect_state_set(move |_sw, state| {
+        // Settings on main thread
+        unsafe { (*settings_clone).set_pre_emphasis(state); }
+        // Radio on spawned thread
         let radio_clone = radio_pre_emph.clone();
         std::thread::spawn(move || {
             if let Ok(r) = radio_clone.lock() {
@@ -346,8 +325,11 @@ fn create_ui(
     de_emph_label.set_halign(gtk4::Align::Start);
     let de_emph_switch = gtk4::Switch::new();
     de_emph_switch.set_valign(gtk4::Align::Center);
+    de_emph_switch.set_active(false);
+    
     let radio_de_emph = Arc::clone(radio);
     de_emph_switch.connect_state_set(move |_sw, state| {
+        unsafe { (*settings_clone).set_de_emphasis(state); }
         let radio_clone = radio_de_emph.clone();
         std::thread::spawn(move || {
             if let Ok(r) = radio_clone.lock() {
@@ -368,8 +350,11 @@ fn create_ui(
     hp_label.set_halign(gtk4::Align::Start);
     let hp_switch = gtk4::Switch::new();
     hp_switch.set_valign(gtk4::Align::Center);
+    hp_switch.set_active(true);
+    
     let radio_hp = Arc::clone(radio);
     hp_switch.connect_state_set(move |_sw, state| {
+        unsafe { (*settings_clone).set_high_pass_filter(state); }
         let radio_clone = radio_hp.clone();
         std::thread::spawn(move || {
             if let Ok(r) = radio_clone.lock() {
@@ -390,8 +375,11 @@ fn create_ui(
     lp_label.set_halign(gtk4::Align::Start);
     let lp_switch = gtk4::Switch::new();
     lp_switch.set_valign(gtk4::Align::Center);
+    lp_switch.set_active(true);
+    
     let radio_lp = Arc::clone(radio);
     lp_switch.connect_state_set(move |_sw, state| {
+        unsafe { (*settings_clone).set_low_pass_filter(state); }
         let radio_clone = radio_lp.clone();
         std::thread::spawn(move || {
             if let Ok(r) = radio_clone.lock() {
@@ -421,8 +409,10 @@ fn create_ui(
     let tx_power_switch = gtk4::Switch::new();
     tx_power_switch.set_active(false);
     tx_power_switch.set_valign(gtk4::Align::Center);
+    
     let radio_tx_power = Arc::clone(radio);
     tx_power_switch.connect_state_set(move |_sw, state| {
+        unsafe { (*settings_clone).set_tx_power_high(state); }
         let radio_clone = radio_tx_power.clone();
         std::thread::spawn(move || {
             if let Ok(r) = radio_clone.lock() {
@@ -446,28 +436,168 @@ fn create_ui(
     let mic_dropdown = gtk4::DropDown::from_strings(&[
         "None", "Low", "Med", "High",
     ]);
+    
     let radio_mic = Arc::clone(radio);
-    mic_dropdown.connect_selected_notify(glib::clone!(@weak mic_dropdown => move |dd| {
+    mic_dropdown.connect_selected_notify(move |dd| {
         let idx = dd.selected();
         let level = match idx {
-            0 => "None",
-            1 => "Low", 
-            2 => "Med",
-            _ => "High",
+            0 => "none",
+            1 => "low", 
+            2 => "med",
+            _ => "high",
         };
+        unsafe { (*settings_clone).set_mic_gain(level); }
         let radio_clone = radio_mic.clone();
         std::thread::spawn(move || {
             if let Ok(r) = radio_clone.lock() {
                 let _ = r.set_mic_gain(level);
             }
         });
-    }));
+    });
     mic_section.append(&mic_dropdown);
     settings_view.append(&mic_section);
     
-    // Add back button
+    // Channels section
+    let channels_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let channels_title = gtk4::Label::new(Some("<b>Channels</b>"));
+    channels_title.set_markup("<b>Channels</b>");
+    channels_title.set_halign(gtk4::Align::Start);
+    channels_section.append(&channels_title);
+    
+    // Import CSV row using libadwaita ActionRow
+    let import_row = adw::ActionRow::new();
+    import_row.set_title("Import from CSV");
+    import_row.set_subtitle("Import channels from CHIRP CSV file");
+    
+    let import_icon = gtk4::Image::from_icon_name("document-open-symbolic");
+    let import_btn = gtk4::Button::new();
+    import_btn.set_child(Some(&import_icon));
+    import_btn.add_css_class("flat");
+    import_row.set_activatable_widget(Some(&import_btn));
+    import_row.add_suffix(&import_btn);
+    
+    // Export CSV row using libadwaita ActionRow
+    let export_row = adw::ActionRow::new();
+    export_row.set_title("Export to CSV");
+    export_row.set_subtitle("Export channels to CHIRP CSV file");
+    
+    let export_icon = gtk4::Image::from_icon_name("document-save-as-symbolic");
+    let export_btn = gtk4::Button::new();
+    export_btn.set_child(Some(&export_icon));
+    export_btn.add_css_class("flat");
+    export_row.set_activatable_widget(Some(&export_btn));
+    export_row.add_suffix(&export_btn);
+    
+    // Import CSV - opens file chooser dialog
+    let settings_for_import = settings_clone;
+    import_btn.connect_clicked(move |_| {
+        // We can't use @weak window here since we're capturing it in the inner closure
+        // So we capture it in the outer closure instead
+        let dialog = gtk4::FileChooserDialog::new(
+            Some("Import Channels from CSV"),
+            None::<&gtk4::Window>,
+            gtk4::FileChooserAction::Open,
+            &[
+                ("Cancel", gtk4::ResponseType::Cancel),
+                ("Import", gtk4::ResponseType::Accept),
+            ],
+        );
+        
+        // Add CSV file filter
+        let filter = gtk4::FileFilter::new();
+        filter.set_name(Some("CSV Files"));
+        filter.add_pattern("*.csv");
+        filter.add_mime_type("text/csv");
+        dialog.add_filter(&filter);
+        
+        // Connect response handler
+        let settings = settings_for_import;
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk4::ResponseType::Accept {
+                if let Some(file) = dialog.file() {
+                    if let Some(path) = file.path() {
+                        eprintln!("[pocket-modem] Importing channels from: {:?}", path);
+                        let result = unsafe { (*settings).import_csv(&path) };
+                        match result {
+                            Ok(channels) => eprintln!("[pocket-modem] Imported {} channels", channels.len()),
+                            Err(e) => eprintln!("[pocket-modem] Import failed: {}", e),
+                        }
+                    }
+                }
+            }
+            dialog.close();
+        });
+        
+        dialog.show();
+    });
+    
+    // Export CSV - opens save file chooser dialog
+    let settings_for_export = settings_clone;
+    export_btn.connect_clicked(move |_| {
+        let dialog = gtk4::FileChooserDialog::new(
+            Some("Export Channels to CSV"),
+            None::<&gtk4::Window>,
+            gtk4::FileChooserAction::Save,
+            &[
+                ("Cancel", gtk4::ResponseType::Cancel),
+                ("Export", gtk4::ResponseType::Accept),
+            ],
+        );
+        
+        // Add CSV file filter
+        let filter = gtk4::FileFilter::new();
+        filter.set_name(Some("CSV Files"));
+        filter.add_pattern("*.csv");
+        filter.add_mime_type("text/csv");
+        dialog.add_filter(&filter);
+        
+        // Set default filename
+        dialog.set_current_name("pocket-modem-channels.csv");
+        
+        // Connect response handler
+        let settings = settings_for_export;
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk4::ResponseType::Accept {
+                if let Some(file) = dialog.file() {
+                    if let Some(path) = file.path() {
+                        eprintln!("[pocket-modem] Exporting channels to: {:?}", path);
+                        let result = unsafe { (*settings).export_csv(&path) };
+                        match result {
+                            Ok(_) => eprintln!("[pocket-modem] Exported channels successfully"),
+                            Err(e) => eprintln!("[pocket-modem] Export failed: {}", e),
+                        }
+                    }
+                }
+            }
+            dialog.close();
+        });
+        
+        dialog.show();
+    });
+    
+    channels_section.append(&import_row);
+    channels_section.append(&export_row);
+    
+    settings_view.append(&channels_section);
+    
+    // Reset to Defaults button
+    let reset_btn = gtk4::Button::with_label("Reset to Defaults");
+    reset_btn.add_css_class("destructive-action");
+    reset_btn.set_margin_top(24);
+    
+    reset_btn.connect_clicked(move |_| {
+        unsafe {
+            (*settings_clone).reset_to_defaults();
+        }
+        squelch_scale.set_value(4.0);
+        squelch_value_label.set_text("4");
+        eprintln!("[pocket-modem] Settings reset to defaults");
+    });
+    settings_view.append(&reset_btn);
+    
+    // Back button
     let back_btn = gtk4::Button::with_label("Back");
-    back_btn.set_margin_top(24);
+    back_btn.set_margin_top(16);
     back_btn.connect_clicked(glib::clone!(@weak settings_btn => move |_| {
         settings_btn.set_active(false);
     }));
@@ -475,13 +605,12 @@ fn create_ui(
     
     header_bar.pack_end(&settings_btn);
     
-    // Status row using a horizontal Box with labels
+    // Status row
     let status_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 32);
     status_row.set_halign(gtk4::Align::Center);
     status_row.set_margin_top(16);
     status_row.set_margin_bottom(16);
     
-    // Modem status indicator (starts disconnected, updated by UI timer)
     let modem_label = gtk4::Label::new(Some("○"));
     modem_label.add_css_class("status-icon-red");
     let modem_status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
@@ -494,7 +623,6 @@ fn create_ui(
     modem_status_box.append(&modem_label);
     modem_status_box.append(&modem_status_label);
     
-    // GPS icon and status LED
     let gps_icon = gtk4::Image::from_icon_name("location-services-active-symbolic");
     gps_icon.set_pixel_size(28);
     let gps_led = gtk4::Label::new(Some("○"));
@@ -511,12 +639,10 @@ fn create_ui(
     status_row.append(&modem_status_box);
     status_row.append(&gps_status_box);
 
-    // GPS location display (below status row)
     let gps_location_label = gtk4::Label::new(Some("Searching..."));
     gps_location_label.add_css_class("gps-location");
     gps_location_label.set_margin_top(4);
 
-    // Audio status indicator
     let audio_label = gtk4::Label::new(Some("○"));
     audio_label.add_css_class("status-icon-gray");
     let audio_status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
@@ -530,12 +656,11 @@ fn create_ui(
     audio_status_box.append(&audio_status_label);
     status_row.append(&audio_status_box);
     
-    // RSSI / S-meter - below VFO (starts at 0, updated by UI timer)
+    // RSSI / S-meter
     let rssi_sbar = gtk4::ProgressBar::new();
     rssi_sbar.set_fraction(0.0);
     rssi_sbar.add_css_class("rssi-bar");
     
-    // S-meter: bar and dBm value side by side
     let smeter_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
     smeter_box.set_halign(gtk4::Align::Center);
     smeter_box.set_margin_start(24);
@@ -543,16 +668,13 @@ fn create_ui(
     smeter_box.set_valign(gtk4::Align::Center);
     smeter_box.set_size_request(-1, 20);
     
-    // SIGNAL label on left
     let signal_label = gtk4::Label::new(Some("SIGNAL"));
     signal_label.add_css_class("signal-text");
     signal_label.set_valign(gtk4::Align::Center);
     
-    // Bar in center, takes remaining space
     rssi_sbar.set_hexpand(true);
     rssi_sbar.set_valign(gtk4::Align::Center);
     
-    // dBm value on right (starts "-- dBm", updated by UI timer)
     let signal_value = gtk4::Label::new(None);
     signal_value.add_css_class("signal-value");
     signal_value.set_markup(&format!("<span color='#FFB000'>{}</span>", "-- dBm"));
@@ -563,10 +685,10 @@ fn create_ui(
     smeter_box.append(&rssi_sbar);
     smeter_box.append(&signal_value);
     
-    // VFO frequency display - using Entry for interaction
+    // VFO frequency display
     let freq_entry = gtk4::Entry::new();
-    freq_entry.set_text("144.200");
-    gtk4::prelude::EditableExt::set_alignment(&freq_entry, 0.5);
+    freq_entry.set_text(&format!("{}.{:03}", saved_freq / 1000, saved_freq % 1000));
+    gtk4::prelude::EntryExt::set_alignment(&freq_entry, 0.5);
     freq_entry.add_css_class("freq-display");
     freq_entry.set_size_request(260, 100);
     freq_entry.set_margin_start(16);
@@ -575,35 +697,36 @@ fn create_ui(
     freq_entry.set_margin_bottom(20);
     freq_entry.set_editable(true);
     freq_entry.set_can_focus(true);
-    // Clear selection by default (select region -1,-1 deselects)
     freq_entry.select_region(-1, -1);
     
     let radio_freq = Arc::clone(&radio);
+    let settings_for_freq = settings_clone;
     freq_entry.connect_activate(move |entry| {
         let text = entry.text().to_string();
         
-        // Parse frequency - user enters "145.500" or "144.8" (MHz with optional decimal)
         if let Ok(freq_mhz) = text.parse::<f64>() {
             let khz = (freq_mhz * 1000.0) as u32;
             let radio = Arc::clone(&radio_freq);
             
-            // Spawn thread for serial operation, command sent via channel
+            // Save frequency to GSettings immediately
+            unsafe { (*settings_for_freq).set_frequency(khz); }
+            eprintln!("[pocket-modem] Saving freq to GSettings: {} kHz", khz);
+            
             std::thread::spawn(move || {
                 if let Ok(r) = radio.lock() {
                     if r.set_frequency(khz).is_ok() {
-                        eprintln!("[pocket-modem] Frequency set to {} kHz", khz);
+                        eprintln!("[pocket-modem] Frequency tuned to {} kHz", khz);
                     }
                 }
             });
             
-            // Update display immediately with expected format
             entry.set_text(&format!("{}.{:03}", khz / 1000, khz % 1000));
         } else {
             eprintln!("[pocket-modem] Invalid frequency: {}", text);
         }
     });
     
-    // Mode buttons using gtk4::ToggleButtons in a Box
+    // Mode buttons
     let mode_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
     mode_box.set_homogeneous(true);
     mode_box.set_margin_start(16);
@@ -613,7 +736,7 @@ fn create_ui(
     
     let btn_fm = gtk4::ToggleButton::with_label("FM");
     btn_fm.add_css_class("mode-btn");
-    btn_fm.add_css_class("mode-btn-active");  // FM is default active
+    btn_fm.add_css_class("mode-btn-active");
     
     let btn_rade = gtk4::ToggleButton::with_label("RADE");
     btn_rade.add_css_class("mode-btn");
@@ -628,24 +751,22 @@ fn create_ui(
     mode_box.append(&btn_rade);
     mode_box.append(&btn_m17);
     
-    // Channel list using PreferencesGroup with ActionRows
+    // Channel list
     let channel_group = adw::PreferencesGroup::builder()
         .title("Channels")
         .build();
     
-    // Add empty state message as a disabled row
     let no_channels_row = adw::ActionRow::builder()
         .title("No channels configured")
         .build();
     no_channels_row.set_sensitive(false);
     channel_group.add(&no_channels_row);
     
-    // PTT Button using SplitButton for modern look (without dropdown)
+    // PTT Button
     let ptt_btn = gtk4::Button::new();
     ptt_btn.add_css_class("ptt-button");
     ptt_btn.set_valign(gtk4::Align::Center);
     
-    // PTT box with circle and label underneath
     let ptt_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     ptt_box.set_halign(gtk4::Align::Center);
     ptt_box.set_valign(gtk4::Align::Center);
@@ -671,7 +792,7 @@ fn create_ui(
     ptt_btn.set_margin_bottom(20);
     ptt_btn.set_valign(gtk4::Align::End);
     
-    // PTT using GestureClick for proper press/release detection
+    // PTT using GestureClick
     let radio_pressed = Arc::clone(radio);
     let audio_pressed = Arc::clone(audio);
     let radio_released = Arc::clone(radio);
@@ -679,7 +800,7 @@ fn create_ui(
     
     let gesture = gtk4::GestureClick::new();
     gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    gesture.set_button(0); // 0 = any button
+    gesture.set_button(0);
     
     gesture.connect_pressed(glib::clone!(
         @strong radio_pressed, 
@@ -711,13 +832,13 @@ fn create_ui(
     
     ptt_btn.add_controller(gesture);
     
-    // Main content area with Clamp for responsive width
+    // Main content area
     let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content_box.set_halign(gtk4::Align::Center);
     content_box.set_hexpand(false);
     content_box.set_size_request(320, -1);
     
-    // Connect toggle button to switch views (after content_box exists)
+    // Connect toggle button to switch views
     let settings_view_clone = settings_view.clone();
     let content_box_clone = content_box.clone();
     settings_btn.connect_toggled(move |btn| {
@@ -730,28 +851,17 @@ fn create_ui(
         }
     });
     
-    // Status row at top
     content_box.append(&status_row);
-    
-    // Frequency display and signal
     content_box.append(&freq_entry);
     content_box.append(&smeter_box);
-    
-    // Mode buttons
     content_box.append(&mode_box);
-    
-    // Channel list
     content_box.append(channel_group.as_ref() as &gtk4::Widget);
     
-    // Spacer to push PTT to bottom
     let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     spacer.set_vexpand(true);
     content_box.append(&spacer);
-    
-    // PTT at bottom
     content_box.append(&ptt_btn);
     
-    // Main layout box
     let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     main_box.append(&header_bar);
     main_box.append(&content_box);
@@ -765,21 +875,15 @@ fn create_ui(
     let audio_clone = Arc::clone(audio);
     let audio_label_clone = audio_label.clone();
     let gps_clone = Arc::clone(gps);
-
     let gps_led_clone = gps_led.clone();
-
     let gps_location_clone = gps_location_label.clone();
-
     let ptt_label_update = ptt_label.clone();
+    let settings_channels = settings as *const SettingsManager as *mut SettingsManager;
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        // Get radio state for UI updates
-        // NOTE: Using lock() (blocking) NOT try_lock() - if we skip updates when lock is
-        // unavailable, RSSI display freezes during squelch/filter changes that hold the lock.
         if let Ok(r) = radio_update.lock() {
             let state = r.state();
             
-            // Update based on having received RSSI (raw_rssi > 0 means packets arriving)
             if state.connected && state.raw_rssi > 0 {
                 modem_label_clone.set_text("●");
                 modem_label_clone.remove_css_class("status-icon-red");
@@ -794,17 +898,11 @@ fn create_ui(
                 modem_label_clone.add_css_class("status-icon-red");
             }
             
-            // Calculate dBm using Android's formula
-            // DBM = rssi * 1.2 - 160.8
-            // Matches what Android app uses
             let dbm = (state.raw_rssi as f64) * 1.2 - 160.8;
             
-            // Update dBm display and bar
             if state.connected && state.raw_rssi > 0 {
                 let dbm_text = format!("{} dBm", dbm as i32);
                 signal_value_clone.set_markup(&format!("<span color='#FFB000'>{}</span>", dbm_text));
-                
-                // Bar: -120 dBm = 0%, -30 dBm = 100%
                 let frac = ((dbm + 120.0) / 90.0).clamp(0.0, 1.0);
                 rssi_sbar_clone.set_fraction(frac);
             } else {
@@ -813,14 +911,13 @@ fn create_ui(
             }
         }
         
-        // Update audio status indicator based on radio's squelch state and audio thread status
+        // Update audio status
         {
             let a = audio_clone.lock().unwrap();
             let audio_started = a.audio_started();
             let has_error = a.has_decode_error();
             drop(a);
             
-            // Get squelch state from radio
             let squelch_open = if let Ok(r) = radio_update.lock() {
                 r.state().squelch_open
             } else {
@@ -828,27 +925,23 @@ fn create_ui(
             };
             
             if has_error {
-                // Red empty dot: error with audio decoding
                 audio_label_clone.set_text("○");
                 audio_label_clone.remove_css_class("status-icon-green");
                 audio_label_clone.remove_css_class("status-icon-gray-filled");
                 audio_label_clone.add_css_class("status-icon-red");
             } else if !audio_started {
-                // Grey empty dot: audio thread not started
                 audio_label_clone.set_text("○");
                 audio_label_clone.remove_css_class("status-icon-green");
                 audio_label_clone.remove_css_class("status-icon-red");
                 audio_label_clone.remove_css_class("status-icon-gray-filled");
                 audio_label_clone.add_css_class("status-icon-gray-empty");
             } else if squelch_open {
-                // Green full dot: audio coming through (squelch open)
                 audio_label_clone.set_text("●");
                 audio_label_clone.remove_css_class("status-icon-gray-empty");
                 audio_label_clone.remove_css_class("status-icon-gray-filled");
                 audio_label_clone.remove_css_class("status-icon-red");
                 audio_label_clone.add_css_class("status-icon-green");
             } else {
-                // Grey full dot: audio thread started but squelch closed
                 audio_label_clone.set_text("●");
                 audio_label_clone.remove_css_class("status-icon-green");
                 audio_label_clone.remove_css_class("status-icon-red");
@@ -857,7 +950,7 @@ fn create_ui(
             }
         }
 
-        // Update GPS status indicator
+        // Update GPS status
         if let Ok(g) = gps_clone.lock() {
             let gps_data = g.get_data();
             if gps_data.has_fix {
@@ -865,7 +958,6 @@ fn create_ui(
                 gps_led_clone.remove_css_class("gps-led-off");
                 gps_led_clone.add_css_class("gps-led-on");
 
-                // Update location display
                 if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
                     let location = format!("{:.6}, {:.6}", lat, lon);
                     gps_location_clone.set_text(&location);
@@ -882,12 +974,19 @@ fn create_ui(
             }
         }
         
+        // Channel count is shown in settings via ActionRow subtitles
+        // This timer can be used for other periodic updates if needed
+        unsafe {
+            let _count = (*settings_channels).channels().len();
+            // Channel count is displayed in the ActionRow subtitles dynamically
+        }
+        
         ptt_label_update.set_text("PTT");
         
         glib::ControlFlow::Continue
     });
     
-    // CSS - preserved styling from original
+    // CSS styling
     let css_provider = gtk4::CssProvider::new();
     css_provider.load_from_data(r#"
         .freq-display {
@@ -923,146 +1022,34 @@ fn create_ui(
             color: #33D17A;
             box-shadow: 0 0 8px rgba(51, 209, 122, 0.3);
         }
-        .status-icon-green {
-            font-size: 16px;
-            color: #33D17A;
-        }
-        .status-icon-red {
-            font-size: 16px;
-            color: #ff4444;
-        }
-        .status-text {
-            font-size: 13px;
-            color: #FFB000;
-            font-weight: bold;
-        }
-        .s-meter-header {
-            font-size: 12px;
-            color: #888;
-        }
-        .s-level {
-            font-size: 18px;
-            min-width: 40px;
-        }
-        .modem-label {
-            color: #666;
-            font-size: 13px;
-        }
-        .gps-label {
-            color: #666;
-            font-size: 13px;
-        }
-        .audio-label {
-            color: #666;
-            font-size: 13px;
-        }
-        .audio-status-box {
-            color: @theme_fg_color;
-        }
-        .gps-status-box {
-            color: @theme_fg_color;
-        }
-        .location-services-active-symbolic {
-            color: inherit;
-        }
-        .gps-led-on {
-            color: #33D17A;
-            font-size: 16px;
-        }
-        .gps-led-off {
-            color: #666;
-            font-size: 16px;
-        }
-
-        .gps-location {
-            font-size: 11px;
-            font-family: monospace;
-            color: #888;
-        }
-        .gps-searching {
-            color: #666;
-            font-style: italic;
-        }
-        .gps-fixed {
-            color: #33D17A;
-        }
-        .status-icon-gray-empty {
-            font-size: 16px;
-            color: #666;
-        }
-        .status-icon-gray-filled {
-            font-size: 16px;
-            color: #888;
-        }
-
-        .squelch-label {
-            font-size: 12px;
-            color: #888;
-            font-weight: bold;
-        }
-        .signal-text {
-            font-size: 12px;
-            color: #666;
-            font-weight: bold;
-        }
-        .signal-value {
-            font-size: 12px;
-            font-weight: bold;
-        }
-        .rssi-bar {
-            background: #2a2a2a;
-            border: 1px solid #444;
-            border-radius: 6px;
-        }
-        .rssi-bar > trough {
-            background: #2a2a2a;
-            border-radius: 6px;
-        }
-        .rssi-bar > trough > progress {
-            background: #FFB000;
-            border-radius: 5px;
-        }
-        .ptt-button {
-            min-width: 100px;
-            min-height: 110px;
-            border-radius: 16px;
-            background: #333;
-            border: 2px solid #555;
-        }
-        .ptt-button:hover {
-            background: #3a3a3a;
-            border-color: #666;
-        }
-        .ptt-button:active {
-            background: #444;
-            border-color: #FFB000;
-        }
-        .ptt-icon {
-            color: #888;
-        }
-        .ptt-icon-idle {
-            color: #33D17A;
-        }
-        .ptt-recording {
-            color: #ff4444;
-        }
-        .ptt-button:hover .ptt-icon {
-            color: #aaa;
-        }
-        .ptt-button:active .ptt-icon {
-            color: #FFB000;
-        }
-        .ptt-label {
-            font-size: 12px;
-            font-weight: bold;
-            color: #888;
-        }
-        .ptt-button:hover .ptt-label {
-            color: #aaa;
-        }
-        .ptt-button:active .ptt-label {
-            color: #FFB000;
-        }
+        .status-icon-green { font-size: 16px; color: #33D17A; }
+        .status-icon-red { font-size: 16px; color: #ff4444; }
+        .status-text { font-size: 13px; color: #FFB000; font-weight: bold; }
+        .modem-label { color: #666; font-size: 13px; }
+        .gps-label { color: #666; font-size: 13px; }
+        .audio-label { color: #666; font-size: 13px; }
+        .gps-led-on { color: #33D17A; font-size: 16px; }
+        .gps-led-off { color: #666; font-size: 16px; }
+        .gps-location { font-size: 11px; font-family: monospace; color: #888; }
+        .gps-searching { color: #666; font-style: italic; }
+        .gps-fixed { color: #33D17A; }
+        .status-icon-gray-empty { font-size: 16px; color: #666; }
+        .status-icon-gray-filled { font-size: 16px; color: #888; }
+        .signal-text { font-size: 12px; color: #666; font-weight: bold; }
+        .signal-value { font-size: 12px; font-weight: bold; }
+        .rssi-bar { background: #2a2a2a; border: 1px solid #444; border-radius: 6px; }
+        .rssi-bar > trough { background: #2a2a2a; border-radius: 6px; }
+        .rssi-bar > trough > progress { background: #FFB000; border-radius: 5px; }
+        .ptt-button { min-width: 100px; min-height: 110px; border-radius: 16px; background: #333; border: 2px solid #555; }
+        .ptt-button:hover { background: #3a3a3a; border-color: #666; }
+        .ptt-button:active { background: #444; border-color: #FFB000; }
+        .ptt-icon { color: #888; }
+        .ptt-button:hover .ptt-icon { color: #aaa; }
+        .ptt-button:active .ptt-icon { color: #FFB000; }
+        .ptt-label { font-size: 12px; font-weight: bold; color: #888; }
+        .ptt-button:hover .ptt-label { color: #aaa; }
+        .ptt-button:active .ptt-label { color: #FFB000; }
+        .dim-label { font-size: 12px; color: #666; }
     "#);
     
     gtk4::style_context_add_provider_for_display(
@@ -1071,7 +1058,6 @@ fn create_ui(
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION
     );
     
-    // Set main_box as content
     window.set_content(Some(&main_box));
     window.show();
 }

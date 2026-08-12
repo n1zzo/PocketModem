@@ -836,9 +836,6 @@ fn process_packet(
     match pkt.command as u8 {
         x if x == DeviceCommand::DeviceState as u8 => {
             if let Some(dev_state) = DeviceState::from_bytes(&pkt.payload) {
-                // Debug: log echoed squelch
-                eprintln!("[io-thread] DeviceState echo: sq={} flags=0x{:04x} rssi={}", 
-                          dev_state.squelch, dev_state.flags, dev_state.rssi);
                 // Check physical PTT before moving
                 let phys_ptt = dev_state.phys_ptt_down();
                 if phys_ptt != *last_phys_ptt {
