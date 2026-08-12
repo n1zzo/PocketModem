@@ -7,12 +7,14 @@ mod gps;
 mod kiss;
 mod radio;
 
-use audio::{AudioConfig, AudioManager};
+use audio::{AudioConfig, AudioManager, ADPCMEncoder, ADPCMDecoder};
 use gps::GpsManager;
 
 use radio::{KV4PRadio, SerialConfig};
+use kiss::{build_kv4p_packet, HostCommand};
 
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use libadwaita::prelude::*;
@@ -41,37 +43,61 @@ fn main() {
         port: serial_device.clone(),
         baudrate: 115200,
         timeout_ms: 500,
+    })));    let serial_device = std::env::var("POCKET_MODEM_DEVICE").ok().unwrap_or_else(|| {
+        // Auto-detect if no env var set
+        if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.path().to_str() {
+                    if name.contains("10c4") || name.contains("CP2102") || name.contains("Silicon_Labs") {
+                        eprintln!("[pocket-modem] Found device: {}", name);
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+        "/dev/ttyUSB0".to_string()
+    });
+
+    eprintln!("[pocket-modem] Using: {}", serial_device);
+
+    // Create radio - I/O thread handles serial internally
+    let radio = Arc::new(Mutex::new(KV4PRadio::new(SerialConfig {
+        port: serial_device.clone(),
+        baudrate: 115200,
+        timeout_ms: 500,
     })));
-    
-    // Radio will be opened asynchronously after GTK shows - start with disconnected state
-    let _connected = false;
     
     let radio_clone = Arc::clone(&radio);
 
     // Create GPS manager
     let gps_manager = Arc::new(Mutex::new(GpsManager::new()));
     {
-        // Enable GPS location in ModemManager
         let _ = GpsManager::enable_gps_location();
         let gps = gps_manager.lock().unwrap();
         gps.start();
     }
 
     // Create audio manager with KV4P settings
+    // Create radio - I/O thread handles serial internally
+    let radio = Arc::new(Mutex::new(KV4PRadio::new(SerialConfig {
+        port: serial_device.clone(),
+        baudrate: 115200,
+        timeout_ms: 500,
+    })));
+    let radio_clone = Arc::clone(&radio);
+
+    // Create audio manager with KV4P settings
     let audio_config = AudioConfig {
         sample_rate: 16000,
-        tx_gain: 2.0,
+        tx_gain: 1.0,
         rx_gain: 1.0,
-        gate_threshold: 0.001,  // Lower threshold to allow quieter audio through
+        gate_threshold: 0.001,
         pre_emphasis_alpha: 0.0,
         hard_limit: 0.95,
     };
     let audio_manager = Arc::new(Mutex::new(AudioManager::new(audio_config)));
     
-
-    
-    // Connect audio TX to radio (ADPCM frames)
-    // Commands are sent via channel to I/O thread
+    // Connect audio TX to radio TX
     {
         let mut audio = audio_manager.lock().unwrap();
         let radio = Arc::clone(&radio);
@@ -81,29 +107,29 @@ fn main() {
             }
         });
     }
-    
 
-    
+    // Create GPS manager
+    let gps_manager = Arc::new(Mutex::new(GpsManager::new()));
+    {
+        let _ = GpsManager::enable_gps_location();
+        let gps = gps_manager.lock().unwrap();
+        gps.start();
+    }
 
-    
     let app = adw::Application::builder()
         .application_id("org.pocketmodem.gtk")
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     
     // Register empty open handler to prevent GTK from exiting when command line args
-    // are passed - GTK default is to exit on open, we want to ignore those args
-    app.connect_open(|_app, _files, _hint| {
-        // Empty handler - ignore file open requests
-    });
+    app.connect_open(|_app, _files, _hint| {});
     
-    // Clone for shutdown handler before move into activate
     let audio_for_shutdown = Arc::clone(&audio_manager);
     let gps_manager_activate = Arc::clone(&gps_manager);
+    let audio_activate = Arc::clone(&audio_manager);
     
     app.connect_activate(move |app| {
-        // Create UI first (disconnected state)
-        create_ui(app, &radio_clone, &audio_manager, &gps_manager_activate);
+        create_ui(app, &radio_clone, &audio_activate, &gps_manager_activate);
     });
 
     // Close radio, audio and GPS on shutdown
@@ -133,7 +159,7 @@ fn create_ui(
     app: &adw::Application,
     radio: &Arc<Mutex<KV4PRadio>>,
     audio: &Arc<Mutex<AudioManager>>,
-    gps: &Arc<Mutex<GpsManager>>
+    gps: &Arc<Mutex<GpsManager>>,
 ) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -148,7 +174,7 @@ fn create_ui(
     
     // Async connection: spawn thread after UI is visible
     // This ensures UI is responsive while connecting
-    let radio_async = Arc::clone(radio);
+    let radio_async = Arc::clone(&radio);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(200));  // Wait for UI to render
         
@@ -174,7 +200,9 @@ fn create_ui(
         // If connected, tune and open audio
         if connected {
             if let Ok(r) = radio_async.lock() {
-                let _ = r.tune_freq(145500, 145500);
+                let state = r.state();
+                let freq = state.frequency;
+                let _ = r.tune_freq(freq, freq);
                 let _ = r.open_audio();
             }
         }
@@ -391,7 +419,7 @@ fn create_ui(
     tx_power_label.set_hexpand(true);
     tx_power_label.set_halign(gtk4::Align::Start);
     let tx_power_switch = gtk4::Switch::new();
-    tx_power_switch.set_active(true);
+    tx_power_switch.set_active(false);
     tx_power_switch.set_valign(gtk4::Align::Center);
     let radio_tx_power = Arc::clone(radio);
     tx_power_switch.connect_state_set(move |_sw, state| {
@@ -537,7 +565,7 @@ fn create_ui(
     
     // VFO frequency display - using Entry for interaction
     let freq_entry = gtk4::Entry::new();
-    freq_entry.set_text("145.500");
+    freq_entry.set_text("144.200");
     gtk4::prelude::EditableExt::set_alignment(&freq_entry, 0.5);
     freq_entry.add_css_class("freq-display");
     freq_entry.set_size_request(260, 100);
@@ -653,24 +681,32 @@ fn create_ui(
     gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
     gesture.set_button(0); // 0 = any button
     
-    gesture.connect_pressed(glib::clone!(@strong radio_pressed, @strong audio_pressed => move |_gesture, _n_press, _x, _y| {
+    gesture.connect_pressed(glib::clone!(
+        @strong radio_pressed, 
+        @strong audio_pressed,
+        @weak ptt_label,
+        => move |_gesture, _n_press, _x, _y| {
+        ptt_label.set_text("TX");
         if let Ok(r) = radio_pressed.lock() {
             let _ = r.ptt_on();
         }
         if let Ok(mut a) = audio_pressed.lock() {
-            a.stop_playback();
             let _ = a.start_capture();
         }
     }));
     
-    gesture.connect_released(glib::clone!(@strong radio_released, @strong audio_released => move |_gesture, _n_press, _x, _y| {
+    gesture.connect_released(glib::clone!(
+        @strong radio_released, 
+        @strong audio_released,
+        @weak ptt_label,
+        => move |_gesture, _n_press, _x, _y| {
+        if let Ok(mut a) = audio_released.lock() {
+            let _ = a.stop_capture();
+        }
         if let Ok(r) = radio_released.lock() {
             let _ = r.ptt_off();
         }
-        if let Ok(mut a) = audio_released.lock() {
-            a.stop_capture();
-            let _ = a.start_playback();
-        }
+        ptt_label.set_text("PTT");
     }));
     
     ptt_btn.add_controller(gesture);
@@ -733,6 +769,8 @@ fn create_ui(
     let gps_led_clone = gps_led.clone();
 
     let gps_location_clone = gps_location_label.clone();
+
+    let ptt_label_update = ptt_label.clone();
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
         // Get radio state for UI updates
@@ -843,6 +881,8 @@ fn create_ui(
                 gps_location_clone.add_css_class("gps-searching");
             }
         }
+        
+        ptt_label_update.set_text("PTT");
         
         glib::ControlFlow::Continue
     });
@@ -1000,6 +1040,12 @@ fn create_ui(
         .ptt-icon {
             color: #888;
         }
+        .ptt-icon-idle {
+            color: #33D17A;
+        }
+        .ptt-recording {
+            color: #ff4444;
+        }
         .ptt-button:hover .ptt-icon {
             color: #aaa;
         }
@@ -1029,4 +1075,3 @@ fn create_ui(
     window.set_content(Some(&main_box));
     window.show();
 }
-

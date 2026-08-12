@@ -139,9 +139,9 @@ impl Default for RadioSharedState {
     fn default() -> Self {
         Self {
             inner: Mutex::new(RadioStateInner::default()),
-            frequency: AtomicU32::new(145500),
-            tx_frequency: AtomicU32::new(145500),
-            power_high: AtomicBool::new(true),
+            frequency: AtomicU32::new(144200),
+            tx_frequency: AtomicU32::new(144200),
+            power_high: AtomicBool::new(false),
             current_squelch: AtomicU8::new(4),
             squelch_user_set: AtomicBool::new(false),
             firmware_squelch: AtomicU8::new(4),
@@ -384,6 +384,7 @@ impl KV4PRadio {
         let mut state = self.build_desired_state(true);
         // Clear PTT bits - must clear both to stop transmission
         state.flags &= !(HostStateFlags::PTT_REQUESTED.bits() | HostStateFlags::TX_ALLOWED.bits());
+        
         // Use drain+send to clear queued audio frames first, then send PTT off
         // Send multiple times to ensure reliable release
         for _ in 0..5 {
@@ -394,10 +395,16 @@ impl KV4PRadio {
     
     pub fn send_audio(&self, adpcm_data: &[u8]) -> Result<(), String> {
         if !self.running.load(Ordering::SeqCst) {
+            eprintln!("[radio] send_audio: ERROR - radio not running!");
             return Err("Radio not connected".to_string());
         }
+        eprintln!("[radio] send_audio: {} bytes, queueing frame", adpcm_data.len());
         let frame = build_tx_audio_packet(adpcm_data);
-        self.queue_command(RadioCommand::SendFrame(frame))
+        let result = self.queue_command(RadioCommand::SendFrame(frame));
+        if result.is_err() {
+            eprintln!("[radio] send_audio: ERROR queueing frame: {:?}", result);
+        }
+        result
     }
     
     pub fn send_raw_audio(&self, data: &[u8]) -> Result<(), String> {
@@ -534,13 +541,13 @@ fn io_thread_main(
     let mut last_version: Option<VersionInfo> = None;
     
     // Flow control window — decremented on each outgoing frame, incremented by WindowAck
-    let flow_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(2048));
+    // Initialize with large window to handle burst TX without blocking
+    let flow_window: Arc<AtomicU32> = Arc::new(AtomicU32::new(65536));
     let flow_window_ack = Arc::clone(&flow_window);
     
     // Track whether we're connected (to enable window ack)
     let connected = Arc::new(AtomicBool::new(false));
-    let connected_for_parse = Arc::clone(&connected);
-    let connected_for_writing = Arc::clone(&connected);
+    let _connected_for_parse = Arc::clone(&connected);
     
     loop {
         // Check for commands with SHORT timeout — don't block serial reads
@@ -573,6 +580,7 @@ fn io_thread_main(
                                                 
                                                 // Mark radio as running (connected)
                                                 running.store(true, Ordering::SeqCst);
+                                                connected.store(true, Ordering::SeqCst);  // Enable flow control ack
                                                 
                                                 // Call connect callback
                                                 if let Some(ref cb) = callbacks.lock().unwrap().connect {
@@ -614,6 +622,7 @@ fn io_thread_main(
                                                     state.inner.lock().unwrap().version = Some(version);
                                                     // Mark radio as running (connected)
                                                     running.store(true, Ordering::SeqCst);
+                                                    connected.store(true, Ordering::SeqCst);  // Enable flow control ack
                                                     if let Some(ref cb) = callbacks.lock().unwrap().connect {
                                                         cb(true);
                                                     }
@@ -637,14 +646,8 @@ fn io_thread_main(
                         let payload = desired_state.to_bytes();
                         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
                         let frame_len = frame.len() as u32;
-                        // Debug: log squelch value being sent with hex payload dump
-                        let payload_hex: Vec<String> = payload.iter().map(|b| format!("{:02x}", b)).collect();
-                        eprintln!("[io-thread] SendState: sq={} flags=0x{:04x} freq={:.3} payload=[{}]", 
-                                  desired_state.squelch, desired_state.flags, desired_state.freq_rx,
-                                  payload_hex.join(" "));
                         // Flow control: wait if window exhausted
                         while flow_window.load(Ordering::SeqCst) < frame_len {
-                            // Wait for WindowAck to free up space — yield to allow ack to arrive
                             thread::sleep(Duration::from_micros(500));
                         }
                         flow_window.fetch_sub(frame_len, Ordering::SeqCst);
@@ -655,6 +658,7 @@ fn io_thread_main(
                 RadioCommand::SendFrame(frame) => {
                     if let Some(ref mut sp) = serial {
                         let frame_len = frame.len() as u32;
+                        
                         // Flow control: wait if window exhausted
                         while flow_window.load(Ordering::SeqCst) < frame_len {
                             thread::sleep(Duration::from_micros(500));
@@ -671,6 +675,12 @@ fn io_thread_main(
                     if let Some(ref mut sp) = serial {
                         let payload = desired_state.to_bytes();
                         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
+                        let frame_len = frame.len() as u32;
+                        // Flow control: wait if window exhausted
+                        while flow_window.load(Ordering::SeqCst) < frame_len {
+                            thread::sleep(Duration::from_micros(500));
+                        }
+                        flow_window.fetch_sub(frame_len, Ordering::SeqCst);
                         let _ = sp.write_all(&frame);
                         let _ = sp.flush();
                     }
@@ -697,7 +707,8 @@ fn io_thread_main(
                 Ok(n) => {
                     let packets = parser.lock().unwrap().feed(&buf[..n]);
                     for pkt in packets {
-                        // WindowAck (0x09): increment flow control window
+                        // WindowUpdate (0x09): increment flow control window
+                        // NOTE: This is a notification from device, no response needed
                         if pkt.command == 0x09 && pkt.payload.len() >= 4 {
                             // Parse window size from payload (little-endian u32 at offset 0)
                             let size = u32::from_le_bytes([
@@ -705,11 +716,6 @@ fn io_thread_main(
                                 pkt.payload[2], pkt.payload[3],
                             ]);
                             flow_window_ack.fetch_add(size, Ordering::SeqCst);
-                            
-                            // Also send the ack back
-                            let ack = build_kv4p_packet(HostCommand::WindowAck, &pkt.payload);
-                            let _ = sp.write_all(&ack);
-                            let _ = sp.flush();
                         }
                         
                         // Process packet
@@ -921,7 +927,7 @@ mod tests {
         let config = SerialConfig::default();
         let radio = KV4PRadio::new(config);
         let state = radio.state();
-        assert_eq!(state.frequency, 145500);
+        assert_eq!(state.frequency, 144200);
         assert_eq!(state.connected, false);
     }
 }

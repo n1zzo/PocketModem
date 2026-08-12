@@ -587,6 +587,14 @@ impl AudioManager {
     pub fn start_capture(&mut self) -> Result<(), String> {
         if self.tx_enabled.load(Ordering::SeqCst) { return Ok(()); }
         
+        // Set ALSA mic gain
+        let _ = std::process::Command::new("amixer")
+            .args(["-c", "0", "set", "TX_DEC0", "100"])
+            .output();
+        let _ = std::process::Command::new("amixer")
+            .args(["-c", "0", "set", "TX_AIF1_CAP Mixer DEC0", "on"])
+            .output();
+        
         let config = self.config.clone();
         let tx_callback = Arc::clone(&self.tx_callback);
         let tx_enabled = Arc::clone(&self.tx_enabled);
@@ -791,9 +799,6 @@ impl AudioManager {
         let device = host.default_input_device()
             .ok_or("No input device available")?;
         
-        let supported = device.default_input_config()
-            .map_err(|e| format!("Failed to get default input config: {}", e))?;
-        
         let sample_rate = config.sample_rate;
         let gain = config.tx_gain;
         let gate_threshold = config.gate_threshold;
@@ -810,101 +815,80 @@ impl AudioManager {
         let encoder: Arc<std::sync::Mutex<ADPCMEncoder>> = Arc::new(std::sync::Mutex::new(ADPCMEncoder::new()));
         let encoder_clone = Arc::clone(&encoder);
         
-        let stream = match supported.sample_format() {
-            cpal::SampleFormat::I16 => {
-                device.build_input_stream(
-                    &supported.config(),
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        if !enabled.load(Ordering::SeqCst) { return; }
+        // Build stream config at 16kHz (ADPCM sample rate)
+        let stream_config = cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        
+        let stream = {
+            let enabled_clone = enabled.clone();
+            let callback_clone2 = callback_clone.clone();
+            let dc_remover_clone2 = dc_remover_clone.clone();
+            let pre_emph_clone2 = pre_emph_clone.clone();
+            let tx_buf_clone2 = tx_buf_clone.clone();
+            let encoder_clone2 = encoder_clone.clone();
+            
+            device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if !enabled_clone.load(Ordering::SeqCst) { return; }
+                    
+                    let mut samples: Vec<i16> = data.iter()
+                        .map(|&s| {
+                            let s = s * gain;
+                            (s.clamp(-1.0, 1.0) * 32767.0) as i16
+                        })
+                        .collect();
+                    
+                    // DC removal and pre-emphasis for TX
+                    dc_remover_clone2.lock().unwrap().process(&mut samples);
+                    pre_emph_clone2.lock().unwrap().process(&mut samples);
+                    
+                    let mut max_amp = 0.0f32;
+                    for &s in &samples {
+                        let amp = (s as f32).abs() / 32768.0;
+                        if amp > max_amp { max_amp = amp; }
+                    }
+                    
+
+                    
+                    if max_amp > gate_threshold {
+                        // Accumulate samples for ADPCM encoding
+                        let mut tx = tx_buf_clone2.lock().unwrap();
+                        tx.extend_from_slice(&samples);
                         
-                        let mut samples: Vec<i16> = data.iter()
-                            .map(|&s| (s as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16)
-                            .collect();
-                        
-                        // DC removal and pre-emphasis for TX
-                        dc_remover_clone.lock().unwrap().process(&mut samples);
-                        pre_emph_clone.lock().unwrap().process(&mut samples);
-                        
-                        // Check if audio level is above threshold
-                        let mut max_amp = 0.0f32;
-                        for &s in &samples {
-                            let amp = (s as f32).abs() / 32768.0;
-                            if amp > max_amp { max_amp = amp; }
-                        }
-                        
-                        // Debug: log mic audio levels
-                        if max_amp > 0.01 {
-                            eprintln!("[audio] TX I16: {} samples, max_amp={:.4}", samples.len(), max_amp);
-                        }
-                        
-                        if max_amp > gate_threshold {
-                            // Accumulate samples for ADPCM encoding
-                            let mut tx = tx_buf_clone.lock().unwrap();
-                            tx.extend_from_slice(&samples);
-                            
-                            // Encode full blocks (249 samples each)
-                            while tx.len() >= 249 {
-                                let block = tx.drain(..249).collect::<Vec<_>>();
-                                let adpcm = encoder_clone.lock().unwrap().encode(&block);
-                                if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
-                                    cb(&adpcm);
-                                }
+                        // Encode full blocks (249 samples each)
+                        while tx.len() >= 249 {
+                            let block = tx.drain(..249).collect::<Vec<_>>();
+                            let adpcm = encoder_clone2.lock().unwrap().encode(&block);
+                            if let Some(ref mut cb) = *callback_clone2.lock().unwrap() {
+                                cb(&adpcm);
                             }
-                        } else if tx_buf_clone.lock().unwrap().is_empty() {
-                            // Silence - reset encoder state
-                            encoder_clone.lock().unwrap().reset();
                         }
-                    },
-                    err_fn,
-                    None,
-                )
-            }
-            cpal::SampleFormat::F32 => {
-                device.build_input_stream(
-                    &supported.config(),
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        if !enabled.load(Ordering::SeqCst) { return; }
-                        
-                        let mut samples: Vec<i16> = data.iter()
-                            .map(|&s| {
-                                let s = s * gain;
-                                (s.clamp(-1.0, 1.0) * 32767.0) as i16
-                            })
-                            .collect();
-                        
-                        // F32 format branch: DC removal and pre-emphasis
-                        dc_remover_clone.lock().unwrap().process(&mut samples);
-                        pre_emph_clone.lock().unwrap().process(&mut samples);
-                        
-                        let mut max_amp = 0.0f32;
-                        for &s in &samples {
-                            let amp = (s as f32).abs() / 32768.0;
-                            if amp > max_amp { max_amp = amp; }
-                        }
-                        
-                        if max_amp > gate_threshold {
-                            // Accumulate samples for ADPCM encoding
-                            let mut tx = tx_buf_clone.lock().unwrap();
-                            tx.extend_from_slice(&samples);
-                            
-                            // Encode full blocks (249 samples each)
-                            while tx.len() >= 249 {
-                                let block = tx.drain(..249).collect::<Vec<_>>();
-                                let adpcm = encoder_clone.lock().unwrap().encode(&block);
-                                if let Some(ref mut cb) = *callback_clone.lock().unwrap() {
-                                    cb(&adpcm);
-                                }
+                    } else {
+                        // Silence - drain any remaining samples with padding
+                        let mut tx = tx_buf_clone2.lock().unwrap();
+                        if !tx.is_empty() {
+                            // Pad to 249 samples and encode
+                            while tx.len() < 249 {
+                                tx.push(0);  // Pad with silence
                             }
-                        } else if tx_buf_clone.lock().unwrap().is_empty() {
-                            // Silence - reset encoder state
-                            encoder_clone.lock().unwrap().reset();
+                            let block: Vec<i16> = tx.drain(..249).collect();
+                            drop(tx);  // Release lock before callback
+                            let adpcm = encoder_clone2.lock().unwrap().encode(&block);
+                            if let Some(ref mut cb) = *callback_clone2.lock().unwrap() {
+                                cb(&adpcm);
+                            }
                         }
-                    },
-                    err_fn,
-                    None,
-                )
-            }
-            _ => return Err("Unsupported sample format".to_string()),
+                        // Reset encoder for next talk spurt
+                        encoder_clone2.lock().unwrap().reset();
+                    }
+                },
+                err_fn,
+                None,
+            )
         }.map_err(|e| format!("Failed to build input stream: {}", e))?;
         
         stream.play().map_err(|e| format!("Failed to start stream: {}", e))?;
