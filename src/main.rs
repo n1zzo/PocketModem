@@ -1,6 +1,10 @@
 //! PocketModem libadwaita UI with native KV4P protocol implementation
 //!
-//! Uses only libadwaita bindings for a modern GNOME-style interface
+//! Uses libadwaita patterns for a modern GNOME-style interface:
+//! - ViewStack for page navigation
+//! - PreferencesGroup + ActionRow for settings
+//! - ToastOverlay for notifications
+//! - Clamp for content width
 
 mod audio;
 mod gps;
@@ -17,8 +21,58 @@ use radio::{KV4PRadio, SerialConfig};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use libadwaita::prelude::*;
-use libadwaita as adw;
+use adw::prelude::*;
+use adw;
+
+/// Calculate Maidenhead locator from lat/lon
+/// Based on the standard 6-character grid square
+fn maidenhead_locator(lat: f64, lon: f64) -> String {
+    // Handle edge cases
+    if lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 {
+        return "---".to_string();
+    }
+    
+    // Field (18x18 grid, A-R, 20° x 10°)
+    let mut lon_adj = lon;
+    let mut lat_adj = lat;
+    let mut negative_lon = false;
+    let mut negative_lat = false;
+    
+    // Handle negative coordinates
+    if lon_adj < 0.0 {
+        lon_adj = 180.0 + lon_adj;
+        negative_lon = true;
+    }
+    if lat_adj < 0.0 {
+        lat_adj = 90.0 + lat_adj;
+        negative_lat = true;
+    }
+    
+    // Field calculation
+    let field1 = (lon_adj / 20.0).floor() as i32;
+    let field2 = (lat_adj / 10.0).floor() as i32;
+    
+    // Square (10x10 grid, 2° x 1°)
+    let rem1 = (lon_adj % 20.0) / 2.0;
+    let rem2 = (lat_adj % 10.0) / 1.0;
+    let sq_lon = rem1.floor() as i32;
+    let sq_lat = rem2.floor() as i32;
+    
+    // Subsquare (24x24 grid, 5' x 2.5')
+    let rem1b = (rem1 % 1.0) * 60.0 / 5.0;
+    let rem2b = (rem2 % 1.0) * 60.0 / 2.5;
+    let sub_lon = rem1b.floor() as i32;
+    let sub_lat = rem2b.floor() as i32;
+    
+    let c1 = (b'A' + (field1 % 18) as u8) as char;
+    let c2 = (b'A' + (field2 % 18) as u8) as char;
+    let c3 = (b'0' + (sq_lon % 10) as u8) as char;
+    let c4 = (b'0' + (sq_lat % 10) as u8) as char;
+    let c5 = (b'a' + (sub_lon % 24) as u8) as char;
+    let c6 = (b'a' + (sub_lat % 24) as u8) as char;
+    
+    format!("{}{}{}{}{}{}", c1, c2, c3, c4, c5, c6)
+}
 
 /// GSettings application ID (matches schema path)
 const APP_ID: &str = "org.pocketmodem.pocket-modem";
@@ -87,7 +141,7 @@ fn main() {
 
     let app = adw::Application::builder()
         .application_id(APP_ID)
-        .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     
     // Register empty open handler to prevent GTK from exiting when command line args
@@ -131,15 +185,14 @@ fn create_ui(
     gps: &Arc<Mutex<GpsManager>>,
     settings: &SettingsManager,
 ) {
+    // Create the main window
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .default_width(320)
+        .default_width(360)
         .default_height(720)
         .title("PocketModem")
         .build();
-    window.set_size_request(320, -1);
-    
-    window.show();
+    window.set_size_request(360, -1);
     
     // Apply saved frequency from settings on startup
     let saved_freq = settings.frequency();
@@ -207,500 +260,233 @@ fn create_ui(
         });
     }
     
-    // Main content box using HeaderBar
+    // =========================================================================
+    // ViewStack for navigation (created later)
+    // =========================================================================
+    // Header bar with settings button
+    // =========================================================================
     let header_bar = adw::HeaderBar::builder()
         .title_widget(&adw::WindowTitle::new("PocketModem", ""))
         .build();
     
-    // Settings button
-    let settings_btn = gtk4::ToggleButton::new();
+    // Settings button in header
+    let settings_btn = gtk::ToggleButton::new();
     settings_btn.set_icon_name("emblem-system-symbolic");
     settings_btn.add_css_class("flat");
     settings_btn.set_tooltip_text(Some("Settings"));
-    
-    // Settings view content
-    let settings_view = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
-    settings_view.set_margin_top(24);
-    settings_view.set_margin_start(16);
-    settings_view.set_margin_end(16);
-    settings_view.set_margin_bottom(24);
-    settings_view.set_visible(false);
-    
-    // === SETTINGS PANEL (operates on main thread) ===
-    let settings_clone = settings as *const SettingsManager as *mut SettingsManager;
-    
-    // Squelch section
-    let squelch_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    let squelch_title = gtk4::Label::new(Some("<b>Squelch</b>"));
-    squelch_title.set_markup("<b>Squelch</b>");
-    squelch_title.set_halign(gtk4::Align::Start);
-    squelch_section.append(&squelch_title);
-    
-    let squelch_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-    squelch_row.set_valign(gtk4::Align::Center);
-    
-    let squelch_scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 8.0, 1.0);
-    squelch_scale.set_value(saved_squelch as f64);
-    squelch_scale.set_inverted(true);
-    squelch_scale.set_hexpand(true);
-    squelch_scale.set_draw_value(false);
-    squelch_scale.set_has_origin(true);
-    
-    let squelch_value_label = gtk4::Label::new(Some(&saved_squelch.to_string()));
-    squelch_value_label.set_width_request(24);
-    squelch_value_label.set_halign(gtk4::Align::Start);
-    squelch_value_label.add_css_class("squelch-value");
-    
-    // Squelch callback - settings on main thread, radio on spawned thread
-    let radio_squelch = Arc::clone(radio);
-    let label_for_closure = squelch_value_label.clone();
-    let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(saved_squelch));
-    
-    squelch_scale.connect_value_changed(move |scale| {
-        let level = scale.value().round() as u8;
-        label_for_closure.set_text(&format!("{}", level));
-        
-        if level != last_sent.load(std::sync::atomic::Ordering::SeqCst) {
-            // Settings on main thread (via unsafe pointer - OK because we're on main thread)
-            unsafe {
-                (*settings_clone).set_squelch(level);
-            }
-            
-            // Radio on spawned thread
-            let radio_clone = radio_squelch.clone();
-            let sent = Arc::clone(&last_sent);
-            std::thread::spawn(move || {
-                if let Ok(r) = radio_clone.lock() {
-                    let _ = r.set_squelch(level);
-                }
-                sent.store(level, std::sync::atomic::Ordering::SeqCst);
-            });
-        }
-    });
-    
-    squelch_row.append(&squelch_scale);
-    squelch_row.append(&squelch_value_label);
-    squelch_section.append(&squelch_row);
-    settings_view.append(&squelch_section);
-    
-    // Audio Filters section
-    let filters_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    let filters_title = gtk4::Label::new(Some("<b>Audio Filters</b>"));
-    filters_title.set_markup("<b>Audio Filters</b>");
-    filters_title.set_halign(gtk4::Align::Start);
-    filters_section.append(&filters_title);
-    
-    // Pre-emphasis
-    let pre_emph_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    pre_emph_row.set_hexpand(true);
-    let pre_emph_label = gtk4::Label::new(Some("Pre-emphasis (TX)"));
-    pre_emph_label.set_hexpand(true);
-    pre_emph_label.set_halign(gtk4::Align::Start);
-    let pre_emph_switch = gtk4::Switch::new();
-    pre_emph_switch.set_valign(gtk4::Align::Center);
-    pre_emph_switch.set_active(false);
-    
-    let radio_pre_emph = Arc::clone(radio);
-    pre_emph_switch.connect_state_set(move |_sw, state| {
-        // Settings on main thread
-        unsafe { (*settings_clone).set_pre_emphasis(state); }
-        // Radio on spawned thread
-        let radio_clone = radio_pre_emph.clone();
-        std::thread::spawn(move || {
-            if let Ok(r) = radio_clone.lock() {
-                let _ = r.set_filter_pre_emphasis(state);
-            }
-        });
-        glib::Propagation::Proceed
-    });
-    pre_emph_row.append(&pre_emph_label);
-    pre_emph_row.append(&pre_emph_switch);
-    filters_section.append(&pre_emph_row);
-    
-    // De-emphasis
-    let de_emph_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    de_emph_row.set_hexpand(true);
-    let de_emph_label = gtk4::Label::new(Some("De-emphasis (RX)"));
-    de_emph_label.set_hexpand(true);
-    de_emph_label.set_halign(gtk4::Align::Start);
-    let de_emph_switch = gtk4::Switch::new();
-    de_emph_switch.set_valign(gtk4::Align::Center);
-    de_emph_switch.set_active(false);
-    
-    let radio_de_emph = Arc::clone(radio);
-    de_emph_switch.connect_state_set(move |_sw, state| {
-        unsafe { (*settings_clone).set_de_emphasis(state); }
-        let radio_clone = radio_de_emph.clone();
-        std::thread::spawn(move || {
-            if let Ok(r) = radio_clone.lock() {
-                let _ = r.set_filter_de_emphasis(state);
-            }
-        });
-        glib::Propagation::Proceed
-    });
-    de_emph_row.append(&de_emph_label);
-    de_emph_row.append(&de_emph_switch);
-    filters_section.append(&de_emph_row);
-    
-    // High-pass filter
-    let hp_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    hp_row.set_hexpand(true);
-    let hp_label = gtk4::Label::new(Some("High-pass filter"));
-    hp_label.set_hexpand(true);
-    hp_label.set_halign(gtk4::Align::Start);
-    let hp_switch = gtk4::Switch::new();
-    hp_switch.set_valign(gtk4::Align::Center);
-    hp_switch.set_active(true);
-    
-    let radio_hp = Arc::clone(radio);
-    hp_switch.connect_state_set(move |_sw, state| {
-        unsafe { (*settings_clone).set_high_pass_filter(state); }
-        let radio_clone = radio_hp.clone();
-        std::thread::spawn(move || {
-            if let Ok(r) = radio_clone.lock() {
-                let _ = r.set_filter_high_pass(state);
-            }
-        });
-        glib::Propagation::Proceed
-    });
-    hp_row.append(&hp_label);
-    hp_row.append(&hp_switch);
-    filters_section.append(&hp_row);
-    
-    // Low-pass filter
-    let lp_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    lp_row.set_hexpand(true);
-    let lp_label = gtk4::Label::new(Some("Low-pass filter"));
-    lp_label.set_hexpand(true);
-    lp_label.set_halign(gtk4::Align::Start);
-    let lp_switch = gtk4::Switch::new();
-    lp_switch.set_valign(gtk4::Align::Center);
-    lp_switch.set_active(true);
-    
-    let radio_lp = Arc::clone(radio);
-    lp_switch.connect_state_set(move |_sw, state| {
-        unsafe { (*settings_clone).set_low_pass_filter(state); }
-        let radio_clone = radio_lp.clone();
-        std::thread::spawn(move || {
-            if let Ok(r) = radio_clone.lock() {
-                let _ = r.set_filter_low_pass(state);
-            }
-        });
-        glib::Propagation::Proceed
-    });
-    lp_row.append(&lp_label);
-    lp_row.append(&lp_switch);
-    filters_section.append(&lp_row);
-    
-    settings_view.append(&filters_section);
-    
-    // TX Power section
-    let tx_power_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    let tx_power_title = gtk4::Label::new(Some("<b>TX Power</b>"));
-    tx_power_title.set_markup("<b>TX Power</b>");
-    tx_power_title.set_halign(gtk4::Align::Start);
-    tx_power_section.append(&tx_power_title);
-    
-    let tx_power_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    tx_power_row.set_hexpand(true);
-    let tx_power_label = gtk4::Label::new(Some("High power"));
-    tx_power_label.set_hexpand(true);
-    tx_power_label.set_halign(gtk4::Align::Start);
-    let tx_power_switch = gtk4::Switch::new();
-    tx_power_switch.set_active(false);
-    tx_power_switch.set_valign(gtk4::Align::Center);
-    
-    let radio_tx_power = Arc::clone(radio);
-    tx_power_switch.connect_state_set(move |_sw, state| {
-        unsafe { (*settings_clone).set_tx_power_high(state); }
-        let radio_clone = radio_tx_power.clone();
-        std::thread::spawn(move || {
-            if let Ok(r) = radio_clone.lock() {
-                let _ = r.set_tx_power(state);
-            }
-        });
-        glib::Propagation::Proceed
-    });
-    tx_power_row.append(&tx_power_label);
-    tx_power_row.append(&tx_power_switch);
-    tx_power_section.append(&tx_power_row);
-    settings_view.append(&tx_power_section);
-    
-    // Mic Gain section
-    let mic_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    let mic_title = gtk4::Label::new(Some("<b>Mic Gain Boost</b>"));
-    mic_title.set_markup("<b>Mic Gain Boost</b>");
-    mic_title.set_halign(gtk4::Align::Start);
-    mic_section.append(&mic_title);
-    
-    let mic_dropdown = gtk4::DropDown::from_strings(&[
-        "None", "Low", "Med", "High",
-    ]);
-    
-    let radio_mic = Arc::clone(radio);
-    mic_dropdown.connect_selected_notify(move |dd| {
-        let idx = dd.selected();
-        let level = match idx {
-            0 => "none",
-            1 => "low", 
-            2 => "med",
-            _ => "high",
-        };
-        unsafe { (*settings_clone).set_mic_gain(level); }
-        let radio_clone = radio_mic.clone();
-        std::thread::spawn(move || {
-            if let Ok(r) = radio_clone.lock() {
-                let _ = r.set_mic_gain(level);
-            }
-        });
-    });
-    mic_section.append(&mic_dropdown);
-    settings_view.append(&mic_section);
-    
-    // Channels section
-    let channels_section = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    let channels_title = gtk4::Label::new(Some("<b>Channels</b>"));
-    channels_title.set_markup("<b>Channels</b>");
-    channels_title.set_halign(gtk4::Align::Start);
-    channels_section.append(&channels_title);
-    
-    // Import CSV row using libadwaita ActionRow
-    let import_row = adw::ActionRow::new();
-    import_row.set_title("Import from CSV");
-    import_row.set_subtitle("Import channels from CHIRP CSV file");
-    
-    let import_icon = gtk4::Image::from_icon_name("document-open-symbolic");
-    let import_btn = gtk4::Button::new();
-    import_btn.set_child(Some(&import_icon));
-    import_btn.add_css_class("flat");
-    import_row.set_activatable_widget(Some(&import_btn));
-    import_row.add_suffix(&import_btn);
-    
-    // Export CSV row using libadwaita ActionRow
-    let export_row = adw::ActionRow::new();
-    export_row.set_title("Export to CSV");
-    export_row.set_subtitle("Export channels to CHIRP CSV file");
-    
-    let export_icon = gtk4::Image::from_icon_name("document-save-as-symbolic");
-    let export_btn = gtk4::Button::new();
-    export_btn.set_child(Some(&export_icon));
-    export_btn.add_css_class("flat");
-    export_row.set_activatable_widget(Some(&export_btn));
-    export_row.add_suffix(&export_btn);
-    
-    // Import CSV - opens file chooser dialog
-    let settings_for_import = settings_clone;
-    import_btn.connect_clicked(move |_| {
-        // We can't use @weak window here since we're capturing it in the inner closure
-        // So we capture it in the outer closure instead
-        let dialog = gtk4::FileChooserDialog::new(
-            Some("Import Channels from CSV"),
-            None::<&gtk4::Window>,
-            gtk4::FileChooserAction::Open,
-            &[
-                ("Cancel", gtk4::ResponseType::Cancel),
-                ("Import", gtk4::ResponseType::Accept),
-            ],
-        );
-        
-        // Add CSV file filter
-        let filter = gtk4::FileFilter::new();
-        filter.set_name(Some("CSV Files"));
-        filter.add_pattern("*.csv");
-        filter.add_mime_type("text/csv");
-        dialog.add_filter(&filter);
-        
-        // Connect response handler
-        let settings = settings_for_import;
-        dialog.connect_response(move |dialog, response| {
-            if response == gtk4::ResponseType::Accept {
-                if let Some(file) = dialog.file() {
-                    if let Some(path) = file.path() {
-                        eprintln!("[pocket-modem] Importing channels from: {:?}", path);
-                        let result = unsafe { (*settings).import_csv(&path) };
-                        match result {
-                            Ok(channels) => eprintln!("[pocket-modem] Imported {} channels", channels.len()),
-                            Err(e) => eprintln!("[pocket-modem] Import failed: {}", e),
-                        }
-                    }
-                }
-            }
-            dialog.close();
-        });
-        
-        dialog.show();
-    });
-    
-    // Export CSV - opens save file chooser dialog
-    let settings_for_export = settings_clone;
-    export_btn.connect_clicked(move |_| {
-        let dialog = gtk4::FileChooserDialog::new(
-            Some("Export Channels to CSV"),
-            None::<&gtk4::Window>,
-            gtk4::FileChooserAction::Save,
-            &[
-                ("Cancel", gtk4::ResponseType::Cancel),
-                ("Export", gtk4::ResponseType::Accept),
-            ],
-        );
-        
-        // Add CSV file filter
-        let filter = gtk4::FileFilter::new();
-        filter.set_name(Some("CSV Files"));
-        filter.add_pattern("*.csv");
-        filter.add_mime_type("text/csv");
-        dialog.add_filter(&filter);
-        
-        // Set default filename
-        dialog.set_current_name("pocket-modem-channels.csv");
-        
-        // Connect response handler
-        let settings = settings_for_export;
-        dialog.connect_response(move |dialog, response| {
-            if response == gtk4::ResponseType::Accept {
-                if let Some(file) = dialog.file() {
-                    if let Some(path) = file.path() {
-                        eprintln!("[pocket-modem] Exporting channels to: {:?}", path);
-                        let result = unsafe { (*settings).export_csv(&path) };
-                        match result {
-                            Ok(_) => eprintln!("[pocket-modem] Exported channels successfully"),
-                            Err(e) => eprintln!("[pocket-modem] Export failed: {}", e),
-                        }
-                    }
-                }
-            }
-            dialog.close();
-        });
-        
-        dialog.show();
-    });
-    
-    channels_section.append(&import_row);
-    channels_section.append(&export_row);
-    
-    settings_view.append(&channels_section);
-    
-    // Reset to Defaults button
-    let reset_btn = gtk4::Button::with_label("Reset to Defaults");
-    reset_btn.add_css_class("destructive-action");
-    reset_btn.set_margin_top(24);
-    
-    reset_btn.connect_clicked(move |_| {
-        unsafe {
-            (*settings_clone).reset_to_defaults();
-        }
-        squelch_scale.set_value(4.0);
-        squelch_value_label.set_text("4");
-        eprintln!("[pocket-modem] Settings reset to defaults");
-    });
-    settings_view.append(&reset_btn);
-    
-    // Back button
-    let back_btn = gtk4::Button::with_label("Back");
-    back_btn.set_margin_top(16);
-    back_btn.connect_clicked(glib::clone!(@weak settings_btn => move |_| {
-        settings_btn.set_active(false);
-    }));
-    settings_view.append(&back_btn);
-    
     header_bar.pack_end(&settings_btn);
     
-    // Status row
-    let status_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 32);
-    status_row.set_halign(gtk4::Align::Center);
+    // =========================================================================
+    // MAIN PAGE
+    // =========================================================================
+    
+    // Clamp content width for proper libadwaita layout
+    let clamp = adw::Clamp::builder()
+        .maximum_size(500)
+        .build();
+    
+    let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content_box.set_halign(gtk::Align::Center);
+    content_box.set_hexpand(true);
+    
+    // --- Status indicators ---
+    let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 32);
+    status_row.set_halign(gtk::Align::Center);
     status_row.set_margin_top(16);
     status_row.set_margin_bottom(16);
     
-    let modem_label = gtk4::Label::new(Some("○"));
-    modem_label.add_css_class("status-icon-red");
-    let modem_status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-    let modem_icon = gtk4::Image::from_icon_name("network-wireless-symbolic");
+    // Modem status (clickable)
+    let modem_status_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let modem_icon = gtk::Image::from_icon_name("network-wireless-symbolic");
     modem_icon.set_pixel_size(28);
-    let modem_status_label = gtk4::Label::new(Some("MODEM"));
+    let modem_label = gtk::Label::new(Some("○"));
+    modem_label.add_css_class("status-icon-red");
+    let modem_status_label = gtk::Label::new(Some("MODEM"));
     modem_status_label.add_css_class("status-text");
     modem_status_label.add_css_class("modem-label");
     modem_status_box.append(&modem_icon);
     modem_status_box.append(&modem_label);
     modem_status_box.append(&modem_status_label);
     
-    let gps_icon = gtk4::Image::from_icon_name("location-services-active-symbolic");
+    // Sheet content for modem
+    let modem_sheet = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    modem_sheet.set_margin_top(16);
+    modem_sheet.set_margin_start(16);
+    modem_sheet.set_margin_end(16);
+    modem_sheet.set_margin_bottom(16);
+    let modem_title = gtk::Label::new(Some("<b>MODEM</b>"));
+    modem_title.set_markup("<b>MODEM</b>");
+    modem_title.set_halign(gtk::Align::Center);
+    let modem_fw_label = gtk::Label::new(Some("Firmware: --"));
+    modem_fw_label.set_halign(gtk::Align::Start);
+    let modem_hw_label = gtk::Label::new(Some("Hardware: --"));
+    modem_hw_label.set_halign(gtk::Align::Start);
+    let modem_rf_label = gtk::Label::new(Some("RF Module: --"));
+    modem_rf_label.set_halign(gtk::Align::Start);
+    let modem_close_btn = gtk::Button::with_label("Close");
+    modem_close_btn.set_halign(gtk::Align::Center);
+    modem_sheet.append(&modem_title);
+    modem_sheet.append(&modem_fw_label);
+    modem_sheet.append(&modem_hw_label);
+    modem_sheet.append(&modem_rf_label);
+    modem_sheet.append(&modem_close_btn);
+    
+    // GPS status (clickable)
+    let gps_status_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let gps_icon = gtk::Image::from_icon_name("location-services-active-symbolic");
     gps_icon.set_pixel_size(28);
-    let gps_led = gtk4::Label::new(Some("○"));
+    let gps_led = gtk::Label::new(Some("○"));
     gps_led.add_css_class("gps-led-off");
-    let gps_status_label = gtk4::Label::new(Some("GPS"));
+    let gps_status_label = gtk::Label::new(Some("GPS"));
     gps_status_label.add_css_class("status-text");
     gps_status_label.add_css_class("gps-label");
-    let gps_status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-    gps_status_box.add_css_class("gps-status-box");
     gps_status_box.append(&gps_icon);
     gps_status_box.append(&gps_led);
     gps_status_box.append(&gps_status_label);
+    gps_status_box.set_cursor_from_name(Some("pointer"));
     
-    status_row.append(&modem_status_box);
-    status_row.append(&gps_status_box);
-
-    let gps_location_label = gtk4::Label::new(Some("Searching..."));
-    gps_location_label.add_css_class("gps-location");
-    gps_location_label.set_margin_top(4);
-
-    let audio_label = gtk4::Label::new(Some("○"));
-    audio_label.add_css_class("status-icon-gray");
-    let audio_status_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-    let audio_icon = gtk4::Image::from_icon_name("audio-volume-medium-symbolic");
+    // Sheet content for GPS
+    let gps_sheet = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    gps_sheet.set_margin_top(16);
+    gps_sheet.set_margin_start(16);
+    gps_sheet.set_margin_end(16);
+    gps_sheet.set_margin_bottom(16);
+    let gps_title = gtk::Label::new(Some("<b>GPS</b>"));
+    gps_title.set_markup("<b>GPS</b>");
+    gps_title.set_halign(gtk::Align::Center);
+    let gps_locator_label = gtk::Label::new(Some("Maidenhead: --"));
+    gps_locator_label.set_halign(gtk::Align::Start);
+    let gps_coords_label = gtk::Label::new(Some("Coordinates: --"));
+    gps_coords_label.set_halign(gtk::Align::Start);
+    let gps_alt_label = gtk::Label::new(Some("Altitude: --"));
+    gps_alt_label.set_halign(gtk::Align::Start);
+    let gps_fix_label = gtk::Label::new(Some("Fix Type: --"));
+    gps_fix_label.set_halign(gtk::Align::Start);
+    let gps_speed_label = gtk::Label::new(Some("Speed: --"));
+    gps_speed_label.set_halign(gtk::Align::Start);
+    let gps_sats_label = gtk::Label::new(Some("Satellites: --"));
+    gps_sats_label.set_halign(gtk::Align::Start);
+    let gps_close_btn = gtk::Button::with_label("Close");
+    gps_close_btn.set_halign(gtk::Align::Center);
+    gps_sheet.append(&gps_title);
+    gps_sheet.append(&gps_locator_label);
+    gps_sheet.append(&gps_coords_label);
+    gps_sheet.append(&gps_alt_label);
+    gps_sheet.append(&gps_fix_label);
+    gps_sheet.append(&gps_speed_label);
+    gps_sheet.append(&gps_sats_label);
+    gps_sheet.append(&gps_close_btn);
+    
+    // Audio status (clickable)
+    let audio_status_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let audio_icon = gtk::Image::from_icon_name("audio-volume-medium-symbolic");
     audio_icon.set_pixel_size(28);
-    let audio_status_label = gtk4::Label::new(Some("AUDIO"));
+    let audio_label = gtk::Label::new(Some("○"));
+    audio_label.add_css_class("status-icon-gray");
+    let audio_status_label = gtk::Label::new(Some("AUDIO"));
     audio_status_label.add_css_class("status-text");
     audio_status_label.add_css_class("audio-label");
     audio_status_box.append(&audio_icon);
     audio_status_box.append(&audio_label);
     audio_status_box.append(&audio_status_label);
+    
+    // Sheet content for audio
+    let audio_sheet = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    audio_sheet.set_margin_top(16);
+    audio_sheet.set_margin_start(16);
+    audio_sheet.set_margin_end(16);
+    audio_sheet.set_margin_bottom(16);
+    let audio_title = gtk::Label::new(Some("<b>AUDIO</b>"));
+    audio_title.set_markup("<b>AUDIO</b>");
+    audio_title.set_halign(gtk::Align::Center);
+    let audio_codec_label = gtk::Label::new(Some("Codec: ADPCM (IMA WAV)"));
+    audio_codec_label.set_halign(gtk::Align::Start);
+    let audio_rate_label = gtk::Label::new(Some("Sample Rate: 16 kHz"));
+    audio_rate_label.set_halign(gtk::Align::Start);
+    let audio_buf_label = gtk::Label::new(Some("Buffer Size: 249 samples"));
+    audio_buf_label.set_halign(gtk::Align::Start);
+    let audio_latency_label = gtk::Label::new(Some("Latency: ~15 ms"));
+    audio_latency_label.set_halign(gtk::Align::Start);
+    let audio_close_btn = gtk::Button::with_label("Close");
+    audio_close_btn.set_halign(gtk::Align::Center);
+    audio_sheet.append(&audio_title);
+    audio_sheet.append(&audio_codec_label);
+    audio_sheet.append(&audio_rate_label);
+    audio_sheet.append(&audio_buf_label);
+    audio_sheet.append(&audio_latency_label);
+    audio_sheet.append(&audio_close_btn);
+    
+    // Add status boxes to status_row
+    status_row.append(&modem_status_box);
+    status_row.append(&gps_status_box);
     status_row.append(&audio_status_box);
     
-    // RSSI / S-meter
-    let rssi_sbar = gtk4::ProgressBar::new();
-    rssi_sbar.set_fraction(0.0);
-    rssi_sbar.add_css_class("rssi-bar");
+    // Create sheets overlay (slides up from bottom)
+    // Only one sheet shown at a time
+    let sheets_stack = gtk::Stack::new();
+    sheets_stack.set_valign(gtk::Align::End);
+    sheets_stack.add_named(&modem_sheet, Some("modem"));
+    sheets_stack.add_named(&gps_sheet, Some("gps"));
+    sheets_stack.add_named(&audio_sheet, Some("audio"));
+    sheets_stack.set_visible_child_name("modem");
+    sheets_stack.set_visible(false);
     
-    let smeter_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-    smeter_box.set_halign(gtk4::Align::Center);
-    smeter_box.set_margin_start(24);
-    smeter_box.set_margin_end(24);
-    smeter_box.set_valign(gtk4::Align::Center);
-    smeter_box.set_size_request(-1, 20);
+    // Connect close buttons
+    sheets_stack.set_visible(false);
+    let m = sheets_stack.clone();
+    modem_close_btn.connect_clicked(move |_| { m.set_visible(false); });
+    let g = sheets_stack.clone();
+    gps_close_btn.connect_clicked(move |_| { g.set_visible(false); });
+    let a = sheets_stack.clone();
+    audio_close_btn.connect_clicked(move |_| { a.set_visible(false); });
     
-    let signal_label = gtk4::Label::new(Some("SIGNAL"));
-    signal_label.add_css_class("signal-text");
-    signal_label.set_valign(gtk4::Align::Center);
+    // Add click controllers to show sheets
+    modem_status_box.add_controller({
+        let s = sheets_stack.clone();
+        let click = gtk::GestureClick::new();
+        click.connect_pressed(move |_, _, _, _| {
+            s.set_visible_child_name("modem");
+            s.set_visible(true);
+        });
+        click
+    });
+    gps_status_box.add_controller({
+        let s = sheets_stack.clone();
+        let click = gtk::GestureClick::new();
+        click.connect_pressed(move |_, _, _, _| {
+            s.set_visible_child_name("gps");
+            s.set_visible(true);
+        });
+        click
+    });
+    audio_status_box.add_controller({
+        let s = sheets_stack.clone();
+        let click = gtk::GestureClick::new();
+        click.connect_pressed(move |_, _, _, _| {
+            s.set_visible_child_name("audio");
+            s.set_visible(true);
+        });
+        click
+    });
     
-    rssi_sbar.set_hexpand(true);
-    rssi_sbar.set_valign(gtk4::Align::Center);
+    content_box.append(&status_row);
+    content_box.append(&sheets_stack);
     
-    let signal_value = gtk4::Label::new(None);
-    signal_value.add_css_class("signal-value");
-    signal_value.set_markup(&format!("<span color='#FFB000'>{}</span>", "-- dBm"));
-    signal_value.set_valign(gtk4::Align::Center);
-    signal_value.set_width_request(70);
-    
-    smeter_box.append(&signal_label);
-    smeter_box.append(&rssi_sbar);
-    smeter_box.append(&signal_value);
-    
-    // VFO frequency display
-    let freq_entry = gtk4::Entry::new();
+    // --- Frequency display ---
+    let freq_entry = gtk::Entry::new();
     freq_entry.set_text(&format!("{}.{:03}", saved_freq / 1000, saved_freq % 1000));
-    gtk4::prelude::EntryExt::set_alignment(&freq_entry, 0.5);
+    gtk::prelude::EntryExt::set_alignment(&freq_entry, 0.5);
     freq_entry.add_css_class("freq-display");
     freq_entry.set_size_request(260, 100);
     freq_entry.set_margin_start(16);
     freq_entry.set_margin_end(16);
     freq_entry.set_margin_top(8);
-    freq_entry.set_margin_bottom(20);
+    freq_entry.set_margin_bottom(4);
     freq_entry.set_editable(true);
     freq_entry.set_can_focus(true);
-    freq_entry.select_region(-1, -1);
     
     let radio_freq = Arc::clone(&radio);
-    let settings_for_freq = settings_clone;
+    let settings_for_freq = settings as *const SettingsManager as *mut SettingsManager;
     freq_entry.connect_activate(move |entry| {
         let text = entry.text().to_string();
         
@@ -725,24 +511,56 @@ fn create_ui(
             eprintln!("[pocket-modem] Invalid frequency: {}", text);
         }
     });
+    content_box.append(&freq_entry);
     
-    // Mode buttons
-    let mode_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    // --- RSSI / S-meter ---
+    let rssi_sbar = gtk::ProgressBar::new();
+    rssi_sbar.set_fraction(0.0);
+    rssi_sbar.add_css_class("rssi-bar");
+    
+    let smeter_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    smeter_box.set_halign(gtk::Align::Center);
+    smeter_box.set_margin_start(24);
+    smeter_box.set_margin_end(24);
+    smeter_box.set_margin_top(12);
+    smeter_box.set_margin_bottom(20);
+    smeter_box.set_valign(gtk::Align::Center);
+    smeter_box.set_size_request(-1, 20);
+    
+    let signal_label = gtk::Label::new(Some("SIGNAL"));
+    signal_label.add_css_class("signal-text");
+    signal_label.set_valign(gtk::Align::Center);
+    
+    rssi_sbar.set_hexpand(true);
+    rssi_sbar.set_valign(gtk::Align::Center);
+    
+    let signal_value = gtk::Label::new(None);
+    signal_value.add_css_class("signal-value");
+    signal_value.set_markup(&format!("<span color='#FFB000'>{}</span>", "-- dBm"));
+    signal_value.set_valign(gtk::Align::Center);
+    signal_value.set_width_request(70);
+    
+    smeter_box.append(&signal_label);
+    smeter_box.append(&rssi_sbar);
+    smeter_box.append(&signal_value);
+    content_box.append(&smeter_box);
+    
+    // --- Mode buttons ---
+    let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     mode_box.set_homogeneous(true);
     mode_box.set_margin_start(16);
     mode_box.set_margin_end(16);
-    mode_box.set_margin_top(20);
     mode_box.set_margin_bottom(16);
     
-    let btn_fm = gtk4::ToggleButton::with_label("FM");
+    let btn_fm = gtk::ToggleButton::with_label("FM");
     btn_fm.add_css_class("mode-btn");
     btn_fm.add_css_class("mode-btn-active");
     
-    let btn_rade = gtk4::ToggleButton::with_label("RADE");
+    let btn_rade = gtk::ToggleButton::with_label("RADE");
     btn_rade.add_css_class("mode-btn");
     btn_rade.set_sensitive(false);
     
-    let btn_m17 = gtk4::ToggleButton::with_label("M17");
+    let btn_m17 = gtk::ToggleButton::with_label("M17");
     btn_m17.add_css_class("mode-btn");
     btn_m17.set_sensitive(false);
     
@@ -750,8 +568,9 @@ fn create_ui(
     mode_box.append(&btn_fm);
     mode_box.append(&btn_rade);
     mode_box.append(&btn_m17);
+    content_box.append(&mode_box);
     
-    // Channel list
+    // --- Channel list (placeholder) ---
     let channel_group = adw::PreferencesGroup::builder()
         .title("Channels")
         .build();
@@ -761,36 +580,37 @@ fn create_ui(
         .build();
     no_channels_row.set_sensitive(false);
     channel_group.add(&no_channels_row);
+    content_box.append(&channel_group);
     
-    // PTT Button
-    let ptt_btn = gtk4::Button::new();
+    // --- PTT Button ---
+    let ptt_btn = gtk::Button::new();
     ptt_btn.add_css_class("ptt-button");
-    ptt_btn.set_valign(gtk4::Align::Center);
+    ptt_btn.set_valign(gtk::Align::Center);
     
-    let ptt_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    ptt_box.set_halign(gtk4::Align::Center);
-    ptt_box.set_valign(gtk4::Align::Center);
+    let ptt_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    ptt_box.set_halign(gtk::Align::Center);
+    ptt_box.set_valign(gtk::Align::Center);
     
-    let ptt_icon = gtk4::Image::from_icon_name("media-record-symbolic");
+    let ptt_icon = gtk::Image::from_icon_name("media-record-symbolic");
     ptt_icon.set_pixel_size(40);
     ptt_icon.add_css_class("ptt-icon");
-    ptt_icon.set_halign(gtk4::Align::Center);
-    ptt_icon.set_valign(gtk4::Align::Center);
+    ptt_icon.set_halign(gtk::Align::Center);
+    ptt_icon.set_valign(gtk::Align::Center);
     
-    let ptt_label = gtk4::Label::new(Some("PTT"));
+    let ptt_label = gtk::Label::new(Some("PTT"));
     ptt_label.add_css_class("ptt-label");
-    ptt_label.set_halign(gtk4::Align::Center);
+    ptt_label.set_halign(gtk::Align::Center);
     
     ptt_box.append(&ptt_icon);
     ptt_box.append(&ptt_label);
     
     ptt_btn.set_child(Some(&ptt_box));
     ptt_btn.set_tooltip_text(Some("Hold to transmit"));
-    ptt_btn.set_hexpand(true);
+    ptt_btn.set_hexpand(false);
     ptt_btn.set_margin_start(20);
     ptt_btn.set_margin_end(20);
-    ptt_btn.set_margin_bottom(20);
-    ptt_btn.set_valign(gtk4::Align::End);
+    ptt_btn.set_margin_bottom(24);
+    ptt_btn.set_valign(gtk::Align::End);
     
     // PTT using GestureClick
     let radio_pressed = Arc::clone(radio);
@@ -798,74 +618,469 @@ fn create_ui(
     let radio_released = Arc::clone(radio);
     let audio_released = Arc::clone(audio);
     
-    let gesture = gtk4::GestureClick::new();
-    gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let gesture = gtk::GestureClick::new();
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
     gesture.set_button(0);
     
-    gesture.connect_pressed(glib::clone!(
-        @strong radio_pressed, 
-        @strong audio_pressed,
-        @weak ptt_label,
-        => move |_gesture, _n_press, _x, _y| {
-        ptt_label.set_text("TX");
-        if let Ok(r) = radio_pressed.lock() {
-            let _ = r.ptt_on();
-        }
-        if let Ok(mut a) = audio_pressed.lock() {
-            let _ = a.start_capture();
-        }
-    }));
-    
-    gesture.connect_released(glib::clone!(
-        @strong radio_released, 
-        @strong audio_released,
-        @weak ptt_label,
-        => move |_gesture, _n_press, _x, _y| {
-        if let Ok(mut a) = audio_released.lock() {
-            let _ = a.stop_capture();
-        }
-        if let Ok(r) = radio_released.lock() {
-            let _ = r.ptt_off();
-        }
-        ptt_label.set_text("PTT");
-    }));
-    
-    ptt_btn.add_controller(gesture);
-    
-    // Main content area
-    let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    content_box.set_halign(gtk4::Align::Center);
-    content_box.set_hexpand(false);
-    content_box.set_size_request(320, -1);
-    
-    // Connect toggle button to switch views
-    let settings_view_clone = settings_view.clone();
-    let content_box_clone = content_box.clone();
-    settings_btn.connect_toggled(move |btn| {
-        if btn.is_active() {
-            settings_view_clone.set_visible(true);
-            content_box_clone.set_visible(false);
-        } else {
-            settings_view_clone.set_visible(false);
-            content_box_clone.set_visible(true);
+    gesture.connect_pressed({
+        let r = radio_pressed.clone();
+        let a = audio_pressed.clone();
+        let label = ptt_label.clone();
+        move |_gesture, _n_press, _x, _y| {
+            label.set_text("TX");
+            if let Ok(mut rad) = r.lock() {
+                let _ = rad.ptt_on();
+            }
+            if let Ok(mut aud) = a.lock() {
+                let _ = aud.start_capture();
+            }
         }
     });
     
-    content_box.append(&status_row);
-    content_box.append(&freq_entry);
-    content_box.append(&smeter_box);
-    content_box.append(&mode_box);
-    content_box.append(channel_group.as_ref() as &gtk4::Widget);
+    gesture.connect_released({
+        let r = radio_released.clone();
+        let a = audio_released.clone();
+        let label = ptt_label.clone();
+        move |_gesture, _n_press, _x, _y| {
+            if let Ok(mut aud) = a.lock() {
+                let _ = aud.stop_capture();
+            }
+            if let Ok(mut rad) = r.lock() {
+                let _ = rad.ptt_off();
+            }
+            label.set_text("PTT");
+        }
+    });
     
-    let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    ptt_btn.add_controller(gesture);
+    
+    // Spacer
+    let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     spacer.set_vexpand(true);
     content_box.append(&spacer);
     content_box.append(&ptt_btn);
     
-    let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    main_box.append(&header_bar);
-    main_box.append(&content_box);
-    main_box.append(&settings_view);
+    clamp.set_child(Some(&content_box));
+    
+    // =========================================================================
+    // ViewStack for navigation
+    // =========================================================================
+    let stack = adw::ViewStack::new();
+    
+    // =========================================================================
+    // SETTINGS PAGE (no header bar - back via toggle button)
+    // =========================================================================
+    let settings_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    
+    let settings_clamp = adw::Clamp::builder()
+        .maximum_size(500)
+        .build();
+    
+    let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    
+    // Scroll view for settings
+    let settings_scroll = gtk::ScrolledWindow::new();
+    settings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    settings_scroll.set_hexpand(true);
+    settings_scroll.set_vexpand(true);
+    
+    let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 24);
+    settings_box.set_margin_top(12);
+    settings_box.set_margin_start(12);
+    settings_box.set_margin_end(12);
+    settings_box.set_margin_bottom(12);
+    
+    // === Squelch section ===
+    let squelch_group = adw::PreferencesGroup::builder()
+        .title("Squelch")
+        .build();
+    
+    let squelch_row = adw::ActionRow::new();
+    squelch_row.set_title("Squelch Level");
+    
+    let squelch_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 8.0, 1.0);
+    squelch_scale.set_value(saved_squelch as f64);
+    squelch_scale.set_inverted(true);
+    squelch_scale.set_draw_value(false);
+    squelch_scale.set_has_origin(true);
+    squelch_scale.set_hexpand(true);
+    
+    let squelch_value_label = gtk::Label::new(Some(&saved_squelch.to_string()));
+    squelch_value_label.set_width_request(20);
+    squelch_value_label.add_css_class("squelch-value");
+    
+    // Squelch callback
+    let radio_squelch = Arc::clone(radio);
+    let settings_clone = settings as *const SettingsManager as *mut SettingsManager;
+    let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(saved_squelch));
+    let squelch_label_clone = squelch_value_label.clone();
+    
+    squelch_scale.connect_value_changed(move |scale| {
+        let level = scale.value().round() as u8;
+        squelch_label_clone.set_text(&format!("{}", level));
+        
+        if level != last_sent.load(std::sync::atomic::Ordering::SeqCst) {
+            // Settings on main thread
+            unsafe {
+                (*settings_clone).set_squelch(level);
+            }
+            
+            // Radio on spawned thread
+            let radio_clone = radio_squelch.clone();
+            let sent = Arc::clone(&last_sent);
+            std::thread::spawn(move || {
+                if let Ok(r) = radio_clone.lock() {
+                    let _ = r.set_squelch(level);
+                }
+                sent.store(level, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+    });
+    
+    squelch_row.add_suffix(&squelch_scale);
+    squelch_row.add_suffix(&squelch_value_label);
+    squelch_row.set_activatable_widget(Some(&squelch_scale));
+    squelch_group.add(&squelch_row);
+    settings_box.append(&squelch_group);
+    
+    // === Audio Filters section ===
+    let filters_group = adw::PreferencesGroup::builder()
+        .title("Audio Filters")
+        .build();
+    
+    // Pre-emphasis
+    let pre_emph_row = adw::ActionRow::new();
+    pre_emph_row.set_title("Pre-emphasis (TX)");
+    let pre_emph_switch = gtk::Switch::new();
+    pre_emph_switch.set_valign(gtk::Align::Center);
+    pre_emph_switch.set_active(false);
+    pre_emph_row.add_suffix(&pre_emph_switch);
+    pre_emph_row.set_activatable_widget(Some(&pre_emph_switch));
+    
+    let radio_pre_emph = Arc::clone(radio);
+    pre_emph_switch.connect_state_set(move |_sw, state| {
+        unsafe { (*settings_clone).set_pre_emphasis(state); }
+        let radio_clone = radio_pre_emph.clone();
+        std::thread::spawn(move || {
+            if let Ok(r) = radio_clone.lock() {
+                let _ = r.set_filter_pre_emphasis(state);
+            }
+        });
+        glib::Propagation::Proceed
+    });
+    filters_group.add(&pre_emph_row);
+    
+    // De-emphasis
+    let de_emph_row = adw::ActionRow::new();
+    de_emph_row.set_title("De-emphasis (RX)");
+    let de_emph_switch = gtk::Switch::new();
+    de_emph_switch.set_valign(gtk::Align::Center);
+    de_emph_switch.set_active(false);
+    de_emph_row.add_suffix(&de_emph_switch);
+    de_emph_row.set_activatable_widget(Some(&de_emph_switch));
+    
+    let radio_de_emph = Arc::clone(radio);
+    de_emph_switch.connect_state_set(move |_sw, state| {
+        unsafe { (*settings_clone).set_de_emphasis(state); }
+        let radio_clone = radio_de_emph.clone();
+        std::thread::spawn(move || {
+            if let Ok(r) = radio_clone.lock() {
+                let _ = r.set_filter_de_emphasis(state);
+            }
+        });
+        glib::Propagation::Proceed
+    });
+    filters_group.add(&de_emph_row);
+    
+    // High-pass filter
+    let hp_row = adw::ActionRow::new();
+    hp_row.set_title("High-pass Filter");
+    let hp_switch = gtk::Switch::new();
+    hp_switch.set_valign(gtk::Align::Center);
+    hp_switch.set_active(true);
+    hp_row.add_suffix(&hp_switch);
+    hp_row.set_activatable_widget(Some(&hp_switch));
+    
+    let radio_hp = Arc::clone(radio);
+    hp_switch.connect_state_set(move |_sw, state| {
+        unsafe { (*settings_clone).set_high_pass_filter(state); }
+        let radio_clone = radio_hp.clone();
+        std::thread::spawn(move || {
+            if let Ok(r) = radio_clone.lock() {
+                let _ = r.set_filter_high_pass(state);
+            }
+        });
+        glib::Propagation::Proceed
+    });
+    filters_group.add(&hp_row);
+    
+    // Low-pass filter
+    let lp_row = adw::ActionRow::new();
+    lp_row.set_title("Low-pass Filter");
+    let lp_switch = gtk::Switch::new();
+    lp_switch.set_valign(gtk::Align::Center);
+    lp_switch.set_active(true);
+    lp_row.add_suffix(&lp_switch);
+    lp_row.set_activatable_widget(Some(&lp_switch));
+    
+    let radio_lp = Arc::clone(radio);
+    lp_switch.connect_state_set(move |_sw, state| {
+        unsafe { (*settings_clone).set_low_pass_filter(state); }
+        let radio_clone = radio_lp.clone();
+        std::thread::spawn(move || {
+            if let Ok(r) = radio_clone.lock() {
+                let _ = r.set_filter_low_pass(state);
+            }
+        });
+        glib::Propagation::Proceed
+    });
+    filters_group.add(&lp_row);
+    
+    settings_box.append(&filters_group);
+    
+    // === TX Power section ===
+    let tx_power_group = adw::PreferencesGroup::builder()
+        .title("TX Power")
+        .build();
+    
+    let tx_power_row = adw::ActionRow::new();
+    tx_power_row.set_title("TX Power Level");
+    
+    let tx_power_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    tx_power_box.add_css_class("linked");
+    tx_power_box.set_margin_top(6);
+    tx_power_box.set_margin_bottom(6);
+    
+    let btn_low = gtk::ToggleButton::with_label("Low");
+    let btn_high = gtk::ToggleButton::with_label("High");
+    btn_high.set_active(true);
+    
+    let radio_tx = Arc::clone(radio);
+    let radio_tx2 = Arc::clone(&radio_tx);
+    let btn_low_weak = btn_low.clone();
+    let btn_high_weak = btn_high.clone();
+    
+    btn_low.connect_clicked(move |_| {
+        btn_low_weak.set_active(true);
+        btn_high_weak.set_active(false);
+        let radio_clone = radio_tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(r) = radio_clone.lock() {
+                let _ = r.set_tx_power(false);
+            }
+        });
+    });
+    
+    let btn_low_weak2 = btn_low.clone();
+    let btn_high_weak2 = btn_high.clone();
+    
+    btn_high.connect_clicked(move |_| {
+        btn_low_weak2.set_active(false);
+        btn_high_weak2.set_active(true);
+        let radio_clone = radio_tx2.clone();
+        std::thread::spawn(move || {
+            if let Ok(r) = radio_clone.lock() {
+                let _ = r.set_tx_power(true);
+            }
+        });
+    });
+    
+    tx_power_box.append(&btn_low);
+    tx_power_box.append(&btn_high);
+    tx_power_row.add_suffix(&tx_power_box);
+    tx_power_row.set_activatable_widget(Some(&tx_power_box));
+    tx_power_group.add(&tx_power_row);
+    settings_box.append(&tx_power_group);
+    
+    // === Mic Gain section ===
+    let mic_group = adw::PreferencesGroup::builder()
+        .title("Mic Gain")
+        .build();
+    
+    let mic_row = adw::ActionRow::new();
+    mic_row.set_title("Mic Gain Boost");
+    let mic_dropdown_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    mic_dropdown_box.set_margin_top(6);
+    mic_dropdown_box.set_margin_bottom(6);
+    let mic_dropdown = gtk::DropDown::from_strings(&[
+        "None", "Low", "Med", "High",
+    ]);
+    mic_dropdown_box.append(&mic_dropdown);
+    mic_row.add_suffix(&mic_dropdown_box);
+    mic_row.set_activatable_widget(Some(&mic_dropdown_box));
+    
+    let radio_mic = Arc::clone(radio);
+    mic_dropdown.connect_selected_notify(move |dd| {
+        let idx = dd.selected();
+        let level = match idx {
+            0 => "none",
+            1 => "low", 
+            2 => "med",
+            _ => "high",
+        };
+        unsafe { (*settings_clone).set_mic_gain(level); }
+        let radio_clone = radio_mic.clone();
+        std::thread::spawn(move || {
+            if let Ok(r) = radio_clone.lock() {
+                let _ = r.set_mic_gain(level);
+            }
+        });
+    });
+    mic_group.add(&mic_row);
+    settings_box.append(&mic_group);
+    
+    // === Channels section ===
+    let channels_group = adw::PreferencesGroup::builder()
+        .title("Channels")
+        .build();
+    
+    // Import CSV row
+    let import_row = adw::ActionRow::new();
+    import_row.set_title("Import from CSV");
+    import_row.set_subtitle("Import channels from CHIRP CSV file");
+    
+    let import_icon = gtk::Image::from_icon_name("document-open-symbolic");
+    let import_btn = gtk::Button::new();
+    import_btn.set_child(Some(&import_icon));
+    import_btn.add_css_class("flat");
+    import_row.set_activatable_widget(Some(&import_btn));
+    import_row.add_suffix(&import_btn);
+    
+    // Export CSV row
+    let export_row = adw::ActionRow::new();
+    export_row.set_title("Export to CSV");
+    export_row.set_subtitle("Export channels to CHIRP CSV file");
+    
+    let export_icon = gtk::Image::from_icon_name("document-save-as-symbolic");
+    let export_btn = gtk::Button::new();
+    export_btn.set_child(Some(&export_icon));
+    export_btn.add_css_class("flat");
+    export_row.set_activatable_widget(Some(&export_btn));
+    export_row.add_suffix(&export_btn);
+    
+    let settings_for_import = settings_clone;
+    import_btn.connect_clicked(move |_| {
+        let dialog = gtk::FileChooserDialog::new(
+            Some("Import Channels from CSV"),
+            None::<&gtk::Window>,
+            gtk::FileChooserAction::Open,
+            &[
+                ("Cancel", gtk::ResponseType::Cancel),
+                ("Import", gtk::ResponseType::Accept),
+            ],
+        );
+        
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("CSV Files"));
+        filter.add_pattern("*.csv");
+        filter.add_mime_type("text/csv");
+        dialog.add_filter(&filter);
+        
+        let settings = settings_for_import;
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk::ResponseType::Accept {
+                if let Some(file) = dialog.file() {
+                    if let Some(path) = file.path() {
+                        eprintln!("[pocket-modem] Importing channels from: {:?}", path);
+                        let result = unsafe { (*settings).import_csv(&path) };
+                        match result {
+                            Ok(channels) => eprintln!("[pocket-modem] Imported {} channels", channels.len()),
+                            Err(e) => eprintln!("[pocket-modem] Import failed: {}", e),
+                        }
+                    }
+                }
+            }
+            dialog.close();
+        });
+        
+        dialog.show();
+    });
+    
+    let settings_for_export = settings_clone;
+    export_btn.connect_clicked(move |_| {
+        let dialog = gtk::FileChooserDialog::new(
+            Some("Export Channels to CSV"),
+            None::<&gtk::Window>,
+            gtk::FileChooserAction::Save,
+            &[
+                ("Cancel", gtk::ResponseType::Cancel),
+                ("Export", gtk::ResponseType::Accept),
+            ],
+        );
+        
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("CSV Files"));
+        filter.add_pattern("*.csv");
+        filter.add_mime_type("text/csv");
+        dialog.add_filter(&filter);
+        
+        dialog.set_current_name("pocket-modem-channels.csv");
+        
+        let settings = settings_for_export;
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk::ResponseType::Accept {
+                if let Some(file) = dialog.file() {
+                    if let Some(path) = file.path() {
+                        eprintln!("[pocket-modem] Exporting channels to: {:?}", path);
+                        let result = unsafe { (*settings).export_csv(&path) };
+                        match result {
+                            Ok(_) => eprintln!("[pocket-modem] Exported channels successfully"),
+                            Err(e) => eprintln!("[pocket-modem] Export failed: {}", e),
+                        }
+                    }
+                }
+            }
+            dialog.close();
+        });
+        
+        dialog.show();
+    });
+    
+    channels_group.add(&import_row);
+    channels_group.add(&export_row);
+    settings_box.append(&channels_group);
+    
+    // === Reset to Defaults ===
+    let reset_btn = gtk::Button::with_label("Reset to Defaults");
+    reset_btn.add_css_class("destructive-action");
+    reset_btn.set_margin_top(12);
+    
+    let settings_for_reset = settings_clone;
+    let squelch_scale_for_reset = squelch_scale.clone();
+    reset_btn.connect_clicked(move |_| {
+        unsafe {
+            (*settings_for_reset).reset_to_defaults();
+        }
+        squelch_scale_for_reset.set_value(4.0);
+        eprintln!("[pocket-modem] Settings reset to defaults");
+    });
+    settings_box.append(&reset_btn);
+    
+    settings_scroll.set_child(Some(&settings_box));
+    settings_content.append(&settings_scroll);
+    settings_clamp.set_child(Some(&settings_content));
+    settings_page.append(&settings_clamp);
+    
+    // =========================================================================
+    // Navigation - Connect settings button to ViewStack
+    // =========================================================================
+    stack.add_titled(&clamp, Some("main"), "Main");
+    stack.add_titled(&settings_page, Some("settings"), "Settings");
+    
+    let stack_for_toggle = stack.clone();
+    settings_btn.connect_toggled(move |btn| {
+        if btn.is_active() {
+            stack_for_toggle.set_visible_child_name("settings");
+        } else {
+            stack_for_toggle.set_visible_child_name("main");
+        }
+    });
+    
+    // =========================================================================
+    // Toast Overlay for notifications
+    // =========================================================================
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&stack));
     
     // Update loop for live status
     let radio_update = Arc::clone(radio);
@@ -876,9 +1091,19 @@ fn create_ui(
     let audio_label_clone = audio_label.clone();
     let gps_clone = Arc::clone(gps);
     let gps_led_clone = gps_led.clone();
-    let gps_location_clone = gps_location_label.clone();
     let ptt_label_update = ptt_label.clone();
     let settings_channels = settings as *const SettingsManager as *mut SettingsManager;
+    
+    // Bottom sheet labels
+    let modem_fw_label_clone = modem_fw_label.clone();
+    let modem_hw_label_clone = modem_hw_label.clone();
+    let modem_rf_label_clone = modem_rf_label.clone();
+    let gps_locator_label_clone = gps_locator_label.clone();
+    let gps_coords_label_clone = gps_coords_label.clone();
+    let gps_alt_label_clone = gps_alt_label.clone();
+    let gps_fix_label_clone = gps_fix_label.clone();
+    let gps_speed_label_clone = gps_speed_label.clone();
+    let gps_sats_label_clone = gps_sats_label.clone();
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if let Ok(r) = radio_update.lock() {
@@ -950,35 +1175,64 @@ fn create_ui(
             }
         }
 
-        // Update GPS status
+        // Update GPS status (LED only, no coordinates display)
         if let Ok(g) = gps_clone.lock() {
             let gps_data = g.get_data();
             if gps_data.has_fix {
                 gps_led_clone.set_text("●");
                 gps_led_clone.remove_css_class("gps-led-off");
                 gps_led_clone.add_css_class("gps-led-on");
-
-                if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
-                    let location = format!("{:.6}, {:.6}", lat, lon);
-                    gps_location_clone.set_text(&location);
-                    gps_location_clone.remove_css_class("gps-searching");
-                    gps_location_clone.add_css_class("gps-fixed");
-                }
             } else {
                 gps_led_clone.set_text("○");
                 gps_led_clone.remove_css_class("gps-led-on");
                 gps_led_clone.add_css_class("gps-led-off");
-                gps_location_clone.set_text("Searching...");
-                gps_location_clone.remove_css_class("gps-fixed");
-                gps_location_clone.add_css_class("gps-searching");
             }
         }
         
-        // Channel count is shown in settings via ActionRow subtitles
-        // This timer can be used for other periodic updates if needed
+        // Update MODEM bottom sheet
+        if let Ok(r) = radio_update.lock() {
+            let state = r.state();
+            if state.connected {
+                if let Some(version) = r.version() {
+                    modem_fw_label_clone.set_text(&format!("Firmware: v{}", version.firmware_version));
+                    modem_hw_label_clone.set_text(&format!("Hardware: KV4P HT"));
+                    modem_rf_label_clone.set_text(&format!("RF Module: {:?}", version.rf_module_type));
+                }
+            } else {
+                modem_fw_label_clone.set_text("Firmware: --");
+                modem_hw_label_clone.set_text("Hardware: --");
+                modem_rf_label_clone.set_text("RF Module: --");
+            }
+        }
+        
+        // Update GPS bottom sheet
+        if let Ok(g) = gps_clone.lock() {
+            let gps_data = g.get_data();
+            if gps_data.has_fix {
+                if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
+                    gps_locator_label_clone.set_text(&format!("Maidenhead: {}", maidenhead_locator(lat, lon)));
+                    gps_coords_label_clone.set_text(&format!("Coordinates: {:.6}, {:.6}", lat, lon));
+                }
+                if let Some(alt) = gps_data.altitude {
+                    gps_alt_label_clone.set_text(&format!("Altitude: {:.1} m", alt));
+                }
+                gps_fix_label_clone.set_text(&format!("Fix Type: {}", if gps_data.speed.is_some() { "3D Fix" } else { "2D Fix" }));
+                if let Some(speed) = gps_data.speed {
+                    gps_speed_label_clone.set_text(&format!("Speed: {:.1} km/h", speed));
+                }
+                gps_sats_label_clone.set_text(&format!("Satellites: {}", gps_data.satellites));
+            } else {
+                gps_locator_label_clone.set_text("Maidenhead: --");
+                gps_coords_label_clone.set_text("Coordinates: --");
+                gps_alt_label_clone.set_text("Altitude: --");
+                gps_fix_label_clone.set_text("Fix Type: No Fix");
+                gps_speed_label_clone.set_text("Speed: --");
+                gps_sats_label_clone.set_text("Satellites: --");
+            }
+        }
+        
         unsafe {
             let _count = (*settings_channels).channels().len();
-            // Channel count is displayed in the ActionRow subtitles dynamically
         }
         
         ptt_label_update.set_text("PTT");
@@ -986,28 +1240,30 @@ fn create_ui(
         glib::ControlFlow::Continue
     });
     
-    // CSS styling
-    let css_provider = gtk4::CssProvider::new();
+    // =========================================================================
+    // CSS Styling
+    // =========================================================================
+    let css_provider = gtk::CssProvider::new();
     css_provider.load_from_data(r#"
         .freq-display {
-            font-size: 56px;
+            font-size: 60px;
             font-family: "monospace";
             font-weight: bold;
             color: #FFB000;
             background: #1E1E1E;
-            border: 4px solid #444;
-            border-radius: 16px;
+            border: 3px solid #444;
+            border-radius: 12px;
             text-shadow: 0 0 8px rgba(255, 176, 0, 0.5);
-            box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.8);
+            box-shadow: inset 0 0 16px rgba(0, 0, 0, 0.8);
             caret-color: #FFB000;
         }
         .freq-display:focus {
             border-color: #FFB000;
         }
         .mode-btn {
-            font-size: 14px;
+            font-size: 13px;
             font-weight: bold;
-            padding: 8px 16px;
+            padding: 8px 12px;
             border-radius: 8px;
             background: #2a2a2a;
             border: 1px solid #444;
@@ -1020,44 +1276,47 @@ fn create_ui(
             background: #1a2a1a;
             border: 2px solid #33D17A;
             color: #33D17A;
-            box-shadow: 0 0 8px rgba(51, 209, 122, 0.3);
+            box-shadow: 0 0 6px rgba(51, 209, 122, 0.3);
         }
-        .status-icon-green { font-size: 16px; color: #33D17A; }
-        .status-icon-red { font-size: 16px; color: #ff4444; }
-        .status-text { font-size: 13px; color: #FFB000; font-weight: bold; }
-        .modem-label { color: #666; font-size: 13px; }
-        .gps-label { color: #666; font-size: 13px; }
-        .audio-label { color: #666; font-size: 13px; }
-        .gps-led-on { color: #33D17A; font-size: 16px; }
-        .gps-led-off { color: #666; font-size: 16px; }
-        .gps-location { font-size: 11px; font-family: monospace; color: #888; }
+        .status-icon-green { font-size: 14px; color: #33D17A; }
+        .status-icon-red { font-size: 14px; color: #ff4444; }
+        .dim-label { font-size: 12px; color: #888; }
+        .gps-led-on { color: #33D17A; font-size: 14px; }
+        .gps-led-off { color: #666; font-size: 14px; }
+        .gps-location { font-size: 10px; font-family: monospace; color: #888; }
         .gps-searching { color: #666; font-style: italic; }
         .gps-fixed { color: #33D17A; }
-        .status-icon-gray-empty { font-size: 16px; color: #666; }
-        .status-icon-gray-filled { font-size: 16px; color: #888; }
-        .signal-text { font-size: 12px; color: #666; font-weight: bold; }
-        .signal-value { font-size: 12px; font-weight: bold; }
-        .rssi-bar { background: #2a2a2a; border: 1px solid #444; border-radius: 6px; }
-        .rssi-bar > trough { background: #2a2a2a; border-radius: 6px; }
-        .rssi-bar > trough > progress { background: #FFB000; border-radius: 5px; }
-        .ptt-button { min-width: 100px; min-height: 110px; border-radius: 16px; background: #333; border: 2px solid #555; }
+        .status-icon-gray-empty { font-size: 14px; color: #666; }
+        .status-icon-gray-filled { font-size: 14px; color: #888; }
+        .modem-label { color: #666; font-size: 11px; }
+        .gps-label { color: #666; font-size: 11px; }
+        .audio-label { color: #666; font-size: 11px; }
+        .signal-text { font-size: 11px; color: #888; font-weight: bold; }
+        .signal-value { font-size: 11px; font-weight: bold; }
+        .rssi-bar { background: #2a2a2a; border: 1px solid #444; border-radius: 4px; }
+        .ptt-button { min-width: 90px; min-height: 100px; border-radius: 12px; background: #333; border: 2px solid #555; }
         .ptt-button:hover { background: #3a3a3a; border-color: #666; }
         .ptt-button:active { background: #444; border-color: #FFB000; }
         .ptt-icon { color: #888; }
         .ptt-button:hover .ptt-icon { color: #aaa; }
         .ptt-button:active .ptt-icon { color: #FFB000; }
-        .ptt-label { font-size: 12px; font-weight: bold; color: #888; }
+        .ptt-label { font-size: 11px; font-weight: bold; color: #888; }
         .ptt-button:hover .ptt-label { color: #aaa; }
         .ptt-button:active .ptt-label { color: #FFB000; }
-        .dim-label { font-size: 12px; color: #666; }
+        .squelch-value { font-size: 14px; font-weight: bold; color: #888; }
     "#);
     
-    gtk4::style_context_add_provider_for_display(
-        &gtk4::prelude::RootExt::display(&window),
+    gtk::style_context_add_provider_for_display(
+        &gtk::prelude::RootExt::display(&window),
         &css_provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION
     );
     
-    window.set_content(Some(&main_box));
+    // Main container with header bar
+    let main_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    main_container.append(&header_bar);
+    main_container.append(&toast_overlay);
+    
+    window.set_content(Some(&main_container));
     window.show();
 }
