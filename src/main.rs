@@ -14,7 +14,7 @@ mod settings;
 
 use audio::{AudioConfig, AudioManager};
 use gps::GpsManager;
-use settings::SettingsManager;
+use settings::{SettingsManager, Channel, Duplex, ToneMode, PowerLevel};
 
 use radio::{KV4PRadio, SerialConfig};
 
@@ -25,51 +25,59 @@ use adw::prelude::*;
 use adw;
 
 /// Calculate Maidenhead locator from lat/lon
-/// Based on the standard 6-character grid square
+/// Uses the standard Maidenhead Locator System algorithm:
+/// - Field: 18x18 grid (A-R), 18° lon x 9° lat
+/// - Square: 10x10 grid (0-9), 2° lon x 1° lat  
+/// - Subsquare: 24x24 grid (a-x), 5' lon x 2.5' lat
+/// 
+/// Reference: hamutils/maidenhead Python library
 fn maidenhead_locator(lat: f64, lon: f64) -> String {
     // Handle edge cases
     if lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 {
-        return "---".to_string();
+        return "-----".to_string();
     }
     
-    // Field (18x18 grid, A-R, 20° x 10°)
-    let mut lon_adj = lon;
-    let mut lat_adj = lat;
-    let mut negative_lon = false;
-    let mut negative_lat = false;
+    // Radix progression for 6-character precision:
+    // Field (18), Square (10), Subsquare (24), Square (10), Subsquare (24), Square (10)
+    let radix: [i32; 6] = [18, 10, 24, 10, 24, 10];
     
-    // Handle negative coordinates
-    if lon_adj < 0.0 {
-        lon_adj = 180.0 + lon_adj;
-        negative_lon = true;
+    // Calculate multiplier from all radix values
+    let multiplier: i64 = radix.iter().map(|&r| r as i64).product();
+    let half_multiplier = multiplier / 2;
+    
+    // Convert to integer representation
+    // int_lat = int((lat + 90) * multiplier) // (radix[0] * radix[1])
+    let int_lat = ((lat + 90.0) * multiplier as f64).round() as i64 
+                  / (radix[0] * radix[1]) as i64;
+    let int_lon = (((lon + 180.0).rem_euclid(360.0)) * half_multiplier as f64).round() as i64
+                  / (radix[0] * radix[1]) as i64;
+    
+    // Helper to convert integer to Maidenhead digits
+    fn convert(mut val: i64, radix: &[i32; 6]) -> [i32; 6] {
+        let mut result = [0i32; 6];
+        let mut idx = 5;
+        let mut remaining_radix: Vec<i32> = radix.to_vec();
+        
+        while !remaining_radix.is_empty() {
+            let r = remaining_radix.pop().unwrap();
+            let (p, q) = (val / r as i64, val % r as i64);
+            result[idx] = q as i32;
+            val = p;
+            if idx > 0 { idx -= 1; }
+        }
+        result
     }
-    if lat_adj < 0.0 {
-        lat_adj = 90.0 + lat_adj;
-        negative_lat = true;
-    }
     
-    // Field calculation
-    let field1 = (lon_adj / 20.0).floor() as i32;
-    let field2 = (lat_adj / 10.0).floor() as i32;
+    let lat_digits = convert(int_lat, &radix);
+    let lon_digits = convert(int_lon, &radix);
     
-    // Square (10x10 grid, 2° x 1°)
-    let rem1 = (lon_adj % 20.0) / 2.0;
-    let rem2 = (lat_adj % 10.0) / 1.0;
-    let sq_lon = rem1.floor() as i32;
-    let sq_lat = rem2.floor() as i32;
-    
-    // Subsquare (24x24 grid, 5' x 2.5')
-    let rem1b = (rem1 % 1.0) * 60.0 / 5.0;
-    let rem2b = (rem2 % 1.0) * 60.0 / 2.5;
-    let sub_lon = rem1b.floor() as i32;
-    let sub_lat = rem2b.floor() as i32;
-    
-    let c1 = (b'A' + (field1 % 18) as u8) as char;
-    let c2 = (b'A' + (field2 % 18) as u8) as char;
-    let c3 = (b'0' + (sq_lon % 10) as u8) as char;
-    let c4 = (b'0' + (sq_lat % 10) as u8) as char;
-    let c5 = (b'a' + (sub_lon % 24) as u8) as char;
-    let c6 = (b'a' + (sub_lat % 24) as u8) as char;
+    // Build Maidenhead string
+    let c1 = (b'A' + (lon_digits[0] % 18) as u8) as char;  // Field lon: A-R
+    let c2 = (b'A' + (lat_digits[0] % 18) as u8) as char;  // Field lat: A-R
+    let c3 = (b'0' + (lon_digits[1] % 10) as u8) as char;  // Square lon: 0-9
+    let c4 = (b'0' + (lat_digits[1] % 10) as u8) as char;  // Square lat: 0-9
+    let c5 = (b'a' + (lon_digits[2] % 24) as u8) as char;  // Subsquare lon: a-x
+    let c6 = (b'a' + (lat_digits[2] % 24) as u8) as char;  // Subsquare lat: a-x
     
     format!("{}{}{}{}{}{}", c1, c2, c3, c4, c5, c6)
 }
@@ -112,9 +120,9 @@ fn main() {
     // Create GPS manager
     let gps_manager = Arc::new(Mutex::new(GpsManager::new()));
     {
-        let _ = GpsManager::enable_gps_location();
         let gps = gps_manager.lock().unwrap();
         gps.start();
+        // GPS auto-detection and enabling happens in the thread
     }
 
     // Create audio manager with KV4P settings
@@ -369,12 +377,12 @@ fn create_ui(
     let gps_close_btn = gtk::Button::with_label("Close");
     gps_close_btn.set_halign(gtk::Align::Center);
     gps_sheet.append(&gps_title);
+    gps_sheet.append(&gps_fix_label);
+    gps_sheet.append(&gps_sats_label);
     gps_sheet.append(&gps_locator_label);
     gps_sheet.append(&gps_coords_label);
     gps_sheet.append(&gps_alt_label);
-    gps_sheet.append(&gps_fix_label);
     gps_sheet.append(&gps_speed_label);
-    gps_sheet.append(&gps_sats_label);
     gps_sheet.append(&gps_close_btn);
     
     // Audio status (clickable)
@@ -570,16 +578,77 @@ fn create_ui(
     mode_box.append(&btn_m17);
     content_box.append(&mode_box);
     
-    // --- Channel list (placeholder) ---
+    // --- Channel list ---
     let channel_group = adw::PreferencesGroup::builder()
         .title("Channels")
         .build();
     
+    // "No channels" placeholder row
     let no_channels_row = adw::ActionRow::builder()
-        .title("No channels configured")
+        .title("No channels")
+        .subtitle("Tap + to add current frequency")
         .build();
     no_channels_row.set_sensitive(false);
+    
+    // Show/hide based on channel count
+    let channel_count = unsafe { (*(settings as *const SettingsManager as *mut SettingsManager)).channels().len() };
+    no_channels_row.set_visible(channel_count == 0);
+    
+    // Add button to create new channel
+    let add_channel_btn = gtk::Button::new();
+    add_channel_btn.set_icon_name("list-add-symbolic");
+    add_channel_btn.add_css_class("flat");
+    add_channel_btn.set_tooltip_text(Some("Add current frequency as new channel"));
+    
+    // Clone for callback
+    let settings_add = settings as *const SettingsManager as *mut SettingsManager;
+    let radio_for_add = Arc::clone(&radio);
+    let no_channels_row_clone = no_channels_row.clone();
+    
+    add_channel_btn.connect_clicked(move |_| {
+        unsafe {
+            let freq = {
+                if let Ok(r) = radio_for_add.lock() {
+                    r.state().frequency
+                } else {
+                    145500  // Default
+                }
+            };
+            
+            // Find next available location number
+            let existing = (*settings_add).channels();
+            let next_location = if existing.is_empty() {
+                1
+            } else {
+                existing.iter().map(|c| c.location).max().unwrap_or(0) + 1
+            };
+            
+            // Create new channel with current frequency
+            let new_channel = Channel {
+                location: next_location,
+                name: format!("CH{}", next_location),
+                rx_freq_khz: freq,
+                duplex: Duplex::Simplex,
+                offset_khz: 0,
+                tx_freq_khz: None,
+                tone_mode: ToneMode::None,
+                rtone_hz: 88.5,
+                ctone_hz: 88.5,
+                mode: "FM".to_string(),
+                power: PowerLevel::High,
+                comment: String::new(),
+            };
+            
+            (*settings_add).add_channel(new_channel);
+            eprintln!("[pocket-modem] Added channel: location={}, freq={} kHz", next_location, freq);
+            
+            // Hide "No channels" message
+            no_channels_row_clone.set_visible(false);
+        }
+    });
+    
     channel_group.add(&no_channels_row);
+    channel_group.add(&add_channel_btn);
     content_box.append(&channel_group);
     
     // --- PTT Button ---
@@ -700,7 +769,8 @@ fn create_ui(
     
     let squelch_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 8.0, 1.0);
     squelch_scale.set_value(saved_squelch as f64);
-    squelch_scale.set_inverted(true);
+    // Note: lower values = more permissive (opens easier), higher = stricter
+    // Default is 4 (mid-range)
     squelch_scale.set_draw_value(false);
     squelch_scale.set_has_origin(true);
     squelch_scale.set_hexpand(true);
@@ -1178,13 +1248,24 @@ fn create_ui(
         // Update GPS status (LED only, no coordinates display)
         if let Ok(g) = gps_clone.lock() {
             let gps_data = g.get_data();
+            
+            // Three states: GPS disabled (gray), enabled but no fix (yellow), has fix (green)
             if gps_data.has_fix {
                 gps_led_clone.set_text("●");
                 gps_led_clone.remove_css_class("gps-led-off");
+                gps_led_clone.remove_css_class("gps-led-searching");
                 gps_led_clone.add_css_class("gps-led-on");
-            } else {
-                gps_led_clone.set_text("○");
+            } else if gps_data.gps_enabled {
+                // GPS enabled but no fix yet - use same circle, different color
+                gps_led_clone.set_text("●");
+                gps_led_clone.remove_css_class("gps-led-off");
                 gps_led_clone.remove_css_class("gps-led-on");
+                gps_led_clone.add_css_class("gps-led-searching");
+            } else {
+                // GPS not enabled or not detected
+                gps_led_clone.set_text("●");
+                gps_led_clone.remove_css_class("gps-led-on");
+                gps_led_clone.remove_css_class("gps-led-searching");
                 gps_led_clone.add_css_class("gps-led-off");
             }
         }
@@ -1208,26 +1289,38 @@ fn create_ui(
         // Update GPS bottom sheet
         if let Ok(g) = gps_clone.lock() {
             let gps_data = g.get_data();
-            if gps_data.has_fix {
-                if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
-                    gps_locator_label_clone.set_text(&format!("Maidenhead: {}", maidenhead_locator(lat, lon)));
-                    gps_coords_label_clone.set_text(&format!("Coordinates: {:.6}, {:.6}", lat, lon));
+            
+            if gps_data.gps_enabled {
+                if gps_data.has_fix {
+                    gps_fix_label_clone.set_text(&format!("Fix Type: {}", if gps_data.speed.is_some() { "3D Fix" } else { "2D Fix" }));
+                    gps_sats_label_clone.set_text(&format!("Satellites: {}", gps_data.satellites));
+                    if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
+                        gps_locator_label_clone.set_text(&format!("Maidenhead: {}", maidenhead_locator(lat, lon)));
+                        gps_coords_label_clone.set_text(&format!("Coordinates: {:.6}, {:.6}", lat, lon));
+                    }
+                    if let Some(alt) = gps_data.altitude {
+                        gps_alt_label_clone.set_text(&format!("Altitude: {:.1} m", alt));
+                    }
+                    if let Some(speed) = gps_data.speed {
+                        gps_speed_label_clone.set_text(&format!("Speed: {:.1} km/h", speed));
+                    }
+                } else {
+                    // GPS enabled but no fix yet
+                    gps_fix_label_clone.set_text("Fix Type: No Fix");
+                    gps_sats_label_clone.set_text(&format!("Satellites: {}", gps_data.satellites));
+                    gps_locator_label_clone.set_text("Maidenhead: --");
+                    gps_coords_label_clone.set_text("Coordinates: --");
+                    gps_alt_label_clone.set_text("Altitude: --");
+                    gps_speed_label_clone.set_text("Speed: --");
                 }
-                if let Some(alt) = gps_data.altitude {
-                    gps_alt_label_clone.set_text(&format!("Altitude: {:.1} m", alt));
-                }
-                gps_fix_label_clone.set_text(&format!("Fix Type: {}", if gps_data.speed.is_some() { "3D Fix" } else { "2D Fix" }));
-                if let Some(speed) = gps_data.speed {
-                    gps_speed_label_clone.set_text(&format!("Speed: {:.1} km/h", speed));
-                }
-                gps_sats_label_clone.set_text(&format!("Satellites: {}", gps_data.satellites));
             } else {
+                // GPS not enabled or not detected
+                gps_fix_label_clone.set_text("Fix Type: No GPS");
+                gps_sats_label_clone.set_text("Satellites: --");
                 gps_locator_label_clone.set_text("Maidenhead: --");
                 gps_coords_label_clone.set_text("Coordinates: --");
                 gps_alt_label_clone.set_text("Altitude: --");
-                gps_fix_label_clone.set_text("Fix Type: No Fix");
                 gps_speed_label_clone.set_text("Speed: --");
-                gps_sats_label_clone.set_text("Satellites: --");
             }
         }
         
@@ -1283,6 +1376,7 @@ fn create_ui(
         .dim-label { font-size: 12px; color: #888; }
         .gps-led-on { color: #33D17A; font-size: 14px; }
         .gps-led-off { color: #666; font-size: 14px; }
+        .gps-led-searching { color: #FFB000; font-size: 14px; }
         .gps-location { font-size: 10px; font-family: monospace; color: #888; }
         .gps-searching { color: #666; font-style: italic; }
         .gps-fixed { color: #33D17A; }
