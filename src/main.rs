@@ -721,11 +721,16 @@ fn create_ui(
             let radio = radio_for_click.clone();
             let settings = settings_for_channel;
             let ch_freq = channel.rx_freq_khz;
+            let ch_tone_mode = match channel.tone_mode {
+                ToneMode::None => 0,
+                ToneMode::Tone => 1,
+                ToneMode::Tsql => 2,
+            };
             let ch_ctone = channel.ctone_hz;  // TX CTCSS
             let ch_rtone = channel.rtone_hz;  // RX CTCSS
             click.connect_pressed(move |_, _, _, _| {
-                eprintln!("[pocket-modem] Selecting channel: {} MHz, ctcss_tx={}, ctcss_rx={}", 
-                          ch_freq as f64 / 1000.0, ch_ctone, ch_rtone);
+                eprintln!("[pocket-modem] Selecting channel: {} MHz, tone_mode={}, ctcss_tx={}, ctcss_rx={}", 
+                          ch_freq as f64 / 1000.0, ch_tone_mode, ch_ctone, ch_rtone);
                 
                 // Update freq entry UI on main thread
                 freq_entry.set_text(&format!("{}.{:03}", ch_freq / 1000, ch_freq % 1000));
@@ -737,7 +742,7 @@ fn create_ui(
                 let r = radio.clone();
                 std::thread::spawn(move || {
                     if let Ok(r) = r.lock() {
-                        let _ = r.set_frequency_with_ctcss(ch_freq, ch_ctone, ch_rtone);
+                        let _ = r.set_frequency_with_ctcss(ch_freq, ch_tone_mode, ch_ctone, ch_rtone);
                     }
                 });
             });

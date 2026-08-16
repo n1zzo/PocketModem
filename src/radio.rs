@@ -313,24 +313,40 @@ impl KV4PRadio {
 
     /// Set frequency with optional CTCSS settings from channel
     /// 
-    /// If ctone_tx > 0 and/or ctone_rx > 0, the CTCSS codes will be set.
-    /// ctone_tx=0 or ctone_rx=0 means no CTCSS for that direction.
-    pub fn set_frequency_with_ctcss(&self, khz: u32, ctone_tx: f32, ctone_rx: f32) -> Result<(), String> {
-        // Convert Hz to CTCSS codes if tones are specified
-        if ctone_tx > 0.0 {
-            let code = Self::ctcss_hz_to_code(ctone_tx);
-            self.state.firmware_ctcss_tx.store(code, Ordering::SeqCst);
-            eprintln!("[radio] CTCSS TX: {} Hz -> code {}", ctone_tx, code);
-        } else {
-            self.state.firmware_ctcss_tx.store(0, Ordering::SeqCst);
-        }
-        
-        if ctone_rx > 0.0 {
-            let code = Self::ctcss_hz_to_code(ctone_rx);
-            self.state.firmware_ctcss_rx.store(code, Ordering::SeqCst);
-            eprintln!("[radio] CTCSS RX: {} Hz -> code {}", ctone_rx, code);
-        } else {
-            self.state.firmware_ctcss_rx.store(0, Ordering::SeqCst);
+    /// tone_mode: 0 = None, 1 = Tone (TX only), 2 = Tsql (TX + RX)
+    /// 
+    /// For Tone mode: applies ctone_tx CTCSS on transmit
+    /// For Tsql mode: applies ctone_tx on TX, ctone_rx on RX
+    pub fn set_frequency_with_ctcss(&self, khz: u32, tone_mode: u8, ctone_tx: f32, ctone_rx: f32) -> Result<(), String> {
+        match tone_mode {
+            1 => {
+                // Tone mode - TX CTCSS only
+                if ctone_tx > 0.0 {
+                    let code = Self::ctcss_hz_to_code(ctone_tx);
+                    self.state.firmware_ctcss_tx.store(code, Ordering::SeqCst);
+                    self.state.firmware_ctcss_rx.store(0, Ordering::SeqCst);
+                    eprintln!("[radio] CTCSS: Tone mode, TX {} Hz -> code {}", ctone_tx, code);
+                } else {
+                    self.state.firmware_ctcss_tx.store(0, Ordering::SeqCst);
+                    self.state.firmware_ctcss_rx.store(0, Ordering::SeqCst);
+                    eprintln!("[radio] CTCSS: Tone mode but TX freq=0, disabled");
+                }
+            }
+            2 => {
+                // Tsql mode - TX and RX CTCSS
+                let tx_code = if ctone_tx > 0.0 { Self::ctcss_hz_to_code(ctone_tx) } else { 0 };
+                let rx_code = if ctone_rx > 0.0 { Self::ctcss_hz_to_code(ctone_rx) } else { 0 };
+                self.state.firmware_ctcss_tx.store(tx_code, Ordering::SeqCst);
+                self.state.firmware_ctcss_rx.store(rx_code, Ordering::SeqCst);
+                eprintln!("[radio] CTCSS: TSQL mode, TX {} -> code {}, RX {} -> code {}", 
+                          ctone_tx, tx_code, ctone_rx, rx_code);
+            }
+            _ => {
+                // None mode - no CTCSS
+                self.state.firmware_ctcss_tx.store(0, Ordering::SeqCst);
+                self.state.firmware_ctcss_rx.store(0, Ordering::SeqCst);
+                eprintln!("[radio] CTCSS: disabled (tone_mode={})", tone_mode);
+            }
         }
         
         let squelch = self.state.current_squelch.load(Ordering::SeqCst);
