@@ -197,7 +197,7 @@ fn create_ui(
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .default_width(360)
-        .default_height(720)
+        .default_height(800)
         .title("PocketModem")
         .build();
     window.set_size_request(360, -1);
@@ -521,6 +521,12 @@ fn create_ui(
     });
     content_box.append(&freq_entry);
     
+    // Clone freq_entry for use in callbacks (before closures move it)
+    let freq_entry_for_channel_click = freq_entry.clone();
+    let freq_entry_for_add = freq_entry.clone();
+    let freq_entry_for_ptt_press = freq_entry.clone();
+    let freq_entry_for_ptt_release = freq_entry.clone();
+    
     // --- RSSI / S-meter ---
     let rssi_sbar = gtk::ProgressBar::new();
     rssi_sbar.set_fraction(0.0);
@@ -579,11 +585,41 @@ fn create_ui(
     content_box.append(&mode_box);
     
     // --- Channel list ---
-    let channel_group = adw::PreferencesGroup::builder()
-        .title("Channels")
-        .build();
+    // Create a custom container for channels with title + add button header
+    let channel_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    channel_container.set_margin_start(16);
+    channel_container.set_margin_end(16);
+    channel_container.set_margin_top(8);
     
-    // "No channels" placeholder row
+    // Header row with "Channels" title and + button
+    let channel_header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    channel_header.set_valign(gtk::Align::Center);
+    channel_header.set_margin_bottom(8);
+    
+    let channel_title = gtk::Label::new(Some("<b>Channels</b>"));
+    channel_title.set_markup("<b>Channels</b>");
+    channel_title.set_halign(gtk::Align::Start);
+    channel_title.add_css_class("channel-section-title");
+    
+    // Spacer to push button to right
+    let channel_header_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    channel_header_spacer.set_hexpand(true);
+    
+    // Add button aligned to right
+    let add_channel_btn = gtk::Button::new();
+    add_channel_btn.set_icon_name("list-add-symbolic");
+    add_channel_btn.add_css_class("flat");
+    add_channel_btn.set_tooltip_text(Some("Add current frequency as new channel"));
+    
+    channel_header.append(&channel_title);
+    channel_header.append(&channel_header_spacer);
+    channel_header.append(&add_channel_btn);
+    
+    // Channel list container (where channel rows will be added)
+    let channel_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    channel_list.add_css_class("channel-list");
+    
+    // "No channels" placeholder
     let no_channels_row = adw::ActionRow::builder()
         .title("No channels")
         .subtitle("Tap + to add current frequency")
@@ -593,17 +629,211 @@ fn create_ui(
     // Show/hide based on channel count
     let channel_count = unsafe { (*(settings as *const SettingsManager as *mut SettingsManager)).channels().len() };
     no_channels_row.set_visible(channel_count == 0);
+    channel_list.append(&no_channels_row);
     
-    // Add button to create new channel
-    let add_channel_btn = gtk::Button::new();
-    add_channel_btn.set_icon_name("list-add-symbolic");
-    add_channel_btn.add_css_class("flat");
-    add_channel_btn.set_tooltip_text(Some("Add current frequency as new channel"));
+    // Function to refresh channel list - takes Arc-wrapped Box, cloned ActionRow
+    fn refresh_channel_list(
+        channel_list: &Arc<gtk::Box>,
+        no_channels_row: &adw::ActionRow,
+        settings: *mut SettingsManager,
+        radio: &Arc<Mutex<KV4PRadio>>,
+        freq_entry: gtk::Entry,
+    ) {
+        unsafe {
+            let channels = (*settings).channels();
+            
+            // Clear existing rows (keep "No channels" placeholder)
+            while let Some(child) = channel_list.first_child() {
+                channel_list.remove(&child);
+            }
+            
+            // Show/hide "No channels" placeholder
+            no_channels_row.set_visible(channels.is_empty());
+            channel_list.append(no_channels_row);
+            
+            // Add channel rows
+            for (idx, ch) in channels.iter().enumerate() {
+                let row = create_channel_row(
+                    ch,
+                    idx,
+                    settings,
+                    channel_list.clone(),
+                    no_channels_row.clone(),
+                    radio.clone(),
+                    freq_entry.clone(),
+                    settings,
+                );
+                channel_list.append(&row);
+            }
+            channel_list.show();
+        }
+    }
     
-    // Clone for callback
+    // Function to create a channel row with edit button
+    fn create_channel_row(
+        channel: &Channel,
+        channel_index: usize,
+        settings: *mut SettingsManager,
+        channel_list: Arc<gtk::Box>,
+        no_channels_row: adw::ActionRow,
+        radio: Arc<Mutex<KV4PRadio>>,
+        freq_entry: gtk::Entry,
+        settings_for_channel: *mut SettingsManager,
+    ) -> gtk::Box {
+        let freq_mhz = channel.rx_freq_khz as f64 / 1000.0;
+        
+        // Container for the row with edit button
+        let row_container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row_container.set_valign(gtk::Align::Center);
+        row_container.add_css_class("channel-row");
+        row_container.set_hexpand(true);
+        
+        // Action row for channel - takes remaining space
+        let row = adw::ActionRow::builder()
+            .title(&channel.name)
+            .subtitle(&format!("{:.3} MHz", freq_mhz))
+            .build();
+        row.set_hexpand(true);
+        
+        // Spacer to push edit button to the right
+        let row_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row_spacer.set_hexpand(true);
+        
+        // Edit button
+        let edit_btn = gtk::Button::new();
+        edit_btn.set_icon_name("document-edit-symbolic");
+        edit_btn.add_css_class("flat");
+        edit_btn.set_tooltip_text(Some("Edit channel"));
+        
+        let channel_freq = channel.rx_freq_khz;
+        let radio_for_click = Arc::clone(&radio);
+        let freq_entry_for_row = freq_entry.clone();
+        
+        // Handle click on the row
+        row.add_controller({
+            let click = gtk::GestureClick::new();
+            click.set_button(1);
+            let freq_entry = freq_entry_for_row.clone();
+            let radio = radio_for_click.clone();
+            let settings = settings_for_channel;
+            let ch_freq = channel.rx_freq_khz;
+            click.connect_pressed(move |_, _, _, _| {
+                eprintln!("[pocket-modem] Selecting channel: {} MHz", ch_freq as f64 / 1000.0);
+                
+                // Update freq entry UI on main thread
+                freq_entry.set_text(&format!("{}.{:03}", ch_freq / 1000, ch_freq % 1000));
+                
+                // Save to settings
+                unsafe { (*settings).set_frequency(ch_freq); }
+                
+                // Tune radio
+                let r = radio.clone();
+                std::thread::spawn(move || {
+                    if let Ok(r) = r.lock() {
+                        let _ = r.set_frequency(ch_freq);
+                    }
+                });
+            });
+            click
+        });
+        
+        // Edit button callback - show edit dialog
+        let edit_channel = channel.clone();
+        let settings_edit = settings;
+        let radio_for_edit = Arc::clone(&radio);
+        
+        edit_btn.connect_clicked(move |btn| {
+            // Clone for each callback
+            let ch_list_save = channel_list.clone();
+            let no_ch_save = no_channels_row.clone();
+            let radio_save = radio_for_edit.clone();
+            let freq_save = freq_entry.clone();
+            
+            let ch_list_delete = channel_list.clone();
+            let no_ch_delete = no_channels_row.clone();
+            let radio_delete = radio_for_edit.clone();
+            let freq_delete = freq_entry.clone();
+            
+            // Show a simple edit dialog with FnOnce callbacks
+            show_channel_edit_dialog(
+                btn,
+                &edit_channel,
+                move |updated| {
+                    // Update channel in settings
+                    unsafe {
+                        (*settings_edit).update_channel(channel_index, updated.clone());
+                        eprintln!("[pocket-modem] Updated channel: {}", updated.name);
+                    }
+                    
+                    // Refresh the channel list
+                    refresh_channel_list(
+                        &ch_list_save,
+                        &no_ch_save,
+                        settings_edit,
+                        &radio_save,
+                        freq_save,
+                    );
+                },
+                move || {
+                    // Delete callback
+                    unsafe {
+                        (*settings_edit).delete_channel(channel_index);
+                        eprintln!("[pocket-modem] Deleted channel at index {}", channel_index);
+                    }
+                    
+                    // Refresh the channel list
+                    refresh_channel_list(
+                        &ch_list_delete,
+                        &no_ch_delete,
+                        settings_edit,
+                        &radio_delete,
+                        freq_delete,
+                    );
+                },
+            );
+        });
+        
+        row_container.append(&row);
+        row_container.append(&row_spacer);
+        row_container.append(&edit_btn);
+        row_container
+    }
+    
+    // Wrap in Arc for ownership
+    let channel_list_arc = Arc::new(channel_list);
+    let no_channels_row_arc = Arc::new(no_channels_row);
+    
+    // Clone everything needed for the add callback
     let settings_add = settings as *const SettingsManager as *mut SettingsManager;
     let radio_for_add = Arc::clone(&radio);
-    let no_channels_row_clone = no_channels_row.clone();
+    let radio_for_list = Arc::clone(&radio);
+    let freq_entry_for_load = freq_entry.clone();
+    
+    // Load existing channels into the UI
+    unsafe {
+        let existing_channels = (*settings_add).channels();
+        for (idx, ch) in existing_channels.iter().enumerate() {
+            let row = create_channel_row(
+                ch,
+                idx,
+                settings_add,
+                channel_list_arc.clone(),
+                (*no_channels_row_arc).clone(),
+                radio_for_list.clone(),
+                freq_entry_for_load.clone(),
+                settings_add,
+            );
+            channel_list_arc.append(&row);
+        }
+        // Hide "No channels" if we have channels
+        if !(*settings_add).channels().is_empty() {
+            no_channels_row_arc.set_visible(false);
+        }
+    }
+    
+    // Add button callback
+    let channel_list_add = channel_list_arc.clone();
+    let no_channels_row_add = (*no_channels_row_arc).clone();
     
     add_channel_btn.connect_clicked(move |_| {
         unsafe {
@@ -639,17 +869,43 @@ fn create_ui(
                 comment: String::new(),
             };
             
-            (*settings_add).add_channel(new_channel);
+            // Add to settings
+            (*settings_add).add_channel(new_channel.clone());
+            let new_index = (*settings_add).channels().len() - 1;
             eprintln!("[pocket-modem] Added channel: location={}, freq={} kHz", next_location, freq);
             
             // Hide "No channels" message
-            no_channels_row_clone.set_visible(false);
+            no_channels_row_add.set_visible(false);
+            
+            // Create and append a UI row for the new channel
+            let row = create_channel_row(
+                &new_channel,
+                new_index,
+                settings_add,
+                channel_list_add.clone(),
+                no_channels_row_add.clone(),
+                radio_for_add.clone(),
+                freq_entry.clone(),
+                settings_add,
+            );
+            channel_list_add.append(&row);
+            channel_list_add.show();
         }
     });
     
-    channel_group.add(&no_channels_row);
-    channel_group.add(&add_channel_btn);
-    content_box.append(&channel_group);
+    // Put channel list in a scrolled window
+    let channel_scroll = gtk::ScrolledWindow::new();
+    channel_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    channel_scroll.set_hexpand(true);
+    channel_scroll.set_vexpand(true);  // Takes all available space before PTT
+    channel_scroll.set_min_content_height(80);
+    // Max height ensures PTT button is always visible
+    channel_scroll.set_max_content_height(1000);
+    channel_scroll.set_child(Some(&*channel_list_arc));
+    
+    channel_container.append(&channel_header);
+    channel_container.append(&channel_scroll);
+    content_box.append(&channel_container);
     
     // --- PTT Button ---
     let ptt_btn = gtk::Button::new();
@@ -678,7 +934,7 @@ fn create_ui(
     ptt_btn.set_hexpand(false);
     ptt_btn.set_margin_start(20);
     ptt_btn.set_margin_end(20);
-    ptt_btn.set_margin_bottom(24);
+    ptt_btn.set_margin_bottom(8);
     ptt_btn.set_valign(gtk::Align::End);
     
     // PTT using GestureClick
@@ -686,6 +942,7 @@ fn create_ui(
     let audio_pressed = Arc::clone(audio);
     let radio_released = Arc::clone(radio);
     let audio_released = Arc::clone(audio);
+    let settings_for_ptt = settings as *const SettingsManager as *mut SettingsManager;
     
     let gesture = gtk::GestureClick::new();
     gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -695,9 +952,38 @@ fn create_ui(
         let r = radio_pressed.clone();
         let a = audio_pressed.clone();
         let label = ptt_label.clone();
+        let freq_entry = freq_entry_for_ptt_press.clone();
+        let settings = settings_for_ptt;
         move |_gesture, _n_press, _x, _y| {
             label.set_text("TX");
+            
+            // Get current RX frequency and calculate TX frequency based on duplex
+            let (tx_freq, rx_freq) = unsafe {
+                let rx_freq = (*settings).frequency();
+                let channels = (*settings).channels();
+                
+                // Find if current frequency matches a channel
+                let tx_freq = if let Some(ch) = channels.iter().find(|c| c.rx_freq_khz == rx_freq) {
+                    match ch.duplex {
+                        Duplex::Simplex => rx_freq,
+                        Duplex::Plus => rx_freq + ch.offset_khz,
+                        Duplex::Minus => rx_freq.saturating_sub(ch.offset_khz),
+                        Duplex::Split => ch.tx_freq_khz.unwrap_or(rx_freq),
+                    }
+                } else {
+                    // Default: simplex (no offset)
+                    rx_freq
+                };
+                (tx_freq, rx_freq)
+            };
+            
+            // Update VFO to show TX frequency (red)
+            freq_entry.set_text(&format!("{}.{:03}", tx_freq / 1000, tx_freq % 1000));
+            freq_entry.add_css_class("tx-frequency");
+            
+            // Tune radio to TX frequency and PTT on
             if let Ok(mut rad) = r.lock() {
+                let _ = rad.set_frequency(tx_freq);
                 let _ = rad.ptt_on();
             }
             if let Ok(mut aud) = a.lock() {
@@ -710,23 +996,45 @@ fn create_ui(
         let r = radio_released.clone();
         let a = audio_released.clone();
         let label = ptt_label.clone();
+        let freq_entry = freq_entry_for_ptt_release.clone();
+        let settings = settings_for_ptt;
         move |_gesture, _n_press, _x, _y| {
             if let Ok(mut aud) = a.lock() {
                 let _ = aud.stop_capture();
             }
+            
+            // Get RX frequency for restoration
+            let rx_freq = unsafe { (*settings).frequency() };
+            
+            // PTT off
             if let Ok(mut rad) = r.lock() {
                 let _ = rad.ptt_off();
             }
+            
+            // Restore VFO to RX frequency (normal color)
+            freq_entry.remove_css_class("tx-frequency");
+            freq_entry.set_text(&format!("{}.{:03}", rx_freq / 1000, rx_freq % 1000));
+            
+            // Tune radio back to RX frequency
+            let rad = r.clone();
+            std::thread::spawn(move || {
+                if let Ok(rad) = rad.lock() {
+                    let _ = rad.set_frequency(rx_freq);
+                }
+            });
+            
             label.set_text("PTT");
         }
     });
     
     ptt_btn.add_controller(gesture);
     
-    // Spacer
-    let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    spacer.set_vexpand(true);
-    content_box.append(&spacer);
+    // Small margin above PTT
+    let ptt_spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    ptt_spacer.set_vexpand(false);
+    ptt_spacer.set_size_request(-1, 8);
+    
+    content_box.append(&ptt_spacer);
     content_box.append(&ptt_btn);
     
     clamp.set_child(Some(&content_box));
@@ -1334,6 +1642,208 @@ fn create_ui(
     });
     
     // =========================================================================
+    // Channel Edit Dialog
+    // =========================================================================
+    fn show_channel_edit_dialog<F, D>(
+        parent: &gtk::Button,
+        channel: &Channel,
+        on_save: F,
+        on_delete: D,
+    )
+    where
+        F: FnOnce(Channel) + 'static,
+        D: FnOnce() + 'static,
+    {
+        // Create dialog window using gtk::Dialog (not libadwaita)
+        let dialog = gtk::Dialog::with_buttons(
+            Some(&format!("Edit Channel: {}", channel.name)),
+            parent.root().and_then(|r| r.downcast::<gtk::Window>().ok()).as_ref(),
+            gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+            &[("Cancel", gtk::ResponseType::Cancel), ("Save", gtk::ResponseType::Accept)],
+        );
+        
+        // Content box
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(12);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_bottom(12);
+        
+        // Name field
+        let name_row = adw::ActionRow::new();
+        name_row.set_title("Name");
+        let name_entry = gtk::Entry::new();
+        name_entry.set_text(&channel.name);
+        name_entry.set_hexpand(true);
+        name_row.add_suffix(&name_entry);
+        name_row.set_activatable_widget(Some(&name_entry));
+        content.append(&name_row);
+        
+        // Frequency field
+        let freq_row = adw::ActionRow::new();
+        freq_row.set_title("Frequency (MHz)");
+        let freq_entry = gtk::Entry::new();
+        freq_entry.set_text(&format!("{:.3}", channel.rx_freq_khz as f64 / 1000.0));
+        freq_entry.set_hexpand(true);
+        freq_row.add_suffix(&freq_entry);
+        freq_row.set_activatable_widget(Some(&freq_entry));
+        content.append(&freq_row);
+        
+        // Duplex selection
+        let duplex_row = adw::ActionRow::new();
+        duplex_row.set_title("Duplex");
+        let duplex_dropdown = gtk::DropDown::from_strings(&["Simplex", "+", "-", "Split"]);
+        match channel.duplex {
+            Duplex::Simplex => duplex_dropdown.set_selected(0),
+            Duplex::Plus => duplex_dropdown.set_selected(1),
+            Duplex::Minus => duplex_dropdown.set_selected(2),
+            Duplex::Split => duplex_dropdown.set_selected(3),
+        }
+        duplex_row.add_suffix(&duplex_dropdown);
+        duplex_row.set_activatable_widget(Some(&duplex_dropdown));
+        content.append(&duplex_row);
+        
+        // Offset field (for +/- duplex)
+        let offset_row = adw::ActionRow::new();
+        offset_row.set_title("Offset (kHz)");
+        let offset_entry = gtk::Entry::new();
+        offset_entry.set_text(&channel.offset_khz.to_string());
+        offset_entry.set_hexpand(true);
+        offset_row.add_suffix(&offset_entry);
+        offset_row.set_activatable_widget(Some(&offset_entry));
+        content.append(&offset_row);
+        
+        // Tone mode selection
+        let tone_row = adw::ActionRow::new();
+        tone_row.set_title("Tone Mode");
+        let tone_dropdown = gtk::DropDown::from_strings(&["None", "Tone", "TSQL"]);
+        match channel.tone_mode {
+            ToneMode::None => tone_dropdown.set_selected(0),
+            ToneMode::Tone => tone_dropdown.set_selected(1),
+            ToneMode::Tsql => tone_dropdown.set_selected(2),
+        }
+        tone_row.add_suffix(&tone_dropdown);
+        tone_row.set_activatable_widget(Some(&tone_dropdown));
+        content.append(&tone_row);
+        
+        // RX Tone frequency
+        let rtone_row = adw::ActionRow::new();
+        rtone_row.set_title("RX Tone (Hz)");
+        let rtone_entry = gtk::Entry::new();
+        rtone_entry.set_text(&format!("{:.1}", channel.rtone_hz));
+        rtone_entry.set_hexpand(true);
+        rtone_row.add_suffix(&rtone_entry);
+        rtone_row.set_activatable_widget(Some(&rtone_entry));
+        content.append(&rtone_row);
+        
+        // TX Tone frequency
+        let ctone_row = adw::ActionRow::new();
+        ctone_row.set_title("TX Tone (Hz)");
+        let ctone_entry = gtk::Entry::new();
+        ctone_entry.set_text(&format!("{:.1}", channel.ctone_hz));
+        ctone_entry.set_hexpand(true);
+        ctone_row.add_suffix(&ctone_entry);
+        ctone_row.set_activatable_widget(Some(&ctone_entry));
+        content.append(&ctone_row);
+        
+        // Delete button
+        let delete_btn = gtk::Button::with_label("Delete Channel");
+        delete_btn.add_css_class("destructive-action");
+        delete_btn.set_margin_top(12);
+        content.append(&delete_btn);
+        
+        // Add content to dialog
+        let content_area = dialog.content_area();
+        content_area.append(&content);
+        
+        // Use RefCell to allow mutating Option in Fn closure
+        use std::cell::RefCell;
+        let on_delete_opt = RefCell::new(Some(on_delete));
+        
+        // Delete button - use FnOnce via Option::take
+        let dialog_for_delete = dialog.clone();
+        delete_btn.connect_clicked(move |_| {
+            if let Some(callback) = on_delete_opt.borrow_mut().take() {
+                callback();
+            }
+            dialog_for_delete.close();
+        });
+        
+        // Handle response - wrap on_save in RefCell<Option>
+        let on_save_opt = RefCell::new(Some(on_save));
+        let channel_clone = channel.clone();
+        let name_entry_clone = name_entry.clone();
+        let freq_entry_clone = freq_entry.clone();
+        let offset_entry_clone = offset_entry.clone();
+        let rtone_entry_clone = rtone_entry.clone();
+        let ctone_entry_clone = ctone_entry.clone();
+        let dialog_for_close = dialog.clone();
+        
+        dialog.connect_response(move |_d, response| {
+            if response == gtk::ResponseType::Accept {
+                // Parse values and call on_save
+                let name = name_entry_clone.text().to_string();
+                let freq_text = freq_entry_clone.text().to_string();
+                let offset_text = offset_entry_clone.text().to_string();
+                let rtone_text = rtone_entry_clone.text().to_string();
+                let ctone_text = ctone_entry_clone.text().to_string();
+                
+                // Parse frequency
+                let freq_mhz: f64 = freq_text.parse().unwrap_or(channel_clone.rx_freq_khz as f64 / 1000.0);
+                let rx_freq_khz = (freq_mhz * 1000.0) as u32;
+                
+                // Parse offset
+                let offset_khz: u32 = offset_text.parse().unwrap_or(channel_clone.offset_khz);
+                
+                // Parse duplex
+                let duplex = match duplex_dropdown.selected() {
+                    0 => Duplex::Simplex,
+                    1 => Duplex::Plus,
+                    2 => Duplex::Minus,
+                    _ => Duplex::Split,
+                };
+                
+                // Parse tone mode
+                let tone_mode = match tone_dropdown.selected() {
+                    0 => ToneMode::None,
+                    1 => ToneMode::Tone,
+                    _ => ToneMode::Tsql,
+                };
+                
+                // Parse tone frequencies
+                let rtone_hz: f32 = rtone_text.parse().unwrap_or(channel_clone.rtone_hz);
+                let ctone_hz: f32 = ctone_text.parse().unwrap_or(channel_clone.ctone_hz);
+                
+                let updated = Channel {
+                    location: channel_clone.location,
+                    name,
+                    rx_freq_khz,
+                    duplex,
+                    offset_khz,
+                    tx_freq_khz: if duplex == Duplex::Split {
+                        Some(rx_freq_khz + offset_khz)
+                    } else {
+                        None
+                    },
+                    tone_mode,
+                    rtone_hz,
+                    ctone_hz,
+                    mode: channel_clone.mode.clone(),
+                    power: channel_clone.power,
+                    comment: channel_clone.comment.clone(),
+                };
+                
+                if let Some(callback) = on_save_opt.borrow_mut().take() {
+                    callback(updated);
+                }
+            }
+            dialog_for_close.close();
+        });
+        
+        dialog.show();
+    }
+    
+    // =========================================================================
     // CSS Styling
     // =========================================================================
     let css_provider = gtk::CssProvider::new();
@@ -1352,6 +1862,11 @@ fn create_ui(
         }
         .freq-display:focus {
             border-color: #FFB000;
+        }
+        .tx-frequency {
+            color: #ff4444;
+            border-color: #ff4444;
+            text-shadow: 0 0 8px rgba(255, 68, 68, 0.5);
         }
         .mode-btn {
             font-size: 13px;
@@ -1398,6 +1913,10 @@ fn create_ui(
         .ptt-button:hover .ptt-label { color: #aaa; }
         .ptt-button:active .ptt-label { color: #FFB000; }
         .squelch-value { font-size: 14px; font-weight: bold; color: #888; }
+        .channel-section-title { font-size: 14px; color: #888; }
+        .channel-list { background: #2a2a2a; border-radius: 8px; border: 1px solid #444; }
+        .channel-row { background: transparent; }
+        .channel-row:hover { background: #333; }
     "#);
     
     gtk::style_context_add_provider_for_display(
