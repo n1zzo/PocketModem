@@ -318,7 +318,7 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
     None
 }
 
-/// Parse degrees/minutes format: DDMM.MM
+/// Parse degrees/minutes format: DDMM.MM or DDDMM.MM
 fn parse_deg_min(s: &str) -> Option<(f64, f64)> {
     let s = s.trim();
     if s.len() < 4 { return None; }
@@ -328,19 +328,28 @@ fn parse_deg_min(s: &str) -> Option<(f64, f64)> {
         let deg_part = &s[..dot_idx];
         let min_part = &s[dot_idx + 1..];
         
-        if deg_part.len() == 4 || deg_part.len() == 5 || deg_part.len() == 6 {
-            // Could be DDMM.MM or DDDMM.MM
-            let deg_digits = deg_part.len() - 2;
+        // Check for DDDMM.MM (5 chars before decimal, e.g., "00941.09")
+        if deg_part.len() == 5 {
+            // First 3 chars = degrees, last 2 chars = whole minutes
             if let (Ok(deg), Ok(min)) = (
-                deg_part[..deg_digits].parse::<f64>(),
-                format!("{}.{}", &deg_part[deg_digits..], min_part).parse::<f64>()
+                deg_part[..3].parse::<f64>(),
+                format!("{}.{}", &deg_part[3..5], min_part).parse::<f64>()
+            ) {
+                return Some((deg, min));
+            }
+        }
+        // Check for DDMM.MM (4 chars before decimal, e.g., "4534.36")
+        else if deg_part.len() == 4 {
+            if let (Ok(deg), Ok(min)) = (
+                deg_part[..2].parse::<f64>(),
+                format!("{}.{}", &deg_part[2..4], min_part).parse::<f64>()
             ) {
                 return Some((deg, min));
             }
         }
     }
     
-    // Try without decimal
+    // Try without decimal - assume DDMM format
     if let Ok(val) = s.parse::<f64>() {
         let deg = (val / 100.0).floor();
         let min = val - (deg * 100.0);

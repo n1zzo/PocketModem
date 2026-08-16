@@ -953,16 +953,12 @@ fn process_packet(
         }
         // KISS DATA frames (0x00) - raw AX.25 packets from AFSK decoder
         0x00 => {
-            // Already logged in main loop, just parse and callback
+            // KISS DATA frames (0x00) - raw AX.25 packets from AFSK decoder
             if !pkt.payload.is_empty() {
                 if let Some(msg) = aprs::parse_ax25_frame(&pkt.payload) {
-                    eprintln!("[radio] PARSED: {} -> {} ({:?})",
-                              msg.from_callsign, msg.to_callsign, msg.msg_type);
                     if let Some(ref cb) = callbacks.lock().unwrap().aprs {
                         cb(&msg);
                     }
-                } else {
-                    eprintln!("[radio] PARSE FAILED for {} bytes", pkt.payload.len());
                 }
             }
         }

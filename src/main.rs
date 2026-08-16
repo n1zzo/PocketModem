@@ -1056,8 +1056,10 @@ fn create_ui(
         
         let content = gtk::Label::new(None);
         content.set_halign(gtk::Align::Start);
+        content.set_valign(gtk::Align::Start);
         content.set_wrap(true);
-        content.set_width_request(300);
+        content.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        content.set_size_request(280, -1);  // Limit width to clamp size
         
         match msg.msg_type {
             aprs::APRSType::Position => {
@@ -1191,8 +1193,9 @@ fn create_ui(
     let map_icon = gtk::Image::from_icon_name("map-symbolic");
     map_icon.set_pixel_size(64);
     map_icon.add_css_class("map-placeholder-icon");
+    map_icon.set_sensitive(false);
     
-    let map_label = gtk::Label::new(Some("GPS Position"));
+    let map_label = gtk::Label::new(Some("Map"));
     map_label.add_css_class("map-placeholder-text");
     
     let locator_label = gtk::Label::new(Some("--"));
@@ -1202,10 +1205,14 @@ fn create_ui(
     let coords_label = gtk::Label::new(Some("Lat: -- Lon: --"));
     coords_label.add_css_class("coords-display");
     
+    let map_note = gtk::Label::new(Some("Map view coming soon"));
+    map_note.add_css_class("map-placeholder-text");
+    
     map_content.append(&map_icon);
     map_content.append(&map_label);
     map_content.append(&locator_label);
     map_content.append(&coords_label);
+    map_content.append(&map_note);
     
     map_page.append(&map_header);
     map_page.append(&map_content);
