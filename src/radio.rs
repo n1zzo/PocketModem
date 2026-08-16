@@ -488,16 +488,10 @@ impl KV4PRadio {
     
     pub fn send_audio(&self, adpcm_data: &[u8]) -> Result<(), String> {
         if !self.running.load(Ordering::SeqCst) {
-            eprintln!("[radio] send_audio: ERROR - radio not running!");
             return Err("Radio not connected".to_string());
         }
-        eprintln!("[radio] send_audio: {} bytes, queueing frame", adpcm_data.len());
         let frame = build_tx_audio_packet(adpcm_data);
-        let result = self.queue_command(RadioCommand::SendFrame(frame));
-        if result.is_err() {
-            eprintln!("[radio] send_audio: ERROR queueing frame: {:?}", result);
-        }
-        result
+        self.queue_command(RadioCommand::SendFrame(frame))
     }
     
     pub fn send_raw_audio(&self, data: &[u8]) -> Result<(), String> {

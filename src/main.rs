@@ -493,6 +493,8 @@ fn create_ui(
     freq_entry.set_margin_bottom(4);
     freq_entry.set_editable(true);
     freq_entry.set_can_focus(true);
+    // Request numeric keyboard on mobile
+    freq_entry.set_input_purpose(gtk::InputPurpose::Number);
     
     let radio_freq = Arc::clone(&radio);
     let settings_for_freq = settings as *const SettingsManager as *mut SettingsManager;
@@ -565,7 +567,7 @@ fn create_ui(
     mode_box.set_homogeneous(true);
     mode_box.set_margin_start(16);
     mode_box.set_margin_end(16);
-    mode_box.set_margin_bottom(16);
+    mode_box.set_margin_bottom(8);
     
     let btn_fm = gtk::ToggleButton::with_label("FM");
     btn_fm.add_css_class("mode-btn");
@@ -590,7 +592,11 @@ fn create_ui(
     let channel_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     channel_container.set_margin_start(16);
     channel_container.set_margin_end(16);
-    channel_container.set_margin_top(8);
+    channel_container.set_margin_top(4);
+    
+    // Track currently selected channel index (-1 = none)
+    let current_channel_index: Arc<std::sync::atomic::AtomicI32> = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+    let current_channel_index_clone = Arc::clone(&current_channel_index);
     
     // Header row with "Channels" title and + button
     let channel_header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -639,6 +645,7 @@ fn create_ui(
         settings: *mut SettingsManager,
         radio: &Arc<Mutex<KV4PRadio>>,
         freq_entry: gtk::Entry,
+        current_channel_index: Arc<std::sync::atomic::AtomicI32>,
     ) {
         unsafe {
             let channels = (*settings).channels();
@@ -663,6 +670,7 @@ fn create_ui(
                     radio.clone(),
                     freq_entry.clone(),
                     settings,
+                    current_channel_index.clone(),
                 );
                 channel_list.append(&row);
             }
@@ -680,8 +688,35 @@ fn create_ui(
         radio: Arc<Mutex<KV4PRadio>>,
         freq_entry: gtk::Entry,
         settings_for_channel: *mut SettingsManager,
+        current_channel_index: Arc<std::sync::atomic::AtomicI32>,
     ) -> gtk::Box {
         let freq_mhz = channel.rx_freq_khz as f64 / 1000.0;
+        
+        // Format subtitle with shift and tone info
+        let mut subtitle_parts = Vec::new();
+        
+        // Add shift for non-simplex (show as MHz, e.g., -0.600)
+        match channel.duplex {
+            Duplex::Plus => subtitle_parts.push(format!("(+{:.3})", channel.offset_khz as f64 / 1000.0)),
+            Duplex::Minus => subtitle_parts.push(format!("(-{:.3})", channel.offset_khz as f64 / 1000.0)),
+            Duplex::Split => subtitle_parts.push(format!("(split {}.{:.3})", 
+                channel.tx_freq_khz.unwrap_or(channel.rx_freq_khz) / 1000,
+                channel.tx_freq_khz.unwrap_or(channel.rx_freq_khz) % 1000)),
+            Duplex::Simplex => {}
+        }
+        
+        // Add tone info when tone is used
+        match channel.tone_mode {
+            ToneMode::None => {}
+            ToneMode::Tone => subtitle_parts.push(format!("[{}]", channel.rtone_hz)),
+            ToneMode::Tsql => subtitle_parts.push(format!("[{}, {}]", channel.rtone_hz, channel.ctone_hz)),
+        }
+        
+        let subtitle = if subtitle_parts.is_empty() {
+            format!("{:.3} MHz", freq_mhz)
+        } else {
+            format!("{:.3} MHz {}", freq_mhz, subtitle_parts.join(" "))
+        };
         
         // Container for the row with edit button
         let row_container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -689,10 +724,15 @@ fn create_ui(
         row_container.add_css_class("channel-row");
         row_container.set_hexpand(true);
         
+        // Add selected class if this is the selected channel
+        if current_channel_index.load(std::sync::atomic::Ordering::SeqCst) == channel_index as i32 {
+            row_container.add_css_class("channel-row-selected");
+        }
+        
         // Action row for channel - takes remaining space
         let row = adw::ActionRow::builder()
             .title(&channel.name)
-            .subtitle(&format!("{:.3} MHz", freq_mhz))
+            .subtitle(&subtitle)
             .build();
         row.set_hexpand(true);
         
@@ -725,7 +765,29 @@ fn create_ui(
             };
             let ch_ctone = channel.ctone_hz;  // TX CTCSS
             let ch_rtone = channel.rtone_hz;  // RX CTCSS
+            let ch_index = channel_index as i32;
+            let cc_idx = current_channel_index.clone();
+            
+            // We need access to channel_list and no_channels_row to refresh
+            let ch_list = channel_list.clone();
+            let no_ch = no_channels_row.clone();
+            
             click.connect_pressed(move |_, _, _, _| {
+                // Mark this channel as selected
+                let prev_idx = cc_idx.swap(ch_index, std::sync::atomic::Ordering::SeqCst);
+                
+                // Refresh channel list to update highlights
+                if prev_idx != ch_index {
+                    refresh_channel_list(
+                        &ch_list,
+                        &no_ch,
+                        settings,
+                        &radio,
+                        freq_entry.clone(),
+                        cc_idx.clone(),
+                    );
+                }
+                
                 // Update freq entry UI on main thread
                 freq_entry.set_text(&format!("{}.{:03}", ch_freq / 1000, ch_freq % 1000));
                 
@@ -747,9 +809,13 @@ fn create_ui(
         let edit_channel = channel.clone();
         let settings_edit = settings;
         let radio_for_edit = Arc::clone(&radio);
+        let cc_idx_edit = Arc::clone(&current_channel_index);
         
         edit_btn.connect_clicked(move |btn| {
-            // Clone for each callback
+            // Clone for each callback - create both cc_idx clones upfront
+            let cc_idx_save = cc_idx_edit.clone();
+            let cc_idx_delete = cc_idx_edit.clone();
+            
             let ch_list_save = channel_list.clone();
             let no_ch_save = no_channels_row.clone();
             let radio_save = radio_for_edit.clone();
@@ -771,6 +837,31 @@ fn create_ui(
                         eprintln!("[pocket-modem] Updated channel: {}", updated.name);
                     }
                     
+                    // Always reload the edited channel
+                    let ch = &updated;
+                    let ch_freq = ch.rx_freq_khz;
+                    let ch_tone_mode = match ch.tone_mode {
+                        ToneMode::None => 0,
+                        ToneMode::Tone => 1,
+                        ToneMode::Tsql => 2,
+                    };
+                    let ch_ctone = ch.ctone_hz;
+                    let ch_rtone = ch.rtone_hz;
+                    
+                    // Mark as selected and reload
+                    cc_idx_save.store(channel_index as i32, std::sync::atomic::Ordering::SeqCst);
+                    
+                    // Update freq entry
+                    freq_save.set_text(&format!("{}.{:03}", ch_freq / 1000, ch_freq % 1000));
+                    
+                    // Reload the channel on the radio
+                    let r = radio_save.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(mut r) = r.lock() {
+                            let _ = r.set_frequency_with_ctcss(ch_freq, ch_tone_mode, ch_ctone, ch_rtone);
+                        }
+                    });
+                    
                     // Refresh the channel list
                     refresh_channel_list(
                         &ch_list_save,
@@ -778,6 +869,7 @@ fn create_ui(
                         settings_edit,
                         &radio_save,
                         freq_save,
+                        cc_idx_save.clone(),
                     );
                 },
                 move || {
@@ -787,6 +879,11 @@ fn create_ui(
                         eprintln!("[pocket-modem] Deleted channel at index {}", channel_index);
                     }
                     
+                    // Clear selected channel if it was the deleted one
+                    if cc_idx_delete.load(std::sync::atomic::Ordering::SeqCst) == channel_index as i32 {
+                        cc_idx_delete.store(-1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    
                     // Refresh the channel list
                     refresh_channel_list(
                         &ch_list_delete,
@@ -794,6 +891,7 @@ fn create_ui(
                         settings_edit,
                         &radio_delete,
                         freq_delete,
+                        cc_idx_delete.clone(),
                     );
                 },
             );
@@ -828,6 +926,7 @@ fn create_ui(
                 radio_for_list.clone(),
                 freq_entry_for_load.clone(),
                 settings_add,
+                current_channel_index_clone.clone(),
             );
             channel_list_arc.append(&row);
         }
@@ -840,6 +939,7 @@ fn create_ui(
     // Add button callback
     let channel_list_add = channel_list_arc.clone();
     let no_channels_row_add = (*no_channels_row_arc).clone();
+    let current_channel_index_add = Arc::clone(&current_channel_index);
     
     add_channel_btn.connect_clicked(move |_| {
         unsafe {
@@ -893,6 +993,7 @@ fn create_ui(
                 radio_for_add.clone(),
                 freq_entry.clone(),
                 settings_add,
+                current_channel_index_add.clone(),
             );
             channel_list_add.append(&row);
             channel_list_add.show();
@@ -1038,7 +1139,7 @@ fn create_ui(
     // Small margin above PTT
     let ptt_spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     ptt_spacer.set_vexpand(false);
-    ptt_spacer.set_size_request(-1, 8);
+    ptt_spacer.set_size_request(-1, 24);
     
     content_box.append(&ptt_spacer);
     content_box.append(&ptt_btn);
@@ -1681,6 +1782,8 @@ fn create_ui(
         let name_entry = gtk::Entry::new();
         name_entry.set_text(&channel.name);
         name_entry.set_hexpand(true);
+        // Avoid emoji suggestions for channel names
+        name_entry.set_input_purpose(gtk::InputPurpose::Alpha);
         name_row.add_suffix(&name_entry);
         name_row.set_activatable_widget(Some(&name_entry));
         content.append(&name_row);
@@ -1691,6 +1794,8 @@ fn create_ui(
         let freq_entry = gtk::Entry::new();
         freq_entry.set_text(&format!("{:.3}", channel.rx_freq_khz as f64 / 1000.0));
         freq_entry.set_hexpand(true);
+        // Request numeric keyboard on mobile
+        freq_entry.set_input_purpose(gtk::InputPurpose::Number);
         freq_row.add_suffix(&freq_entry);
         freq_row.set_activatable_widget(Some(&freq_entry));
         content.append(&freq_row);
@@ -1709,12 +1814,15 @@ fn create_ui(
         duplex_row.set_activatable_widget(Some(&duplex_dropdown));
         content.append(&duplex_row);
         
-        // Offset field (for +/- duplex)
+        // Offset field (for +/- duplex) - stored as kHz internally, displayed as MHz
         let offset_row = adw::ActionRow::new();
-        offset_row.set_title("Offset (kHz)");
+        offset_row.set_title("Offset (MHz)");
         let offset_entry = gtk::Entry::new();
-        offset_entry.set_text(&channel.offset_khz.to_string());
+        // Display offset in MHz format
+        offset_entry.set_text(&format!("{:.3}", channel.offset_khz as f64 / 1000.0));
         offset_entry.set_hexpand(true);
+        // Request numeric keyboard on mobile
+        offset_entry.set_input_purpose(gtk::InputPurpose::Number);
         offset_row.add_suffix(&offset_entry);
         offset_row.set_activatable_widget(Some(&offset_entry));
         content.append(&offset_row);
@@ -1738,6 +1846,8 @@ fn create_ui(
         let rtone_entry = gtk::Entry::new();
         rtone_entry.set_text(&format!("{:.1}", channel.rtone_hz));
         rtone_entry.set_hexpand(true);
+        // Request numeric keyboard on mobile
+        rtone_entry.set_input_purpose(gtk::InputPurpose::Number);
         rtone_row.add_suffix(&rtone_entry);
         rtone_row.set_activatable_widget(Some(&rtone_entry));
         content.append(&rtone_row);
@@ -1747,6 +1857,9 @@ fn create_ui(
         ctone_row.set_title("TX Tone (Hz)");
         let ctone_entry = gtk::Entry::new();
         ctone_entry.set_text(&format!("{:.1}", channel.ctone_hz));
+        ctone_entry.set_hexpand(true);
+        // Request numeric keyboard on mobile
+        ctone_entry.set_input_purpose(gtk::InputPurpose::Number);
         ctone_entry.set_hexpand(true);
         ctone_row.add_suffix(&ctone_entry);
         ctone_row.set_activatable_widget(Some(&ctone_entry));
@@ -1794,12 +1907,25 @@ fn create_ui(
                 let rtone_text = rtone_entry_clone.text().to_string();
                 let ctone_text = ctone_entry_clone.text().to_string();
                 
+
+                
                 // Parse frequency
                 let freq_mhz: f64 = freq_text.parse().unwrap_or(channel_clone.rx_freq_khz as f64 / 1000.0);
                 let rx_freq_khz = (freq_mhz * 1000.0) as u32;
                 
-                // Parse offset
-                let offset_khz: u32 = offset_text.parse().unwrap_or(channel_clone.offset_khz);
+                // Parse offset as MHz and convert to kHz
+                let offset_khz: u32 = {
+                    let trimmed = offset_text.trim();
+                    if trimmed.is_empty() {
+                        // Default to 0.600 MHz (common 2m offset)
+                        600
+                    } else if let Ok(mhz) = trimmed.parse::<f64>() {
+                        // Input in MHz, convert to kHz
+                        (mhz * 1000.0).round() as u32
+                    } else {
+                        channel_clone.offset_khz
+                    }
+                };
                 
                 // Parse duplex
                 let duplex = match duplex_dropdown.selected() {
@@ -1923,6 +2049,8 @@ fn create_ui(
         .channel-list { background: #2a2a2a; border-radius: 8px; border: 1px solid #444; }
         .channel-row { background: transparent; }
         .channel-row:hover { background: #333; }
+        .channel-row-selected { background: #3a3a3a; }
+        .channel-row-selected:hover { background: #3a3a3a; }
     "#);
     
     gtk::style_context_add_provider_for_display(
