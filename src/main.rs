@@ -95,68 +95,6 @@ fn main() {
     
     // Check for test mode arguments
     let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 2 && args[1] == "--test-ctcss" {
-        // Test CTCSS: --test-ctcss [tx_code] [rx_code]
-        let tx_code: u8 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let rx_code: u8 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-        
-        eprintln!("[pocket-modem] CTCSS Test mode: tx={}, rx={}", tx_code, rx_code);
-        
-        let serial_device = std::env::var("POCKET_MODEM_DEVICE").unwrap_or_else(|_| {
-            if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.path().to_str() {
-                        if name.contains("CP2102") || name.contains("Silicon_Labs") {
-                            return name.to_string();
-                        }
-                    }
-                }
-            }
-            "/dev/ttyUSB0".to_string()
-        });
-        
-        let radio = KV4PRadio::new(SerialConfig {
-            port: serial_device.clone(),
-            baudrate: 115200,
-            timeout_ms: 500,
-        });
-        
-        match radio.open() {
-            Ok(Some(version)) => {
-                eprintln!("[pocket-modem] Connected: fw=v{}, rf={:?}", 
-                          version.firmware_version, version.rf_module_type);
-                
-                // Set CTCSS
-                if let Err(e) = radio.set_ctcss(tx_code, rx_code) {
-                    eprintln!("[pocket-modem] Failed to set CTCSS: {}", e);
-                    std::process::exit(1);
-                }
-                
-                // Wait for device state update
-                thread::sleep(Duration::from_secs(2));
-                
-                // Check if it was applied
-                let dev_state = radio.device_state();
-                if let Some(state) = dev_state {
-                    eprintln!("[pocket-modem] DeviceState: ctcss_tx={}, ctcss_rx={}, squelch={}",
-                              state.ctcss_tx, state.ctcss_rx, state.squelch);
-                    
-                    if state.ctcss_tx == tx_code && state.ctcss_rx == rx_code {
-                        eprintln!("[pocket-modem] SUCCESS: CTCSS correctly applied!");
-                    } else {
-                        eprintln!("[pocket-modem] FAILED: Expected tx={}, rx={} but got tx={}, rx={}",
-                                  tx_code, rx_code, state.ctcss_tx, state.ctcss_rx);
-                    }
-                } else {
-                    eprintln!("[pocket-modem] No device state received");
-                }
-            }
-            Ok(None) => eprintln!("[pocket-modem] No version info"),
-            Err(e) => eprintln!("[pocket-modem] Connection failed: {}", e),
-        }
-        
-        std::process::exit(0);
-    }
     
     let serial_device = std::env::var("POCKET_MODEM_DEVICE").ok().unwrap_or_else(|| {
         // Auto-detect if no env var set
@@ -783,8 +721,11 @@ fn create_ui(
             let radio = radio_for_click.clone();
             let settings = settings_for_channel;
             let ch_freq = channel.rx_freq_khz;
+            let ch_ctone = channel.ctone_hz;  // TX CTCSS
+            let ch_rtone = channel.rtone_hz;  // RX CTCSS
             click.connect_pressed(move |_, _, _, _| {
-                eprintln!("[pocket-modem] Selecting channel: {} MHz", ch_freq as f64 / 1000.0);
+                eprintln!("[pocket-modem] Selecting channel: {} MHz, ctcss_tx={}, ctcss_rx={}", 
+                          ch_freq as f64 / 1000.0, ch_ctone, ch_rtone);
                 
                 // Update freq entry UI on main thread
                 freq_entry.set_text(&format!("{}.{:03}", ch_freq / 1000, ch_freq % 1000));
@@ -792,11 +733,11 @@ fn create_ui(
                 // Save to settings
                 unsafe { (*settings).set_frequency(ch_freq); }
                 
-                // Tune radio
+                // Tune radio with CTCSS from channel
                 let r = radio.clone();
                 std::thread::spawn(move || {
                     if let Ok(r) = r.lock() {
-                        let _ = r.set_frequency(ch_freq);
+                        let _ = r.set_frequency_with_ctcss(ch_freq, ch_ctone, ch_rtone);
                     }
                 });
             });

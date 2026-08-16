@@ -311,6 +311,33 @@ impl KV4PRadio {
         self.queue_command(RadioCommand::SendState(state))
     }
 
+    /// Set frequency with optional CTCSS settings from channel
+    /// 
+    /// If ctone_tx > 0 and/or ctone_rx > 0, the CTCSS codes will be set.
+    /// ctone_tx=0 or ctone_rx=0 means no CTCSS for that direction.
+    pub fn set_frequency_with_ctcss(&self, khz: u32, ctone_tx: f32, ctone_rx: f32) -> Result<(), String> {
+        // Convert Hz to CTCSS codes if tones are specified
+        if ctone_tx > 0.0 {
+            let code = Self::ctcss_hz_to_code(ctone_tx);
+            self.state.firmware_ctcss_tx.store(code, Ordering::SeqCst);
+            eprintln!("[radio] CTCSS TX: {} Hz -> code {}", ctone_tx, code);
+        } else {
+            self.state.firmware_ctcss_tx.store(0, Ordering::SeqCst);
+        }
+        
+        if ctone_rx > 0.0 {
+            let code = Self::ctcss_hz_to_code(ctone_rx);
+            self.state.firmware_ctcss_rx.store(code, Ordering::SeqCst);
+            eprintln!("[radio] CTCSS RX: {} Hz -> code {}", ctone_rx, code);
+        } else {
+            self.state.firmware_ctcss_rx.store(0, Ordering::SeqCst);
+        }
+        
+        let squelch = self.state.current_squelch.load(Ordering::SeqCst);
+        self.tune(khz, khz, squelch, 1)
+    }
+    
+    /// Set frequency without changing CTCSS (uses current firmware values)
     pub fn set_frequency(&self, khz: u32) -> Result<(), String> {
         let squelch = self.state.current_squelch.load(Ordering::SeqCst);
         self.tune(khz, khz, squelch, 1)
