@@ -721,6 +721,7 @@ fn create_ui(
             let radio = radio_for_click.clone();
             let settings = settings_for_channel;
             let ch_freq = channel.rx_freq_khz;
+            let ch_name = channel.name.clone();
             let ch_tone_mode = match channel.tone_mode {
                 ToneMode::None => 0,
                 ToneMode::Tone => 1,
@@ -729,8 +730,18 @@ fn create_ui(
             let ch_ctone = channel.ctone_hz;  // TX CTCSS
             let ch_rtone = channel.rtone_hz;  // RX CTCSS
             click.connect_pressed(move |_, _, _, _| {
-                eprintln!("[pocket-modem] Selecting channel: {} MHz, tone_mode={}, ctcss_tx={}, ctcss_rx={}", 
-                          ch_freq as f64 / 1000.0, ch_tone_mode, ch_ctone, ch_rtone);
+                let tone_mode_str = match ch_tone_mode {
+                    0 => "None",
+                    1 => "Tone",
+                    2 => "TSQL",
+                    _ => "Unknown",
+                };
+                eprintln!("[channel] ==========");
+                eprintln!("[channel] SELECT: {}", ch_name);
+                eprintln!("[channel] freq: {} MHz", ch_freq as f64 / 1000.0);
+                eprintln!("[channel] tone_mode: {} ({})", ch_tone_mode, tone_mode_str);
+                eprintln!("[channel] TX tone (ctone): {} Hz", ch_ctone);
+                eprintln!("[channel] RX tone (rtone): {} Hz", ch_rtone);
                 
                 // Update freq entry UI on main thread
                 freq_entry.set_text(&format!("{}.{:03}", ch_freq / 1000, ch_freq % 1000));
