@@ -547,13 +547,14 @@ fn create_ui(
     let signal_label = gtk::Label::new(Some("SIGNAL"));
     signal_label.add_css_class("signal-text");
     signal_label.set_valign(gtk::Align::Center);
+    signal_label.set_width_request(60);  // Fixed width to prevent jitter
     
     rssi_sbar.set_hexpand(true);
     rssi_sbar.set_valign(gtk::Align::Center);
     
     let signal_value = gtk::Label::new(None);
     signal_value.add_css_class("signal-value");
-    signal_value.set_markup(&format!("<span color='#FFB000'>{}</span>", "-- dBm"));
+    signal_value.set_markup(&format!("<span color='#FFB000'>{}</span>", "--%"));
     signal_value.set_valign(gtk::Align::Center);
     signal_value.set_width_request(70);
     
@@ -1572,6 +1573,7 @@ fn create_ui(
     let modem_label_clone = modem_label.clone();
     let rssi_sbar_clone = rssi_sbar.clone();
     let signal_value_clone = signal_value.clone();
+    let signal_label = signal_label.clone();
     let audio_clone = Arc::clone(audio);
     let audio_label_clone = audio_label.clone();
     let gps_clone = Arc::clone(gps);
@@ -1608,16 +1610,39 @@ fn create_ui(
                 modem_label_clone.add_css_class("status-icon-red");
             }
             
-            let dbm = (state.raw_rssi as f64) * 1.2 - 160.8;
-            
             if state.connected && state.raw_rssi > 0 {
-                let dbm_text = format!("{} dBm", dbm as i32);
-                signal_value_clone.set_markup(&format!("<span color='#FFB000'>{}</span>", dbm_text));
-                let frac = ((dbm + 120.0) / 90.0).clamp(0.0, 1.0);
+                // During TX: show audio level as percentage in red, label AUDIO
+                // During RX: show signal strength in dBm in yellow/gold, label SIGNAL
+                if state.tx_active {
+                    // TX mode: show audio level percentage
+                    let pct = (state.raw_rssi as f64) / 255.0 * 100.0;
+                    let pct_text = format!("{}%", pct as i32);
+                    signal_value_clone.set_markup(&format!("<span color='#FF4444'>{}</span>", pct_text));
+                    signal_label.set_text("AUDIO");
+                    // Red bar for TX
+                    rssi_sbar_clone.remove_css_class("bar-rx");
+                    rssi_sbar_clone.add_css_class("bar-tx");
+                } else {
+                    // RX mode: show signal strength in dBm
+                    let dbm = (state.raw_rssi as f64) * 1.2 - 160.8;
+                    let dbm_text = format!("{} dBm", dbm as i32);
+                    signal_value_clone.set_markup(&format!("<span color='#FFB000'>{}</span>", dbm_text));
+                    signal_label.set_text("SIGNAL");
+                    // Yellow bar for RX
+                    rssi_sbar_clone.remove_css_class("bar-tx");
+                    rssi_sbar_clone.add_css_class("bar-rx");
+                }
+                // Set bar fraction
+                let frac = (state.raw_rssi as f64) / 255.0;
                 rssi_sbar_clone.set_fraction(frac);
+                rssi_sbar_clone.remove_css_class("empty");
             } else {
-                signal_value_clone.set_markup(&format!("<span color='#FFB000'>{}</span>", "-- dBm"));
+                signal_value_clone.set_markup(&format!("<span color='#888888'>{}</span>", "--"));
                 rssi_sbar_clone.set_fraction(0.0);
+                rssi_sbar_clone.add_css_class("empty");
+                signal_label.set_text("SIGNAL");
+                rssi_sbar_clone.remove_css_class("bar-tx");
+                rssi_sbar_clone.remove_css_class("bar-rx");
             }
         }
         
@@ -2035,6 +2060,11 @@ fn create_ui(
         .signal-text { font-size: 11px; color: #888; font-weight: bold; }
         .signal-value { font-size: 11px; font-weight: bold; }
         .rssi-bar { background: #2a2a2a; border: 1px solid #444; border-radius: 4px; }
+        .rssi-bar.progress-bar progress { background: #FF4444; min-height: 8px; }
+        .rssi-bar.empty progress { background: transparent; }
+        .rssi-bar.empty { opacity: 0.3; }
+        .rssi-bar.bar-tx progress { background: #FF4444; }
+        .rssi-bar.bar-rx progress { background: #FFB000; }
         .ptt-button { min-width: 90px; min-height: 100px; border-radius: 12px; background: #333; border: 2px solid #555; }
         .ptt-button:hover { background: #3a3a3a; border-color: #666; }
         .ptt-button:active { background: #444; border-color: #FFB000; }

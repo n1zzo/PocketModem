@@ -105,6 +105,7 @@ pub struct RadioState {
     pub squelch_open: bool,
     pub ptt: bool,
     pub connected: bool,
+    pub tx_active: bool,
 }
 
 // ============================================================================
@@ -271,9 +272,9 @@ impl KV4PRadio {
     pub fn state(&self) -> RadioState {
         let freq = self.state.frequency.load(Ordering::SeqCst);
         let dev_state = self.state.inner.lock().unwrap().device_state.clone();
-        let (rssi, smeter, squelch, raw_rssi) = if let Some(ref s) = dev_state {
-            (s.rssi_dbm(), ((s.rssi as i32) * 9 / 255).max(1), s.is_squelched(), s.rssi)
-        } else { (-121.0, 0, false, 0) };
+        let (rssi, smeter, squelch, raw_rssi, tx_active) = if let Some(ref s) = dev_state {
+            (s.rssi_dbm(), ((s.rssi as i32) * 9 / 255).max(1), s.is_squelched(), s.rssi, s.tx_active())
+        } else { (-121.0, 0, false, 0, false) };
         RadioState {
             frequency: freq,
             tx_frequency: self.state.tx_frequency.load(Ordering::SeqCst),
@@ -287,6 +288,7 @@ impl KV4PRadio {
             squelch_open: !squelch,
             ptt: false,
             connected: self.is_connected(),
+            tx_active,
         }
     }
     
