@@ -158,6 +158,57 @@ fn main() {
         std::process::exit(0);
     }
     
+    // CTCSS sweep mode: cycles through all codes so user can identify which is 71.9 Hz
+    if args.len() >= 2 && args[1] == "--ctcss-sweep" {
+        eprintln!("[pocket-modem] CTCSS Sweep mode - will cycle through all codes");
+        eprintln!("[pocket-modem] Tune your receiver to 71.9 Hz and tell me which code matches");
+        
+        let serial_device = std::env::var("POCKET_MODEM_DEVICE").unwrap_or_else(|_| {
+            if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.path().to_str() {
+                        if name.contains("CP2102") || name.contains("Silicon_Labs") {
+                            return name.to_string();
+                        }
+                    }
+                }
+            }
+            "/dev/ttyUSB0".to_string()
+        });
+        
+        let radio = KV4PRadio::new(SerialConfig {
+            port: serial_device.clone(),
+            baudrate: 115200,
+            timeout_ms: 500,
+        });
+        
+        match radio.open() {
+            Ok(Some(version)) => {
+                eprintln!("[pocket-modem] Connected: fw=v{}, rf={:?}", 
+                          version.firmware_version, version.rf_module_type);
+                
+                // Sweep through codes 1-38
+                // Wait 3 seconds between each code
+                for code in 1..=38 {
+                    eprintln!("[pocket-modem] ===== Testing code {} =====", code);
+                    
+                    if let Err(e) = radio.set_ctcss(code, 0) {
+                        eprintln!("[pocket-modem] Failed to set CTCSS: {}", e);
+                        continue;
+                    }
+                    
+                    thread::sleep(Duration::from_secs(3));
+                }
+                
+                eprintln!("[pocket-modem] Sweep complete!");
+            }
+            Ok(None) => eprintln!("[pocket-modem] No version info"),
+            Err(e) => eprintln!("[pocket-modem] Connection failed: {}", e),
+        }
+        
+        std::process::exit(0);
+    }
+    
     let serial_device = std::env::var("POCKET_MODEM_DEVICE").ok().unwrap_or_else(|| {
         // Auto-detect if no env var set
         if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
