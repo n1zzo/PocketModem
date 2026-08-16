@@ -376,7 +376,15 @@ pub fn build_kv4p_packet(kv4p_cmd: HostCommand, payload: &[u8]) -> Vec<u8> {
     kv4p_data.push(KV4P_PROTO_VERSION);
     kv4p_data.push(kv4p_cmd as u8);
     kv4p_data.extend_from_slice(payload);
-    build_kiss_frame(KISS_CMD_SETHARDWARE, &kv4p_data)
+    let frame = build_kiss_frame(KISS_CMD_SETHARDWARE, &kv4p_data);
+    
+    // Debug: print raw frame bytes for DesiredState commands
+    if kv4p_cmd == HostCommand::DesiredState && payload.len() == 22 {
+        eprintln!("[kiss] >>> KISS frame ({} bytes): ctcss_tx=byte[19]={}, ctcss_rx=byte[21]={}",
+                  frame.len(), payload[19], payload[21]);
+    }
+    
+    frame
 }
 
 /// Build a TxAudio packet with Opus-encoded audio frame
