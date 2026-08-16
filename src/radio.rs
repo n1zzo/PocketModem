@@ -470,15 +470,20 @@ impl KV4PRadio {
     }
 
     pub fn ptt_on(&self) -> Result<(), String> {
+        eprintln!("[radio] PTT ON - building state...");
         let mut state = self.build_desired_state(true);
         state.flags |= HostStateFlags::PTT_REQUESTED.bits() | HostStateFlags::TX_ALLOWED.bits();
+        eprintln!("[radio] PTT ON - flags=0x{:04x}, ctcss_tx={}, ctcss_rx={}", 
+                  state.flags, state.ctcss_tx, state.ctcss_rx);
         self.queue_command(RadioCommand::SendState(state))
     }
 
     pub fn ptt_off(&self) -> Result<(), String> {
+        eprintln!("[radio] PTT OFF - building state...");
         let mut state = self.build_desired_state(true);
         // Clear PTT bits - must clear both to stop transmission
         state.flags &= !(HostStateFlags::PTT_REQUESTED.bits() | HostStateFlags::TX_ALLOWED.bits());
+        eprintln!("[radio] PTT OFF - flags=0x{:04x}", state.flags);
         
         // Use drain+send to clear queued audio frames first, then send PTT off
         // Send multiple times to ensure reliable release
@@ -739,6 +744,15 @@ fn io_thread_main(
                 RadioCommand::SendState(desired_state) => {
                     if let Some(ref mut sp) = serial {
                         let payload = desired_state.to_bytes();
+                        
+                        // Debug: print the state bytes
+                        if payload.len() >= 22 {
+                            eprintln!("[radio] >>> SendState: seq={}, flags=0x{:04x}, ctcss_tx={}, sq={}, ctcss_rx={}",
+                                      i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+                                      u16::from_le_bytes([payload[8], payload[9]]),
+                                      payload[19], payload[20], payload[21]);
+                        }
+                        
                         let frame = build_kv4p_packet(HostCommand::DesiredState, &payload);
                         let frame_len = frame.len() as u32;
                         // Flow control: wait if window exhausted
@@ -970,6 +984,13 @@ fn update_device_state(
     state.firmware_squelch.store(dev_state.squelch.min(8), Ordering::SeqCst);
     state.firmware_ctcss_tx.store(dev_state.ctcss_tx, Ordering::SeqCst);
     state.firmware_ctcss_rx.store(dev_state.ctcss_rx, Ordering::SeqCst);
+    
+    // Debug: print device state flags
+    let has_radio_config = (dev_state.flags & 0x01) != 0;
+    let has_ptt = (dev_state.flags & 0x02) != 0;
+    let tx_active = (dev_state.flags & 0x0200) != 0;
+    eprintln!("[radio] <<< DeviceState: has_radio_config={}, ptt={}, tx_active={}, ctcss_tx={}, ctcss_rx={}, sq={}, err={}",
+              has_radio_config, has_ptt, tx_active, dev_state.ctcss_tx, dev_state.ctcss_rx, dev_state.squelch, dev_state.last_error);
     
     // Seed squelch from firmware if user hasn't set it
     if !state.squelch_user_set.load(Ordering::SeqCst) {
