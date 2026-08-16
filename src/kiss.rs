@@ -45,6 +45,61 @@ pub enum AudioFrameType {
     Opus = 0x01,
 }
 
+/// AX.25 frame container
+/// AX.25 UI frames start with a destination callsign and end with
+/// control=0x03 and PID=0xF0 for APRS
+#[derive(Debug, Clone)]
+pub struct Ax25Frame {
+    pub data: Vec<u8>,
+}
+
+impl Ax25Frame {
+    /// Check if raw data looks like an AX.25 frame
+    /// 
+    /// AX.25 UI frames have this structure:
+    /// - Addresses: dest(7) + src(7) + path(n*7) with final bit set
+    /// - Control: 0x03 (UI frame)
+    /// - PID: 0xF0 (no layer 3)
+    /// - Payload: APRS data
+    pub fn is_ax25_frame(data: &[u8]) -> bool {
+        if data.len() < 16 { return false; }  // Min: dest + src + ctrl + pid
+        
+        // Check for UI frame markers
+        let ctrl = data[data.len() - 2];
+        let pid = data[data.len() - 1];
+        if ctrl != 0x03 || pid != 0xF0 {
+            return false;
+        }
+        
+        // Check if first 7 bytes look like a callsign (printable ASCII)
+        let first_7 = &data[0..7];
+        let mut printable_count = 0;
+        for &b in first_7 {
+            let masked = b & 0x7F;
+            if (masked >= 0x20 && masked <= 0x5F) || (masked >= 0x61 && masked <= 0x7A) {
+                printable_count += 1;
+            }
+        }
+        
+        printable_count >= 5  // Most callsign bytes should be printable
+    }
+}
+
+/// Parse an RxAudio packet to determine if it's AX.25 (APRS) or voice
+pub fn parse_rx_audio_packet(data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() { return None; }
+    Some(data.to_vec())
+}
+
+/// Try to parse raw data as an AX.25 frame
+pub fn try_parse_ax25(data: &[u8]) -> Option<Ax25Frame> {
+    if Ax25Frame::is_ax25_frame(data) {
+        Some(Ax25Frame { data: data.to_vec() })
+    } else {
+        None
+    }
+}
+
 /// Host state flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HostStateFlags(u16);
@@ -386,13 +441,3 @@ pub fn build_tx_audio_packet(opus_data: &[u8]) -> Vec<u8> {
     build_kv4p_packet(HostCommand::TxAudio, opus_data)
 }
 
-/// Parse an RxAudio packet (Opus encoded)
-/// 
-/// Returns the Opus data if successful
-pub fn parse_rx_audio_packet(data: &[u8]) -> Option<Vec<u8>> {
-    // RxAudio payload is just the raw Opus data
-    if data.is_empty() {
-        return None;
-    }
-    Some(data.to_vec())
-}

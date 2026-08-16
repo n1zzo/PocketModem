@@ -10,8 +10,9 @@
 //! Thread safety: KV4PRadio implements Send but NOT Sync. All public methods that
 //! need to be called from multiple threads should use the command queue pattern.
 
+use crate::aprs::{self, APRSMessage};
 use crate::kiss::{
-    build_kv4p_packet, build_tx_audio_packet, DeviceCommand, 
+    build_kv4p_packet, build_tx_audio_packet, Ax25Frame, DeviceCommand, 
     DeviceState, HostCommand, HostDesiredState, HostStateFlags, PacketParser, 
     RfModuleType, VersionInfo,
 };
@@ -49,6 +50,7 @@ pub type RssiCallback = Box<dyn Fn(f32) + Send + Sync>;
 pub type ConnectCallback = Box<dyn Fn(bool) + Send + Sync>;
 pub type RxAudioCallback = Box<dyn Fn(&[u8]) + Send + Sync>;
 pub type PhysPttCallback = Box<dyn Fn(bool) + Send + Sync>;
+pub type AprsCallback = Box<dyn Fn(&APRSMessage) + Send + Sync>;
 
 /// Thread-safe callback container - protected by Mutex, mutated only during init
 struct Callbacks {
@@ -58,6 +60,7 @@ struct Callbacks {
     connect: Option<ConnectCallback>,
     rx_audio: Option<RxAudioCallback>,
     phys_ptt: Option<PhysPttCallback>,
+    aprs: Option<AprsCallback>,
 }
 
 impl Default for Callbacks {
@@ -65,6 +68,7 @@ impl Default for Callbacks {
         Self {
             smeter: None, state: None, rssi: None,
             connect: None, rx_audio: None, phys_ptt: None,
+            aprs: None,
         }
     }
 }
@@ -241,6 +245,10 @@ impl KV4PRadio {
 
     pub fn on_rx_audio<F>(&self, cb: F) where F: Fn(&[u8]) + Send + Sync + 'static {
         self.callbacks.lock().unwrap().rx_audio = Some(Box::new(cb));
+    }
+    
+    pub fn on_aprs<F>(&self, cb: F) where F: Fn(&APRSMessage) + Send + Sync + 'static {
+        self.callbacks.lock().unwrap().aprs = Some(Box::new(cb));
     }
     
     pub fn on_phys_ptt<F>(&self, cb: F) where F: Fn(bool) + Send + Sync + 'static {
@@ -795,11 +803,18 @@ fn io_thread_main(
                 }
                 Ok(n) => {
                     let packets = parser.lock().unwrap().feed(&buf[..n]);
-                    for pkt in packets {
+                    for pkt in &packets {
+                        // Log KISS DATA frames (AX.25/APRS)
+                        if pkt.command == 0x00 && !pkt.payload.is_empty() {
+                            eprintln!("[radio] APRS: {}",
+                                      pkt.payload.iter()
+                                          .map(|b| format!("{:02X}", b))
+                                          .collect::<Vec<_>>()
+                                          .join(" "));
+                        }
+                        
                         // WindowUpdate (0x09): increment flow control window
-                        // NOTE: This is a notification from device, no response needed
                         if pkt.command == 0x09 && pkt.payload.len() >= 4 {
-                            // Parse window size from payload (little-endian u32 at offset 0)
                             let size = u32::from_le_bytes([
                                 pkt.payload[0], pkt.payload[1],
                                 pkt.payload[2], pkt.payload[3],
@@ -936,6 +951,21 @@ fn process_packet(
                 update_device_state(state, callbacks, &dev_state);
             }
         }
+        // KISS DATA frames (0x00) - raw AX.25 packets from AFSK decoder
+        0x00 => {
+            // Already logged in main loop, just parse and callback
+            if !pkt.payload.is_empty() {
+                if let Some(msg) = aprs::parse_ax25_frame(&pkt.payload) {
+                    eprintln!("[radio] PARSED: {} -> {} ({:?})",
+                              msg.from_callsign, msg.to_callsign, msg.msg_type);
+                    if let Some(ref cb) = callbacks.lock().unwrap().aprs {
+                        cb(&msg);
+                    }
+                } else {
+                    eprintln!("[radio] PARSE FAILED for {} bytes", pkt.payload.len());
+                }
+            }
+        }
         x if x == DeviceCommand::SmeterReport as u8 => {
             if !pkt.payload.is_empty() {
                 if let Some(ref cb) = callbacks.lock().unwrap().smeter {
@@ -944,7 +974,7 @@ fn process_packet(
             }
         }
         0x0C | 0x07 => {
-            // Rx audio
+            // Rx audio - regular voice audio
             if !pkt.payload.is_empty() {
                 if let Some(ref cb) = callbacks.lock().unwrap().rx_audio {
                     cb(&pkt.payload);
