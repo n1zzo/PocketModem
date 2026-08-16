@@ -133,6 +133,8 @@ struct RadioSharedState {
     current_squelch: AtomicU8,
     squelch_user_set: AtomicBool,
     firmware_squelch: AtomicU8,  // Cached firmware-reported squelch
+    firmware_ctcss_tx: AtomicU8,  // Cached firmware-reported CTCSS TX
+    firmware_ctcss_rx: AtomicU8,  // Cached firmware-reported CTCSS RX
 }
 
 impl Default for RadioSharedState {
@@ -145,6 +147,8 @@ impl Default for RadioSharedState {
             current_squelch: AtomicU8::new(4),
             squelch_user_set: AtomicBool::new(false),
             firmware_squelch: AtomicU8::new(4),
+            firmware_ctcss_tx: AtomicU8::new(0),
+            firmware_ctcss_rx: AtomicU8::new(0),
         }
     }
 }
@@ -361,6 +365,54 @@ impl KV4PRadio {
         Ok(())
     }
     
+    /// Set CTCSS tone codes for TX and RX
+    /// 
+    /// The firmware expects CTCSS codes 0-50 where:
+    /// - 0 = no tone
+    /// - 1-50 = CTCSS tone codes (standard tones)
+    /// 
+    /// Use ctcss_hz_to_code() to convert Hz frequency to code
+    pub fn set_ctcss(&self, tx_code: u8, rx_code: u8) -> Result<(), String> {
+        eprintln!("[radio] set_ctcss: tx={}, rx={}", tx_code, rx_code);
+        self.state.firmware_ctcss_tx.store(tx_code, Ordering::SeqCst);
+        self.state.firmware_ctcss_rx.store(rx_code, Ordering::SeqCst);
+        let state = self.build_desired_state(true);
+        self.queue_command(RadioCommand::SendState(state))
+    }
+    
+    /// Get current CTCSS codes from firmware-reported state
+    pub fn get_ctcss(&self) -> (u8, u8) {
+        (
+            self.state.firmware_ctcss_tx.load(Ordering::SeqCst),
+            self.state.firmware_ctcss_rx.load(Ordering::SeqCst),
+        )
+    }
+    
+    /// Convert CTCSS frequency in Hz to SA818 code (1-50)
+    /// Returns 0 if no match found (tone disabled)
+    pub fn ctcss_hz_to_code(hz: f32) -> u8 {
+        // Standard CTCSS tones (Hz to code mapping)
+        const CTCSS_TONES: &[(f32, u8)] = &[
+            (67.0, 1), (69.3, 2), (71.9, 3), (74.4, 4), (77.0, 5),
+            (79.7, 6), (82.5, 7), (85.4, 8), (88.5, 9), (91.5, 10),
+            (94.8, 11), (97.4, 12), (100.0, 13), (103.5, 14), (107.2, 15),
+            (110.9, 16), (114.8, 17), (118.8, 18), (123.0, 19), (127.3, 20),
+            (131.8, 21), (136.5, 22), (141.3, 23), (146.2, 24), (151.4, 25),
+            (156.7, 26), (159.8, 27), (162.2, 28), (165.5, 29), (167.9, 30),
+            (171.3, 31), (173.8, 32), (177.3, 33), (179.9, 34), (183.5, 35),
+            (186.2, 36), (189.9, 37), (192.8, 38), (196.6, 39), (199.5, 40),
+            (203.5, 41), (206.5, 42), (210.7, 43), (218.1, 44), (225.7, 45),
+            (229.1, 46), (233.6, 47), (241.8, 48), (250.3, 49), (254.1, 50),
+        ];
+        
+        for (freq, code) in CTCSS_TONES {
+            if (*freq - hz).abs() < 0.5 {
+                return *code;
+            }
+        }
+        0 // No match - tone disabled
+    }
+    
     pub fn open_audio(&self) -> Result<(), String> {
         eprintln!("[radio] open_audio() called");
         // Build state WITHOUT RADIO_CONFIG_VALID - only session flags (RX_AUDIO_OPEN)
@@ -514,9 +566,9 @@ impl KV4PRadio {
             bandwidth: 1,
             freq_tx: freq,
             freq_rx: freq,
-            ctcss_tx: 0,
+            ctcss_tx: self.state.firmware_ctcss_tx.load(Ordering::SeqCst),
             squelch,
-            ctcss_rx: 0,
+            ctcss_rx: self.state.firmware_ctcss_rx.load(Ordering::SeqCst),
         };
         
         state
@@ -871,8 +923,10 @@ fn update_device_state(
     callbacks: &Arc<Mutex<Callbacks>>,
     dev_state: &DeviceState,
 ) {
-    // Cache firmware squelch in atomic (no lock needed)
+    // Cache firmware values in atomics (no lock needed)
     state.firmware_squelch.store(dev_state.squelch.min(8), Ordering::SeqCst);
+    state.firmware_ctcss_tx.store(dev_state.ctcss_tx, Ordering::SeqCst);
+    state.firmware_ctcss_rx.store(dev_state.ctcss_rx, Ordering::SeqCst);
     
     // Seed squelch from firmware if user hasn't set it
     if !state.squelch_user_set.load(Ordering::SeqCst) {
