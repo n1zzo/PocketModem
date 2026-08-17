@@ -10,13 +10,15 @@ mod aprs;
 mod audio;
 mod gps;
 mod kiss;
+mod map;
 mod radio;
 mod settings;
 
 use aprs::APRSMessage;
 use audio::{AudioConfig, AudioManager};
 use gps::GpsManager;
-use settings::{SettingsManager, Channel, Duplex, ToneMode, PowerLevel};
+use map::MapManager;
+use settings::{SettingsManager, Channel, Duplex, ToneMode, PowerLevel, TileSource};
 
 use radio::{KV4PRadio, SerialConfig};
 
@@ -1208,32 +1210,29 @@ fn create_ui(
     aprs_clamp.set_child(Some(&aprs_page));
     
     // =========================================================================
-    // MAP PAGE (placeholder)
+    // MAP PAGE (libshumate)
     // =========================================================================
+    eprintln!("[main] Creating MapManager...");
+    
+    let mut manager = MapManager::new();
+    eprintln!("[main] MapManager created");
+    
+    // Get the view (SimpleMap is refcounted via GObject)
+    let map_view = manager.view().clone();
+    
+    // Wrap manager in Arc for future update capability
+    let map_manager = Arc::new(Mutex::new(manager));
+    
+    // Create map page with GPS header and map view
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     
-    let map_header = gtk::Label::new(Some("<b>Map</b>"));
-    map_header.set_markup("<b>Map</b>");
-    map_header.set_halign(gtk::Align::Start);
-    map_header.set_margin_start(16);
-    map_header.set_margin_top(16);
-    map_header.set_margin_bottom(8);
-    
-    // Map placeholder - shows GPS status and Maidenhead locator
-    let map_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    map_content.set_halign(gtk::Align::Center);
-    map_content.set_margin_start(16);
-    map_content.set_margin_end(16);
-    map_content.set_margin_top(16);
-    map_content.set_margin_bottom(16);
-    
-    let map_icon = gtk::Image::from_icon_name("map-symbolic");
-    map_icon.set_pixel_size(64);
-    map_icon.add_css_class("map-placeholder-icon");
-    map_icon.set_sensitive(false);
-    
-    let map_label = gtk::Label::new(Some("Map"));
-    map_label.add_css_class("map-placeholder-text");
+    // GPS info header with locator
+    let gps_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    gps_header.set_halign(gtk::Align::Center);
+    gps_header.set_margin_start(4);
+    gps_header.set_margin_end(4);
+    gps_header.set_margin_top(4);
+    gps_header.set_margin_bottom(4);
     
     let locator_label = gtk::Label::new(Some("--"));
     locator_label.set_markup(&format!("<span color='#FFB000'>MAIDENHEAD: --</span>"));
@@ -1242,17 +1241,19 @@ fn create_ui(
     let coords_label = gtk::Label::new(Some("Lat: -- Lon: --"));
     coords_label.add_css_class("coords-display");
     
-    let map_note = gtk::Label::new(Some("Map view coming soon"));
-    map_note.add_css_class("map-placeholder-text");
+    gps_header.append(&locator_label);
+    gps_header.append(&coords_label);
     
-    map_content.append(&map_icon);
-    map_content.append(&map_label);
-    map_content.append(&locator_label);
-    map_content.append(&coords_label);
-    map_content.append(&map_note);
+    // Wrap map in ScrolledWindow for clipping
+    let map_scroll = gtk::ScrolledWindow::new();
+    map_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
+    map_scroll.set_hexpand(false);
+    map_scroll.set_vexpand(true);
+    map_scroll.set_size_request(360, 600);
+    map_scroll.set_child(Some(&map_view));
     
-    map_page.append(&map_header);
-    map_page.append(&map_content);
+    map_page.append(&gps_header);
+    map_page.append(&map_scroll);
     
     // Map clamp
     let map_clamp = adw::Clamp::builder()
@@ -1471,6 +1472,8 @@ fn create_ui(
     
     let locator_label_clone = locator_label.clone();
     let coords_label_clone = coords_label.clone();
+    // Note: map_manager updates disabled for now to avoid borrow issues
+    // let map_manager_clone = Arc::clone(&map_manager);
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if let Ok(r) = radio_update.lock() {
@@ -1614,6 +1617,10 @@ fn create_ui(
                             my_lat,
                             my_lon,
                         );
+                        // Update map with new APRS station
+                        // if let Ok(mut map) = map_manager_clone.lock() {
+                        //     map.update_station(msg);
+                        // }
                         new_last = i + 1;
                     }
                 }
@@ -1636,6 +1643,11 @@ fn create_ui(
                         "Lat: {:.6}° Lon: {:.6}°",
                         lat, lon
                     ));
+                    // Update map with user position
+                    // if let Ok(mut map) = map_manager_clone.lock() {
+                    //     map.set_user_position(lat, lon);
+                    //     map.center_on_user(lat, lon);
+                    // }
                 } else {
                     locator_label_clone.set_markup(
                         "<span color='#FFB000'>MAIDENHEAD: --- (searching)</span>"
