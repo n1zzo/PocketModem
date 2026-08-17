@@ -91,21 +91,20 @@ fn calculate_distance_bearing(my_lat: f64, my_lon: f64, target_lat: f64, target_
         return None;
     }
     
-    let (sin_lat1, cos_lat1, sin_lat2, cos_lat2, delta_lon) = {
-        let lat1 = my_lat.to_radians();
-        let lat2 = target_lat.to_radians();
-        let dlon = (target_lon - my_lon).to_radians();
-        (
-            lat1.sin(), lat1.cos(),
-            lat2.sin(), lat2.cos(),
-            dlon
-        )
-    };
+    let lat1 = my_lat.to_radians();
+    let lat2 = target_lat.to_radians();
+    let delta_lon = (target_lon - my_lon).to_radians();
     
-    // Haversine formula
-    let a = (sin_lat2 - cos_lat1 * cos_lat2 * delta_lon.cos()).powi(2) 
-          + (cos_lat1 * sin_lat2 - sin_lat1 * cos_lat2 * delta_lon.cos()).powi(2);
-    let c = 2.0 * a.sqrt().atan2(1.0);
+    let (sin_lat1, cos_lat1, sin_lat2, cos_lat2) = (lat1.sin(), lat1.cos(), lat2.sin(), lat2.cos());
+    
+    // Haversine formula: a = sin²(Δlat/2) + cos(lat1) * cos(lat2) * sin²(Δlon/2)
+    let delta_lat = target_lat - my_lat;
+    let sin_delta_lat = (delta_lat.to_radians() / 2.0).sin();
+    let sin_delta_lon = (delta_lon / 2.0).sin();
+    let a = sin_delta_lat.powi(2) + cos_lat1 * cos_lat2 * sin_delta_lon.powi(2);
+    
+    // c = 2 * asin(min(1.0, sqrt(a)))
+    let c = 2.0 * (a.sqrt().min(1.0)).asin();
     let distance_km = 6371.0 * c;
     
     // Bearing calculation
@@ -1082,10 +1081,12 @@ fn create_ui(
                     };
                     
                     let pos_text = format!("{} {}", dist_text, bearing_text);
-                    let comment = if msg.comment.is_empty() {
+                    // Escape & for GTK markup
+                    let escaped_comment = msg.comment.replace('&', "&amp;");
+                    let comment = if escaped_comment.is_empty() {
                         String::new()
                     } else {
-                        format!(" - {}", msg.comment)
+                        format!(" - {}", escaped_comment)
                     };
                     content.set_markup(&format!(
                         "<span color='#33D17A'>📍 {}</span>{}",

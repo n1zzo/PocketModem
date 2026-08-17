@@ -252,66 +252,93 @@ fn decode_position(msg: &mut APRSMessage, payload: &[u8]) {
     }
 }
 
-/// Parse APRS position format: DDMM.MM N/S DDDMM.MM E/W
+/// Parse APRS position format: DDMM.MM N/S DDDMM.MM E/W or DDMM.MM N/S / DDDMM.MM E/W
 fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
     // APRS position can start with timestamp or directly with position
     let mut offset = 0;
     
     // Check for timestamp prefix
+    // Formats: @HHMMSSz (8), /HHMMSS (7), HHMMSSz (7), HHMMSS/ (7)
     if data.len() >= 7 {
-        let prefix = data[0] as char;
-        if prefix == '/' || prefix == '@' {
-            offset = 7;  // Skip HHMMSS
+        let first = data[0] as char;
+        let sixth = data[5] as char;
+        let seventh = data[6] as char;
+        
+        if first == '@' && seventh == 'z' {
+            offset = 8;  // @HHMMSSz
+        } else if first == '@' || first == '/' {
+            offset = 7;  // @HHMMSS/ or /HHMMSS
+        } else if sixth.is_ascii_digit() && (seventh == 'z' || seventh == '/') {
+            offset = 7;  // HHMMSSz or HHMMSS/ (timestamp without leading @ or /)
         }
     }
     
-    // Parse latitude (DDMM.MM)
-    if offset + 8 > data.len() { return None; }
-    
-    let lat_str = String::from_utf8_lossy(&data[offset..offset + 7]);
-    if let Some((lat_deg, lat_min)) = parse_deg_min(&lat_str) {
+    // Format A: DDMM.MM + N/S + / + DDDMM.MM + E/W (18 chars with / separator)
+    // Example: 4534.19N/00927.35E
+    if offset + 18 <= data.len() {
+        let lat_str = String::from_utf8_lossy(&data[offset..offset + 7]);
         let ns = data[offset + 7] as char;
-        
-        // Parse longitude (DDDMM.MM)
-        if offset + 16 > data.len() { return None; }
-        let lon_str = String::from_utf8_lossy(&data[offset + 9..offset + 16]);
-        if let Some((lon_deg, lon_min)) = parse_deg_min(&lon_str) {
-            let ew = data[offset + 16] as char;
-            
-            let mut lat = lat_deg + lat_min / 60.0;
-            let mut lon = lon_deg + lon_min / 60.0;
-            
-            if ns == 'S' || ns == 's' { lat = -lat; }
-            if ew == 'W' || ew == 'w' { lon = -lon; }
-            
-            return Some((lat, lon, offset + 17));
+        let sep = data[offset + 8] as char;
+        if (ns == 'N' || ns == 'S' || ns == 'n' || ns == 's') && sep == '/' {
+            let lon_str = String::from_utf8_lossy(&data[offset + 9..offset + 17]);
+            let ew = data[offset + 17] as char;
+            if let Some((lat_deg, lat_min)) = parse_deg_min(&lat_str) {
+                if let Some((lon_deg, lon_min)) = parse_deg_min(&lon_str) {
+                    if ew == 'E' || ew == 'W' || ew == 'e' || ew == 'w' {
+                        let mut lat = lat_deg + lat_min / 60.0;
+                        let mut lon = lon_deg + lon_min / 60.0;
+                        if ns == 'S' || ns == 's' { lat = -lat; }
+                        if ew == 'W' || ew == 'w' { lon = -lon; }
+                        return Some((lat, lon, offset + 18));
+                    }
+                }
+            }
         }
     }
     
-    // Alternative: no symbols (micro-reformat)
-    // Format: DDMM.MMN DDDMM.MMW or DDMM.MMN/DDDMM.MMW
-    if offset + 13 > data.len() { return None; }
+    // Format B: DDMM.MM + N/S + DDDMM.MM + E/W (17 chars, no / separator)
+    // Example: 4534.19N00927.35E
+    if offset + 17 <= data.len() {
+        let lat_str = String::from_utf8_lossy(&data[offset..offset + 7]);
+        let ns = data[offset + 7] as char;
+        if ns == 'N' || ns == 'S' || ns == 'n' || ns == 's' {
+            let lon_str = String::from_utf8_lossy(&data[offset + 8..offset + 16]);
+            let ew = data[offset + 16] as char;
+            if let Some((lat_deg, lat_min)) = parse_deg_min(&lat_str) {
+                if let Some((lon_deg, lon_min)) = parse_deg_min(&lon_str) {
+                    if ew == 'E' || ew == 'W' || ew == 'e' || ew == 'w' {
+                        let mut lat = lat_deg + lat_min / 60.0;
+                        let mut lon = lon_deg + lon_min / 60.0;
+                        if ns == 'S' || ns == 's' { lat = -lat; }
+                        if ew == 'W' || ew == 'w' { lon = -lon; }
+                        return Some((lat, lon, offset + 17));
+                    }
+                }
+            }
+        }
+    }
     
-    let lat_str = String::from_utf8_lossy(&data[offset..offset + 6]);
-    if let Some((lat_deg, lat_min)) = parse_deg_min(&lat_str) {
-        let ns = data[offset + 6] as char;
-        
-        // Check for / separator
-        let sep = data[offset + 7] as char;
-        let lon_start = if sep == '/' { offset + 8 } else { offset + 7 };
-        
-        if lon_start + 7 > data.len() { return None; }
-        let lon_str = String::from_utf8_lossy(&data[lon_start..lon_start + 7]);
-        if let Some((lon_deg, lon_min)) = parse_deg_min(&lon_str) {
-            let ew = data[lon_start + 7] as char;
-            
-            let mut lat = lat_deg + lat_min / 60.0;
-            let mut lon = lon_deg + lon_min / 60.0;
-            
-            if ns == 'S' || ns == 's' { lat = -lat; }
-            if ew == 'W' || ew == 'w' { lon = -lon; }
-            
-            return Some((lat, lon, lon_start + 8));
+    // Format C: DDMM.MM + N/S + / + DDDMM.MM + E/W (15 chars, no decimal on minutes)
+    // Example: 4534.N/00927.E
+    if offset + 15 <= data.len() {
+        let lat_str = String::from_utf8_lossy(&data[offset..offset + 6]);
+        if let Some((lat_deg, lat_min)) = parse_deg_min(&lat_str) {
+            let ns = data[offset + 6] as char;
+            if ns == 'N' || ns == 'S' || ns == 'n' || ns == 's' {
+                let sep = data[offset + 7] as char;
+                if sep == '/' {
+                    let lon_start = offset + 8;
+                    let lon_str = String::from_utf8_lossy(&data[lon_start..lon_start + 7]);
+                    let ew = data[lon_start + 7] as char;
+                    if let Some((lon_deg, lon_min)) = parse_deg_min(&lon_str) {
+                        let mut lat = lat_deg + lat_min / 60.0;
+                        let mut lon = lon_deg + lon_min / 60.0;
+                        if ns == 'S' || ns == 's' { lat = -lat; }
+                        if ew == 'W' || ew == 'w' { lon = -lon; }
+                        return Some((lat, lon, lon_start + 8));
+                    }
+                }
+            }
         }
     }
     
