@@ -275,20 +275,17 @@ fn create_ui(
     gps: &Arc<Mutex<GpsManager>>,
     settings: &SettingsManager,
 ) {
-    // Create the main window (360px width for mobile displays)
+    // Create the main window (340px width for mobile displays)
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .default_width(360)
-        .default_height(800)
+        .default_width(340)
+        .default_height(700)
         .title("PocketModem")
         .build();
     
-    // Use 360x700 size (Phosh minimum is ~354px wide)
-    // NOTE: Window will expand to ~464px wide when map page is displayed due to
-    // libshumate's Clutter stage natural size. This is a known limitation.
-    window.set_size_request(360, 700);
+    window.set_size_request(340, 700);
     window.set_resizable(false);
-    window.set_default_size(360, 700);
+    window.set_default_size(340, 700);
     
     // Apply saved frequency from settings on startup
     let saved_freq = settings.frequency();
@@ -378,9 +375,9 @@ fn create_ui(
     
     // Clamp content width for proper libadwaita layout
     let clamp = adw::Clamp::builder()
-        .maximum_size(360)
+        .maximum_size(340)
         .build();
-    clamp.set_size_request(360, 700);
+    clamp.set_size_request(340, 700);
     
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.set_halign(gtk::Align::Center);
@@ -1206,9 +1203,9 @@ fn create_ui(
     
     // APRS clamp
     let aprs_clamp = adw::Clamp::builder()
-        .maximum_size(360)
+        .maximum_size(340)
         .build();
-    aprs_clamp.set_size_request(360, 700);
+    aprs_clamp.set_size_request(340, 700);
     aprs_clamp.set_child(Some(&aprs_page));
     
     // =========================================================================
@@ -1277,9 +1274,9 @@ fn create_ui(
     indicator.set_halign(gtk::Align::Center);
     indicator.set_margin_bottom(8);
     
-    // Carousel wrapper - force fixed size to contain libshumate
+    // Carousel wrapper - force fixed size
     let carousel_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    carousel_box.set_size_request(360, 700);
+    carousel_box.set_size_request(340, 700);
     carousel_box.append(&carousel);
     carousel_box.append(&indicator);
     carousel_box.set_vexpand(false);
@@ -1294,9 +1291,9 @@ fn create_ui(
     let settings_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     
     let settings_clamp = adw::Clamp::builder()
-        .maximum_size(360)
+        .maximum_size(340)
         .build();
-    settings_clamp.set_size_request(360, 700);
+    settings_clamp.set_size_request(340, 700);
     
     let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     
