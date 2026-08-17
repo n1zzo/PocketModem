@@ -361,6 +361,8 @@ fn create_ui(
     let header_bar = adw::HeaderBar::builder()
         .title_widget(&adw::WindowTitle::new("PocketModem", ""))
         .build();
+    header_bar.set_size_request(340, 46);
+    header_bar.set_hexpand(false);
     
     // Settings button in header
     let settings_btn = gtk::ToggleButton::new();
@@ -379,9 +381,11 @@ fn create_ui(
         .tightening_threshold(340)
         .build();
     clamp.set_size_request(340, 700);
+    clamp.set_hexpand(false);
     clamp.set_halign(gtk::Align::Center);
     
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content_box.set_size_request(340, 700);
     content_box.set_halign(gtk::Align::Center);
     content_box.set_hexpand(false);
     content_box.set_vexpand(true);
@@ -1187,6 +1191,8 @@ fn create_ui(
     }
     
     let aprs_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    aprs_page.set_size_request(340, 700);
+    aprs_page.set_hexpand(false);
     
     let aprs_header = gtk::Label::new(Some("<b>APRS Messages</b>"));
     aprs_header.set_markup("<b>APRS Messages</b>");
@@ -1300,6 +1306,8 @@ fn create_ui(
     // SETTINGS PAGE
     // =========================================================================
     let settings_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    settings_page.set_size_request(340, 700);
+    settings_page.set_hexpand(false);
     
     let settings_clamp = adw::Clamp::builder()
         .maximum_size(340)
@@ -1379,6 +1387,8 @@ fn create_ui(
     // ViewStack for navigation
     // =========================================================================
     let stack = adw::ViewStack::new();
+    stack.set_size_request(340, 654);
+    stack.set_hexpand(false);
     
     stack.add_titled(&carousel_box, Some("main"), "Main");
     stack.add_titled(&settings_page, Some("settings"), "Settings");
@@ -1399,6 +1409,8 @@ fn create_ui(
     // Toast Overlay for notifications
     // =========================================================================
     let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_size_request(340, 654);
+    toast_overlay.set_hexpand(false);
     toast_overlay.set_child(Some(&stack));
     
     // =========================================================================
@@ -1976,9 +1988,12 @@ fn create_ui(
     );
     
     let main_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    main_container.set_size_request(340, 700);
+    main_container.set_hexpand(false);
     main_container.append(&header_bar);
     main_container.append(&toast_overlay);
     
     window.set_content(Some(&main_container));
     window.show();
+    eprintln!("[debug] Window shown with size_request 340x700");
 }
