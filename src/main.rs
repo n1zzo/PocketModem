@@ -277,14 +277,14 @@ fn create_ui(
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .default_width(360)
-        .default_height(740)
+        .default_height(800)
         .title("PocketModem")
         .build();
     
-    // Use 360x740 size (Phosh minimum is ~354px)
-    window.set_size_request(360, 740);
+    // Use 360x800 size (Phosh minimum is ~354px wide)
+    window.set_size_request(360, 800);
     window.set_resizable(false);
-    window.set_default_size(360, 740);
+    window.set_default_size(360, 800);
     
     // Apply saved frequency from settings on startup
     let saved_freq = settings.frequency();
@@ -376,11 +376,12 @@ fn create_ui(
     let clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
-    clamp.set_size_request(360, -1);
+    clamp.set_size_request(360, 800);
     
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.set_halign(gtk::Align::Center);
     content_box.set_hexpand(true);
+    content_box.set_vexpand(true);
     
     // --- Status indicators ---
     let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 32);
@@ -1203,7 +1204,7 @@ fn create_ui(
     let aprs_clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
-    aprs_clamp.set_size_request(360, -1);
+    aprs_clamp.set_size_request(360, 800);
     aprs_clamp.set_child(Some(&aprs_page));
     
     // =========================================================================
@@ -1257,7 +1258,7 @@ fn create_ui(
     let map_clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
-    map_clamp.set_size_request(360, -1);
+    map_clamp.set_size_request(360, 800);
     map_clamp.set_child(Some(&map_page));
     
     // =========================================================================
@@ -1296,7 +1297,7 @@ fn create_ui(
     let settings_clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
-    settings_clamp.set_size_request(360, -1);
+    settings_clamp.set_size_request(360, 800);
     
     let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     

@@ -1,0 +1,11 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=/usr/lib
+includedir=/usr/include
+
+Name: shumate
+Description: GTK4 map widget
+Version: 1.6.3
+Requires: gtk4 >= 4.10, glib-2.0, gobject-2.0, cairo, gdk-pixbuf-2.0
+Libs: -L${libdir} -lshumate-1.0
+Cflags: -I${includedir}/shumate-1.0

@@ -11,7 +11,7 @@ use std::path::Path;
 use gio::prelude::SettingsExt;
 
 /// Current schema version - increment when adding new settings
-const CURRENT_SCHEMA_VERSION: u32 = 1;
+const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Default values for settings
 pub mod defaults {
@@ -119,6 +119,40 @@ pub enum PowerLevel {
     Low,
 }
 
+/// Tile source for offline map
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TileSource {
+    Online,   // OSM tiles (requires network)
+    Offline,  // MBTiles file (offline)
+}
+
+impl Default for TileSource {
+    fn default() -> Self {
+        TileSource::Online
+    }
+}
+
+impl std::fmt::Display for TileSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TileSource::Online => write!(f, "Online (OSM)"),
+            TileSource::Offline => write!(f, "Offline (MBTiles)"),
+        }
+    }
+}
+
+impl std::str::FromStr for TileSource {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "online" | "osm" | "" => Ok(TileSource::Online),
+            "offline" | "mbtiles" | "local" => Ok(TileSource::Offline),
+            _ => Err(format!("Invalid tile source: {}", s)),
+        }
+    }
+}
+
 impl Default for PowerLevel {
     fn default() -> Self {
         PowerLevel::High
@@ -216,6 +250,8 @@ pub struct AppSettings {
     pub mic_gain: String,
     pub channels: Vec<Channel>,
     pub last_channel_index: i32,
+    pub tile_source: TileSource,
+    pub offline_tiles_path: Option<String>,
     pub schema_version: u32,
 }
 
@@ -232,6 +268,8 @@ impl Default for AppSettings {
             mic_gain: defaults::MIC_GAIN.to_string(),
             channels: Vec::new(),
             last_channel_index: defaults::LAST_CHANNEL_INDEX,
+            tile_source: TileSource::default(),
+            offline_tiles_path: None,
             schema_version: CURRENT_SCHEMA_VERSION,
         }
     }
@@ -269,6 +307,17 @@ impl SettingsManager {
         // Load channels as JSON string
         let channels_json = self.settings.string("channels");
         let channels: Vec<Channel> = serde_json::from_str(&channels_json).unwrap_or_default();
+        
+        // Load tile source (default to Online if not set)
+        let tile_source_str = self.settings.string("tile-source");
+        let tile_source: TileSource = tile_source_str.to_string().parse().unwrap_or_default();
+        
+        // Load offline tiles path
+        let offline_tiles_path = if self.settings.string("offline-tiles-path").len() > 0 {
+            Some(self.settings.string("offline-tiles-path").to_string())
+        } else {
+            None
+        };
 
         AppSettings {
             frequency: self.settings.int("frequency") as u32,
@@ -281,6 +330,8 @@ impl SettingsManager {
             mic_gain: self.settings.string("mic-gain").to_string(),
             channels,
             last_channel_index: self.settings.int("last-channel-index"),
+            tile_source,
+            offline_tiles_path,
             schema_version: self.settings.int("schema-version") as u32,
         }
     }
@@ -361,6 +412,24 @@ impl SettingsManager {
         self.cached.last_channel_index = index;
         self.settings.set_int("last-channel-index", index).ok();
     }
+    
+    pub fn set_tile_source(&mut self, source: TileSource) {
+        self.cached.tile_source = source;
+        let source_str = match source {
+            TileSource::Online => "online",
+            TileSource::Offline => "offline",
+        };
+        self.settings.set_string("tile-source", source_str).ok();
+    }
+    
+    pub fn set_offline_tiles_path(&mut self, path: Option<&str>) {
+        self.cached.offline_tiles_path = path.map(String::from);
+        if let Some(p) = path {
+            self.settings.set_string("offline-tiles-path", p).ok();
+        } else {
+            self.settings.set_string("offline-tiles-path", "").ok();
+        }
+    }
 
     // ========================================================================
     // Getters
@@ -376,6 +445,8 @@ impl SettingsManager {
     pub fn mic_gain(&self) -> &str { &self.cached.mic_gain }
     pub fn last_channel_index(&self) -> i32 { self.cached.last_channel_index }
     pub fn schema_version(&self) -> u32 { self.cached.schema_version }
+    pub fn tile_source(&self) -> TileSource { self.cached.tile_source }
+    pub fn offline_tiles_path(&self) -> Option<&str> { self.cached.offline_tiles_path.as_deref() }
 
     pub fn channels(&self) -> &[Channel] {
         &self.cached.channels

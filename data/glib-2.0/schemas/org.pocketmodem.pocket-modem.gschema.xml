@@ -4,7 +4,7 @@
 
     <!-- Schema version for migrations -->
     <key name="schema-version" type="i">
-      <default>1</default>
+      <default>2</default>
       <summary>Schema version for settings migrations</summary>
       <description>Incremented when settings schema changes to trigger migration</description>
     </key>
@@ -71,6 +71,19 @@
       <default>"none"</default>
       <summary>Microphone gain boost</summary>
       <description>Mic gain boost level: "none", "low", "med", or "high"</description>
+    </key>
+
+    <!-- Map Settings -->
+    <key name="tile-source" type="s">
+      <default>"online"</default>
+      <summary>Map tile source</summary>
+      <description>Tile source for map: "online" (OSM) or "offline" (MBTiles)</description>
+    </key>
+
+    <key name="offline-tiles-path" type="s">
+      <default>""</default>
+      <summary>Path to offline MBTiles file</summary>
+      <description>Path to MBTiles archive for offline map tiles</description>
     </key>
 
   </schema>
