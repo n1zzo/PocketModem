@@ -273,14 +273,18 @@ fn create_ui(
     gps: &Arc<Mutex<GpsManager>>,
     settings: &SettingsManager,
 ) {
-    // Create the main window
+    // Create the main window (360px width for mobile displays)
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .default_width(360)
-        .default_height(800)
+        .default_height(740)
         .title("PocketModem")
         .build();
-    window.set_size_request(360, -1);
+    
+    // Use 360x740 size (Phosh minimum is ~354px)
+    window.set_size_request(360, 740);
+    window.set_resizable(false);
+    window.set_default_size(360, 740);
     
     // Apply saved frequency from settings on startup
     let saved_freq = settings.frequency();
@@ -372,6 +376,7 @@ fn create_ui(
     let clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
+    clamp.set_size_request(360, -1);
     
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.set_halign(gtk::Align::Center);
@@ -434,7 +439,7 @@ fn create_ui(
     freq_entry.set_text(&format!("{}.{:03}", saved_freq / 1000, saved_freq % 1000));
     gtk::prelude::EntryExt::set_alignment(&freq_entry, 0.5);
     freq_entry.add_css_class("freq-display");
-    freq_entry.set_size_request(260, 100);
+    freq_entry.set_size_request(340, 100);
     freq_entry.set_margin_start(16);
     freq_entry.set_margin_end(16);
     freq_entry.set_margin_top(8);
@@ -1198,6 +1203,7 @@ fn create_ui(
     let aprs_clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
+    aprs_clamp.set_size_request(360, -1);
     aprs_clamp.set_child(Some(&aprs_page));
     
     // =========================================================================
@@ -1251,6 +1257,7 @@ fn create_ui(
     let map_clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
+    map_clamp.set_size_request(360, -1);
     map_clamp.set_child(Some(&map_page));
     
     // =========================================================================
@@ -1289,6 +1296,7 @@ fn create_ui(
     let settings_clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
+    settings_clamp.set_size_request(360, -1);
     
     let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     
