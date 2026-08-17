@@ -373,20 +373,23 @@ fn create_ui(
     // MAIN PAGE
     // =========================================================================
     
-    // Clamp content width for proper libadwaita layout
+    // Clamp content width - constrains child to max 340px
     let clamp = adw::Clamp::builder()
         .maximum_size(340)
+        .tightening_threshold(340)
         .build();
     clamp.set_size_request(340, 700);
+    clamp.set_halign(gtk::Align::Center);
     
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.set_halign(gtk::Align::Center);
-    content_box.set_hexpand(true);
+    content_box.set_hexpand(false);
     content_box.set_vexpand(true);
     
     // --- Status indicators ---
     let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 32);
     status_row.set_halign(gtk::Align::Center);
+    status_row.set_hexpand(false);
     status_row.set_margin_top(16);
     status_row.set_margin_bottom(16);
     
@@ -490,6 +493,7 @@ fn create_ui(
     
     let smeter_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     smeter_box.set_halign(gtk::Align::Center);
+    smeter_box.set_hexpand(false);
     smeter_box.set_margin_start(24);
     smeter_box.set_margin_end(24);
     smeter_box.set_margin_top(12);
@@ -502,7 +506,7 @@ fn create_ui(
     signal_label.set_valign(gtk::Align::Center);
     signal_label.set_width_request(60);
     
-    rssi_sbar.set_hexpand(true);
+    rssi_sbar.set_hexpand(false);
     rssi_sbar.set_valign(gtk::Align::Center);
     
     let signal_value = gtk::Label::new(None);
@@ -650,7 +654,7 @@ fn create_ui(
         let row_container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         row_container.set_valign(gtk::Align::Center);
         row_container.add_css_class("channel-row");
-        row_container.set_hexpand(true);
+        row_container.set_hexpand(false);
         
         if current_channel_index.load(std::sync::atomic::Ordering::SeqCst) == channel_index as i32 {
             row_container.add_css_class("channel-row-selected");
@@ -660,10 +664,10 @@ fn create_ui(
             .title(&channel.name)
             .subtitle(&subtitle)
             .build();
-        row.set_hexpand(true);
+        row.set_hexpand(false);
         
         let row_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        row_spacer.set_hexpand(true);
+        row_spacer.set_hexpand(false);
         
         let edit_btn = gtk::Button::new();
         edit_btn.set_icon_name("document-edit-symbolic");
@@ -896,7 +900,7 @@ fn create_ui(
     
     let channel_scroll = gtk::ScrolledWindow::new();
     channel_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    channel_scroll.set_hexpand(true);
+    channel_scroll.set_hexpand(false);
     channel_scroll.set_vexpand(true);
     channel_scroll.set_min_content_height(80);
     channel_scroll.set_max_content_height(1000);
@@ -1193,7 +1197,7 @@ fn create_ui(
     
     let aprs_scroll = gtk::ScrolledWindow::new();
     aprs_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    aprs_scroll.set_hexpand(true);
+    aprs_scroll.set_hexpand(false);
     aprs_scroll.set_vexpand(true);
     aprs_scroll.set_min_content_height(200);
     aprs_scroll.set_child(Some(&aprs_list_box));
@@ -1201,11 +1205,13 @@ fn create_ui(
     aprs_page.append(&aprs_header);
     aprs_page.append(&aprs_scroll);
     
-    // APRS clamp
+    // APRS clamp - constrains width to 340px
     let aprs_clamp = adw::Clamp::builder()
         .maximum_size(340)
+        .tightening_threshold(340)
         .build();
     aprs_clamp.set_size_request(340, 700);
+    aprs_clamp.set_halign(gtk::Align::Center);
     aprs_clamp.set_child(Some(&aprs_page));
     
     // =========================================================================
@@ -1249,18 +1255,22 @@ fn create_ui(
     map_page.append(&gps_header);
     map_page.append(&map_view);
     
-    // Map clamp - constrain width
+    // Map clamp - constrains width to 340px
     let map_clamp = adw::Clamp::builder()
         .maximum_size(340)
+        .tightening_threshold(340)
         .build();
     map_clamp.set_size_request(340, 700);
+    map_clamp.set_halign(gtk::Align::Center);
     map_clamp.set_child(Some(&map_page));
     
     // =========================================================================
     // CAROUSEL (Swipe Navigation)
     // =========================================================================
+    // Carousel wrapper - fixed size container
     let carousel = adw::Carousel::new();
     carousel.set_interactive(true);
+    carousel.set_hexpand(false);
     carousel.set_vexpand(true);
     
     // Pages: FM (0), APRS (1), Map (2)
@@ -1274,12 +1284,13 @@ fn create_ui(
     indicator.set_halign(gtk::Align::Center);
     indicator.set_margin_bottom(8);
     
-    // Carousel wrapper - force fixed size
+    // Carousel box - fixed size, centered
     let carousel_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     carousel_box.set_size_request(340, 700);
+    carousel_box.set_halign(gtk::Align::Center);
+    carousel_box.set_hexpand(false);
     carousel_box.append(&carousel);
     carousel_box.append(&indicator);
-    carousel_box.set_vexpand(false);
     
     // Mode buttons hidden - APRS is always active
     btn_fm.set_visible(false);
@@ -1292,14 +1303,16 @@ fn create_ui(
     
     let settings_clamp = adw::Clamp::builder()
         .maximum_size(340)
+        .tightening_threshold(340)
         .build();
     settings_clamp.set_size_request(340, 700);
+    settings_clamp.set_halign(gtk::Align::Center);
     
     let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     
     let settings_scroll = gtk::ScrolledWindow::new();
     settings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    settings_scroll.set_hexpand(true);
+    settings_scroll.set_hexpand(false);
     settings_scroll.set_vexpand(true);
     
     let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 24);
@@ -1320,7 +1333,7 @@ fn create_ui(
     squelch_scale.set_value(saved_squelch as f64);
     squelch_scale.set_draw_value(false);
     squelch_scale.set_has_origin(true);
-    squelch_scale.set_hexpand(true);
+    squelch_scale.set_hexpand(false);
     
     let squelch_value_label = gtk::Label::new(Some(&saved_squelch.to_string()));
     squelch_value_label.set_width_request(20);
