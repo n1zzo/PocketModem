@@ -78,11 +78,11 @@ See `AGENTS.md` for detailed debug notes.
 - [x] Rewrite using libadwaita instead of GTK4
 - [x] Use toggle groups for power setting
 - [x] Add MODEM, GPS and AUDIO details with bottom sheet
+- [x] Handle channel edit
+- [x] Implement APRS, add toast for new messages
+- [ ] Add APRS message log and map views using carousel
 - [ ] Use libadwaita feature to show unrecoverable errors
 - [ ] Add flatpack build target
-- [ ] Handle channel edit using adwaita bottom sheet
-- [ ] Implement APRS, add toast for new messages
-- [ ] Add APRS message log and map views using carousel
 - [ ] Noise squelch option
 
 ### Development

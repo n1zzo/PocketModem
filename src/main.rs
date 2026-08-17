@@ -20,6 +20,9 @@ use settings::{SettingsManager, Channel, Duplex, ToneMode, PowerLevel};
 
 use radio::{KV4PRadio, SerialConfig};
 
+#[cfg(feature = "notifications")]
+use libnotify::{init, is_initted, Notification, Urgency};
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::thread;
@@ -113,6 +116,32 @@ fn calculate_distance_bearing(my_lat: f64, my_lon: f64, target_lat: f64, target_
     let bearing = y.atan2(x).to_degrees().rem_euclid(360.0);
     
     Some((distance_km, bearing))
+}
+
+/// Calculate distance in km (simplified, no GPS coordinates needed)
+fn calculate_distance_display(my_lat: f64, my_lon: f64, target_lat: f64, target_lon: f64) -> String {
+    if let Some((dist_km, _)) = calculate_distance_bearing(my_lat, my_lon, target_lat, target_lon) {
+        if dist_km < 1.0 {
+            format!("{:.0}m", dist_km * 1000.0)
+        } else if dist_km < 10.0 {
+            format!("{:.1}km", dist_km)
+        } else {
+            format!("{:.0}km", dist_km)
+        }
+    } else {
+        "??".to_string()
+    }
+}
+
+/// Show a desktop notification for APRS messages
+#[cfg(feature = "notifications")]
+fn show_aprs_notification(body: &str, _from: &str) -> Result<(), String> {
+    if !is_initted() {
+        init("pocket-modem").map_err(|e| format!("Failed to init: {:?}", e))?;
+    }
+    
+    let n = Notification::new("APRS", Some(body), None);
+    n.show().map_err(|e| format!("Show failed: {:?}", e))
 }
 
 /// Format bearing as compass direction with arrow
@@ -1370,7 +1399,48 @@ fn create_ui(
             
             eprintln!("[pocket-modem] APRS: {} -> {} ({:?})", 
                       msg.from_callsign, msg.to_callsign, msg.msg_type);
+            
+            // Build notification text
+            let notification_text = match msg.msg_type {
+                aprs::APRSType::Position => {
+                    if msg.position_lat != 0.0 || msg.position_lon != 0.0 {
+                        format!("{}: {}km", msg.from_callsign, 
+                                calculate_distance_display(45.496, 9.376, msg.position_lat, msg.position_lon))
+                    } else {
+                        msg.from_callsign.clone()
+                    }
+                }
+                aprs::APRSType::Message => {
+                    format!("{}: {}", msg.from_callsign, 
+                            msg.msg_body.as_deref().unwrap_or(""))
+                }
+                aprs::APRSType::Weather => format!("{}: Weather", msg.from_callsign),
+                _ => msg.from_callsign.clone(),
+            };
+            
+            // Truncate long messages
+            let notification_text = if notification_text.len() > 50 { 
+                format!("{}...", &notification_text[..47]) 
+            } else { 
+                notification_text 
+            };
+            
+            // Show desktop notification
+            #[cfg(feature = "notifications")]
+            if let Err(e) = show_aprs_notification(&notification_text, &msg.from_callsign) {
+                eprintln!("[pocket-modem] Notification error: {}", e);
+            }
         });
+    }
+    
+    // Initialize notifications
+    #[cfg(feature = "notifications")]
+    {
+        if let Err(e) = init("pocket-modem") {
+            eprintln!("[pocket-modem] Failed to init notifications: {:?}", e);
+        } else {
+            eprintln!("[pocket-modem] Notifications initialized");
+        }
     }
     
     // Update loop for live status

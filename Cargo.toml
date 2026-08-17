@@ -6,12 +6,19 @@ authors = ["PocketModem Team"]
 license = "GPL-3.0-or-later"
 description = "GTK4 UI for PocketModem Radio - Native KV4P protocol"
 
+[features]
+default = ["notifications"]
+notifications = []
+
 [dependencies]
 serialport = "4.6"
 glib = "0.22"
 gio = "0.22"
 gtk = { version = "0.11", package = "gtk4" }
 adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
+
+# Desktop notifications
+libnotify = "1.0"
 
 # Serialization for settings
 serde = { version = "1.0", features = ["derive"] }
