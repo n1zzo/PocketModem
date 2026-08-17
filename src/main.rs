@@ -281,10 +281,10 @@ fn create_ui(
         .title("PocketModem")
         .build();
     
-    // Use 360x800 size (Phosh minimum is ~354px wide)
-    window.set_size_request(360, 800);
+    // Use 360x760 size (Phosh minimum is ~354px wide)
+    window.set_size_request(360, 760);
     window.set_resizable(false);
-    window.set_default_size(360, 800);
+    window.set_default_size(360, 760);
     
     // Apply saved frequency from settings on startup
     let saved_freq = settings.frequency();
@@ -376,7 +376,7 @@ fn create_ui(
     let clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
-    clamp.set_size_request(360, 800);
+    clamp.set_size_request(360, 760);
     
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.set_halign(gtk::Align::Center);
@@ -1204,7 +1204,7 @@ fn create_ui(
     let aprs_clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
-    aprs_clamp.set_size_request(360, 800);
+    aprs_clamp.set_size_request(360, 760);
     aprs_clamp.set_child(Some(&aprs_page));
     
     // =========================================================================
@@ -1258,7 +1258,7 @@ fn create_ui(
     let map_clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
-    map_clamp.set_size_request(360, 800);
+    map_clamp.set_size_request(360, 760);
     map_clamp.set_child(Some(&map_page));
     
     // =========================================================================
@@ -1297,7 +1297,7 @@ fn create_ui(
     let settings_clamp = adw::Clamp::builder()
         .maximum_size(360)
         .build();
-    settings_clamp.set_size_request(360, 800);
+    settings_clamp.set_size_request(360, 760);
     
     let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     
