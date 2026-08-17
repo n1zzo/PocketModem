@@ -284,6 +284,8 @@ fn create_ui(
         .build();
     
     // Use 360x700 size (Phosh minimum is ~354px wide)
+    // NOTE: Window will expand to ~464px wide when map page is displayed due to
+    // libshumate's Clutter stage natural size. This is a known limitation.
     window.set_size_request(360, 700);
     window.set_resizable(false);
     window.set_default_size(360, 700);
@@ -1210,21 +1212,23 @@ fn create_ui(
     aprs_clamp.set_child(Some(&aprs_page));
     
     // =========================================================================
-    // MAP PAGE (libshumate)
+    // MAP PAGE (simple tiles)
     // =========================================================================
     eprintln!("[main] Creating MapManager...");
     
     let mut manager = MapManager::new();
+    manager.initialize();
     eprintln!("[main] MapManager created");
     
-    // Get the view (SimpleMap is refcounted via GObject)
-    let map_view = manager.view().clone();
+    // Get the DrawingArea widget
+    let map_view = manager.view_cloned();
     
     // Wrap manager in Arc for future update capability
     let map_manager = Arc::new(Mutex::new(manager));
     
     // Create map page with GPS header and map view
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    map_page.set_size_request(340, 700);
     
     // GPS info header with locator
     let gps_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -1244,22 +1248,15 @@ fn create_ui(
     gps_header.append(&locator_label);
     gps_header.append(&coords_label);
     
-    // Wrap map in ScrolledWindow for clipping
-    let map_scroll = gtk::ScrolledWindow::new();
-    map_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
-    map_scroll.set_hexpand(false);
-    map_scroll.set_vexpand(true);
-    map_scroll.set_size_request(360, 600);
-    map_scroll.set_child(Some(&map_view));
-    
+    // Map is a fixed-size DrawingArea
     map_page.append(&gps_header);
-    map_page.append(&map_scroll);
+    map_page.append(&map_view);
     
-    // Map clamp
+    // Map clamp - constrain width
     let map_clamp = adw::Clamp::builder()
-        .maximum_size(360)
+        .maximum_size(340)
         .build();
-    map_clamp.set_size_request(360, 700);
+    map_clamp.set_size_request(340, 700);
     map_clamp.set_child(Some(&map_page));
     
     // =========================================================================
@@ -1280,11 +1277,12 @@ fn create_ui(
     indicator.set_halign(gtk::Align::Center);
     indicator.set_margin_bottom(8);
     
-    // Carousel wrapper
+    // Carousel wrapper - force fixed size to contain libshumate
     let carousel_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    carousel_box.set_size_request(360, 700);
     carousel_box.append(&carousel);
     carousel_box.append(&indicator);
-    carousel_box.set_vexpand(true);
+    carousel_box.set_vexpand(false);
     
     // Mode buttons hidden - APRS is always active
     btn_fm.set_visible(false);
@@ -1472,8 +1470,7 @@ fn create_ui(
     
     let locator_label_clone = locator_label.clone();
     let coords_label_clone = coords_label.clone();
-    // Note: map_manager updates disabled for now to avoid borrow issues
-    // let map_manager_clone = Arc::clone(&map_manager);
+    let map_manager_clone = Arc::clone(&map_manager);
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if let Ok(r) = radio_update.lock() {
@@ -1618,9 +1615,9 @@ fn create_ui(
                             my_lon,
                         );
                         // Update map with new APRS station
-                        // if let Ok(mut map) = map_manager_clone.lock() {
-                        //     map.update_station(msg);
-                        // }
+                        if let Ok(mut map) = map_manager_clone.lock() {
+                            map.update_station(msg);
+                        }
                         new_last = i + 1;
                     }
                 }
@@ -1644,10 +1641,10 @@ fn create_ui(
                         lat, lon
                     ));
                     // Update map with user position
-                    // if let Ok(mut map) = map_manager_clone.lock() {
-                    //     map.set_user_position(lat, lon);
-                    //     map.center_on_user(lat, lon);
-                    // }
+                    if let Ok(mut map) = map_manager_clone.lock() {
+                        map.set_user_position(lat, lon);
+                        map.center_on_user();
+                    }
                 } else {
                     locator_label_clone.set_markup(
                         "<span color='#FFB000'>MAIDENHEAD: --- (searching)</span>"
@@ -1668,6 +1665,13 @@ fn create_ui(
         }
         
         ptt_label_update.set_text("PTT");
+        
+        // Check if map needs a redraw (from background tile loading)
+        if let Ok(map) = map_manager_clone.lock() {
+            if map.needs_redraw() {
+                map.request_redraw();
+            }
+        }
         
         glib::ControlFlow::Continue
     });

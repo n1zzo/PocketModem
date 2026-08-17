@@ -16,11 +16,11 @@ glib = "0.22"
 gio = "0.22"
 gtk = { version = "0.11", package = "gtk4" }
 adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
+cairo-rs = "0.22"
 
-# Map display (libshumate)
-libshumate = { version = "0.8", features = ["gtk_v4_10"] }
-
-
+# Map display - HTTP tiles + image rendering
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+image = "0.25"
 
 # Desktop notifications
 libnotify = "1.0"
