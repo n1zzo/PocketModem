@@ -1014,6 +1014,7 @@ fn create_ui(
     }
     
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    map_page.set_size_request(360, -1);
     map_page.set_hexpand(false);
     map_page.set_vexpand(true);
     map_page.set_halign(gtk::Align::Center);
@@ -1041,6 +1042,7 @@ fn create_ui(
         mm.view().clone()
     };
     // Fill available space (below GPS header and above carousel)
+    map_view.set_size_request(360, -1);
     map_view.set_hexpand(false);
     map_view.set_vexpand(true);
     map_view.set_valign(gtk::Align::Fill);
@@ -1048,11 +1050,11 @@ fn create_ui(
     
     // Map container
     let map_clamp = adw::Clamp::new();
-    map_clamp.set_size_request(330, 700);
+    map_clamp.set_size_request(360, 700);
     map_clamp.set_hexpand(false);
     map_clamp.set_vexpand(false);
-    map_clamp.set_maximum_size(340);
-    map_clamp.set_tightening_threshold(340);
+    map_clamp.set_maximum_size(370);
+    map_clamp.set_tightening_threshold(370);
     map_clamp.set_child(Some(&map_page));
     
     // =========================================================================
@@ -1062,12 +1064,12 @@ fn create_ui(
     carousel.set_interactive(true);
     carousel.set_hexpand(false);
     carousel.set_vexpand(true);
-    carousel.set_size_request(330, 654);  // Constrain carousel to prevent expansion
+    carousel.set_size_request(360, 654);  // Constrain carousel to prevent expansion
     carousel.set_halign(gtk::Align::Center);
     
     // Wrap carousel in a constrained box
     let carousel_wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    carousel_wrapper.set_size_request(330, 654);
+    carousel_wrapper.set_size_request(360, 654);
     carousel_wrapper.set_hexpand(false);
     carousel_wrapper.set_vexpand(true);
     carousel_wrapper.set_halign(gtk::Align::Center);
@@ -1086,7 +1088,7 @@ fn create_ui(
     indicator.set_margin_bottom(8);
     
     let carousel_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    carousel_box.set_size_request(330, 700);
+    carousel_box.set_size_request(360, 700);
     carousel_box.set_hexpand(false);
     carousel_box.append(&carousel_wrapper);
     carousel_box.append(&indicator);
@@ -1169,7 +1171,7 @@ fn create_ui(
     // ViewStack
     // =========================================================================
     let stack = adw::ViewStack::new();
-    stack.set_size_request(330, 654);
+    stack.set_size_request(360, 654);
     stack.set_hexpand(false);
     stack.set_vexpand(false);
     stack.set_halign(gtk::Align::Center);
@@ -1185,7 +1187,7 @@ fn create_ui(
     });
     
     let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_size_request(330, 654);
+    toast_overlay.set_size_request(360, 654);
     toast_overlay.set_hexpand(false);
     toast_overlay.set_vexpand(false);
     toast_overlay.set_halign(gtk::Align::Center);
@@ -1551,10 +1553,10 @@ fn create_ui(
     // Wrap content in a Fixed container to force exact 340x700 size
     // Wrap content in a Box with strict width constraint via CSS
     let fixed_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    fixed_container.set_size_request(330, 700);
+    fixed_container.set_size_request(360, 700);
     fixed_container.set_hexpand(false);
     fixed_container.set_vexpand(false);
-    fixed_container.set_halign(gtk::Align::Center);  // Center the 340px content
+    fixed_container.set_halign(gtk::Align::Center);  // Center the 360px content
     fixed_container.set_valign(gtk::Align::Start);
     
     fixed_container.append(&header_bar);
@@ -1564,8 +1566,8 @@ fn create_ui(
     window.show();
     
     // Force window size after content is set - GTK may expand during layout
-    window.set_size_request(330, 700);
-    window.set_default_size(340, 700);
+    window.set_size_request(360, 700);
+    window.set_default_size(370, 700);
     
 
 }

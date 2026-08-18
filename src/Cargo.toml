@@ -18,15 +18,18 @@ gtk = { version = "0.11", package = "gtk4" }
 adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
 cairo-rs = "0.22"
 
-# Image processing for map tiles
-image = "0.25"
+# Map widget (uses libshumate for GTK4 map rendering)
+# Enable v1_2 for VectorRenderer (vector tile support)
+libshumate = { version = "0.8", features = ["v1_2"] }
 
-# HTTP client for tile downloading
-reqwest = { version = "0.12", features = ["blocking"] }
+# Image processing for APRS symbol spritesheets
+image = "0.25"
 
 # Desktop notifications
 libnotify = "1.0"
-libnotify = "1.0"
+
+# HTTP client for tile downloading (rustls for TLS, no OpenSSL needed)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
 # Serialization for settings
 serde = { version = "1.0", features = ["derive"] }

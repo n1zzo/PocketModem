@@ -42,8 +42,12 @@ fn generate_map_style(is_dark: bool) -> String {
     let bg_color = if is_dark { "#1a1a1a" } else { "#f8f9fa" };
     let land_color = if is_dark { "#2d2d2d" } else { "#e8e0d8" };
     let water_color = if is_dark { "#2a4a6a" } else { "#a8d4e6" };
-    let road_color = if is_dark { "#4a4a4a" } else { "#ffffff" };
-    let text_color = if is_dark { "#e0e0e0" } else { "#333333" };
+    // Roads: lighter in dark mode for visibility
+    let road_color = if is_dark { "#6a6a6a" } else { "#d0d0d0" };
+    let road_width = if is_dark { 2.0 } else { 1.5 };
+    // Text: bright in dark mode, dark in light mode
+    let text_color = if is_dark { "#ffffff" } else { "#222222" };
+    let text_halo = if is_dark { "#1a1a1a" } else { "#ffffff" };
 
     format!(r#"{{
   "version": 8,
@@ -84,8 +88,8 @@ fn generate_map_style(is_dark: bool) -> String {
       "filter": ["==", "$type", "LineString"],
       "paint": {{
         "line-color": "{}",
-        "line-width": 2,
-        "line-opacity": 0.8
+        "line-width": {},
+        "line-opacity": 0.9
       }}
     }},
     {{
@@ -95,12 +99,17 @@ fn generate_map_style(is_dark: bool) -> String {
       "source-layer": "place",
       "layout": {{
         "text-field": "{{name:latin}}",
-        "text-size": 12,
-        "text-color": "{}"
+        "text-size": 11,
+        "text-color": "{}",
+        "text-halo-color": "{}",
+        "text-halo-width": 1.5
+      }},
+      "paint": {{
+        "text-opacity": 0.9
       }}
     }}
   ]
-}}"#, if is_dark { "Dark" } else { "Light" }, GNOME_TILE_URL, bg_color, land_color, water_color, road_color, text_color)
+}}"#, if is_dark { "Dark" } else { "Light" }, GNOME_TILE_URL, bg_color, land_color, water_color, road_color, road_width, text_color, text_halo)
 }
 
 // ============================================================================
