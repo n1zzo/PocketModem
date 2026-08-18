@@ -246,8 +246,10 @@ fn decode_position(msg: &mut APRSMessage, payload: &[u8]) {
                 let sym1 = remainder[0] as char;
                 let sym2 = remainder[1] as char;
                 
-                // Valid APRS symbol: symbol table ID is / or \, symbol code is graphic
-                if (sym1 == '/' || sym1 == '\\') && sym2.is_ascii_graphic() {
+                // Valid APRS symbol: symbol table ID is /, \, #, or overlay digit
+                // / = primary table, \ = alternate table, # = overlay, 0-9 = overlay on table
+                let is_valid_table_id = matches!(sym1, '/' | '\\' | '#' | '0'..='9');
+                if is_valid_table_id && sym2.is_ascii_graphic() {
                     msg.symbol_table_id = Some(sym1);
                     msg.symbol_code = Some(sym2);
                     msg.comment = String::from_utf8_lossy(&remainder[2..]).trim_end().to_string();
