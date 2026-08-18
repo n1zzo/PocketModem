@@ -21,11 +21,10 @@ cairo-rs = "0.22"
 # Image processing for map tiles
 image = "0.25"
 
-# HTTP client for tile downloading
-reqwest = { version = "0.12", features = ["blocking"] }
+# HTTP client for tile downloading (rustls for TLS, no OpenSSL needed)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
 # Desktop notifications
-libnotify = "1.0"
 libnotify = "1.0"
 
 # Serialization for settings

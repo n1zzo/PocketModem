@@ -1000,6 +1000,14 @@ fn create_ui(
     // =========================================================================
     let map_manager = Arc::new(Mutex::new(MapManager::new()));
     
+    // Load APRS symbols from submodule
+    {
+        let mm = map_manager.lock().unwrap();
+        if let Err(e) = mm.load_aprs_symbols(std::path::Path::new("aprs-symbols")) {
+            eprintln!("[pocket-modem] Failed to load APRS symbols: {}", e);
+        }
+    }
+    
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     map_page.set_size_request(330, 700);
     map_page.set_hexpand(false);
@@ -1348,17 +1356,20 @@ fn create_ui(
                     if let Some(msg) = msgs.get(i) {
                         add_aprs_message_to_list(msg, &aprs_list_box_clone, &aprs_empty_label_clone, my_lat, my_lon);
                         if let Ok(mut map) = map_manager_clone.lock() {
-                            // Extract symbol from comment if available
-                            let symbol = if !msg.comment.is_empty() {
-                                msg.comment.chars().next().unwrap_or('?')
+                            // Extract APRS symbol from comment (first two chars are symbol table/code)
+                            // Default to primary table / with ? if not available
+                            let (symbol_table, symbol_code) = if msg.comment.len() >= 2 {
+                                (msg.comment.chars().next().unwrap_or('/'), 
+                                 msg.comment.chars().nth(1).unwrap_or('?'))
                             } else {
-                                '?'
+                                ('/', '?')
                             };
                             map.update_station(
                                 &msg.from_callsign,
                                 msg.position_lat,
                                 msg.position_lon,
-                                symbol,
+                                symbol_table,
+                                symbol_code,
                                 &msg.comment,
                                 msg.timestamp as u32,
                             );
@@ -1435,7 +1446,8 @@ fn create_ui(
                 let map_state = map_manager_for_callback.lock().unwrap().get_state();
                 let mw = map_widget_for_callback.lock().unwrap();
                 let cache = map_manager_for_callback.lock().unwrap().get_tile_cache();
-                mw.draw(&cr, width, height, &map_state, &cache);
+                let aprs_symbols = map_manager_for_callback.lock().unwrap().get_aprs_symbols();
+                mw.draw(&cr, width, height, &map_state, &cache, &aprs_symbols);
             });
             drawing_area.queue_draw();
         }

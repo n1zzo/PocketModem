@@ -3,7 +3,7 @@
 //! Features:
 //! - OpenStreetMap tile rendering
 //! - User position marker (green)
-//! - APRS stations as walkers with colored markers
+//! - APRS stations with official APRS symbol icons from aprs-symbols submodule
 //! - Background tile loading with placeholder display
 
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::hash::{Hash, Hasher};
 use std::fmt;
+use std::path::Path;
 
 /// Tile ID for OpenStreetMap tiles
 #[derive(Clone, Copy, PartialEq, Eq, Hash)] 
@@ -38,87 +39,71 @@ impl Default for TileId {
     }
 }
 
+/// APRS symbol info
+#[derive(Debug, Clone)]
+pub struct APRSSymbol {
+    /// Symbol table (0 = primary, 1 = secondary, 2 = overlay)
+    pub table: u8,
+    /// Symbol code within the table (0-89)
+    pub code: u8,
+}
+
+impl APRSSymbol {
+    /// Parse APRS symbol from two characters
+    /// Returns None if invalid
+    pub fn from_chars(table_char: char, code_char: char) -> Option<Self> {
+        let table = match table_char {
+            '/' => 0,  // Primary table
+            '\\' => 1, // Secondary table
+            _ => return None,
+        };
+        
+        // Symbol codes are ASCII, map to 0-89
+        let code = code_char as u8;
+        if code < 32 || code > 126 {
+            return None;
+        }
+        
+        Some(Self { table, code })
+    }
+    
+    /// Get row and column in the spritesheet for this symbol
+    /// Each symbol is 24x24 pixels, spritesheet has 16 symbols per row
+    pub fn sprite_position(&self) -> Option<(u32, u32)> {
+        if self.table > 2 {
+            return None;
+        }
+        
+        // Symbol code maps to position
+        // Map ASCII to 0-89 index: 'A' to 'Z' = 0-25, '0' to '9' = 26-35, 'a' to 'z' = 36-61
+        let index = match self.code {
+            b'A'..=b'Z' => (self.code - b'A') as u32,
+            b'0'..=b'9' => 26 + (self.code - b'0') as u32,
+            b'a'..=b'z' => 36 + (self.code - b'a') as u32,
+            _ => return None,
+        };
+        
+        if index >= 88 {
+            return None; // Out of bounds
+        }
+        
+        let col = index % 16;
+        let row = index / 16;
+        let table_row = self.table as u32;
+        
+        Some((table_row * 32 + row * 24, col * 24))
+    }
+}
+
 /// APRS station data for map display
 #[derive(Debug, Clone)]
 pub struct MapStation {
     pub callsign: String,
     pub lat: f64,
     pub lon: f64,
-    pub symbol: String,
+    pub symbol: APRSSymbol,
     pub comment: String,
     pub timestamp: u32,
-    pub station_type: StationType,
-}
-
-/// Type of APRS station (affects icon)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StationType {
-    Walker,
-    Bicycle,
-    Car,
-    Boat,
-    Aircraft,
-    Fixed,
-    Unknown,
-}
-
-impl Default for StationType {
-    fn default() -> Self {
-        StationType::Unknown
-    }
-}
-
-impl StationType {
-    /// Determine station type from APRS symbol or comment
-    pub fn from_symbol_and_comment(symbol: char, comment: &str) -> Self {
-        match symbol {
-            '>' => StationType::Car,
-            'b' => StationType::Bicycle,
-            'j' => StationType::Boat,
-            '\'' => StationType::Aircraft,
-            '[' => StationType::Walker,
-            _ => {
-                let comment_lower = comment.to_lowercase();
-                if comment_lower.contains("foot") || comment_lower.contains("hike") || comment_lower.contains("walk") {
-                    StationType::Walker
-                } else if comment_lower.contains("bike") || comment_lower.contains("bicycle") {
-                    StationType::Bicycle
-                } else if comment_lower.contains("car") || comment_lower.contains("vehicle") {
-                    StationType::Car
-                } else if comment_lower.contains("boat") || comment_lower.contains("sail") {
-                    StationType::Boat
-                } else {
-                    StationType::Unknown
-                }
-            }
-        }
-    }
-    
-    /// Marker size for this station type
-    pub fn marker_size(&self) -> f32 {
-        match self {
-            StationType::Walker => 10.0,
-            StationType::Bicycle => 8.0,
-            StationType::Car => 12.0,
-            StationType::Boat => 11.0,
-            StationType::Aircraft => 14.0,
-            StationType::Fixed => 6.0,
-            StationType::Unknown => 8.0,
-        }
-    }
-    
-    /// Color RGBA for this station type
-    pub fn color(&self) -> (f32, f32, f32, f32) {
-        match self {
-            StationType::Walker => (1.0, 0.69, 0.0, 1.0),     // Orange #FFB000
-            StationType::Bicycle => (0.4, 0.67, 1.0, 1.0),    // Blue
-            StationType::Car => (1.0, 0.27, 0.27, 1.0),       // Red
-            StationType::Boat => (0.27, 0.87, 1.0, 1.0),      // Cyan
-            StationType::Aircraft => (1.0, 0.59, 0.78, 1.0),  // Pink
-            StationType::Fixed => (0.53, 0.53, 0.53, 1.0),    // Gray
-            StationType::Unknown => (0.67, 0.67, 0.67, 1.0),  // Light gray
-        }
-    }
 }
 
 /// Map state
@@ -162,7 +147,8 @@ impl MapState {
 pub struct MapManager {
     state: Arc<Mutex<MapState>>,
     tile_cache: Arc<Mutex<HashMap<TileId, Arc<image::RgbaImage>>>>,
-    /// Queue of tiles to load
+    /// APRS symbol spritesheet cache
+    aprs_symbols: Arc<Mutex<Option<image::RgbaImage>>>,
     pending_tiles: Arc<Mutex<Vec<TileId>>>,
 }
 
@@ -171,6 +157,7 @@ impl MapManager {
         Self {
             state: Arc::new(Mutex::new(MapState::default())),
             tile_cache: Arc::new(Mutex::new(HashMap::new())),
+            aprs_symbols: Arc::new(Mutex::new(None)),
             pending_tiles: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -182,9 +169,13 @@ impl MapManager {
         state.needs_redraw = true;
     }
 
-    pub fn update_station(&mut self, callsign: &str, lat: f64, lon: f64, symbol: char, comment: &str, timestamp: u32) {
+    /// Update or add an APRS station
+    /// symbol_table and symbol_code are the APRS symbol characters
+    pub fn update_station(&mut self, callsign: &str, lat: f64, lon: f64, symbol_table: char, symbol_code: char, comment: &str, timestamp: u32) {
         let mut state = self.state.lock().unwrap();
-        let station_type = StationType::from_symbol_and_comment(symbol, comment);
+        
+        let symbol = APRSSymbol::from_chars(symbol_table, symbol_code)
+            .unwrap_or(APRSSymbol { table: 0, code: b'?' });
         
         let is_new = !state.stations.contains_key(callsign);
         
@@ -192,10 +183,9 @@ impl MapManager {
             callsign: callsign.to_string(),
             lat,
             lon,
-            symbol: symbol.to_string(),
+            symbol,
             comment: comment.to_string(),
             timestamp,
-            station_type,
         });
         
         if is_new {
@@ -253,6 +243,42 @@ impl MapManager {
     /// Get tile cache
     pub fn get_tile_cache(&self) -> Arc<Mutex<HashMap<TileId, Arc<image::RgbaImage>>>> {
         Arc::clone(&self.tile_cache)
+    }
+    
+    /// Get APRS symbols spritesheet (lazy loaded)
+    pub fn get_aprs_symbols(&self) -> Arc<Mutex<Option<image::RgbaImage>>> {
+        Arc::clone(&self.aprs_symbols)
+    }
+    
+    /// Load APRS symbols spritesheet
+    pub fn load_aprs_symbols(&self, path: &Path) -> Result<(), String> {
+        let mut cache = self.aprs_symbols.lock().unwrap();
+        
+        if cache.is_some() {
+            return Ok(()); // Already loaded
+        }
+        
+        // Try different spritesheet sizes
+        let sizes = [24, 48, 64, 128];
+        for size in sizes {
+            let spritesheet_path = path.join(format!("png/aprs-symbols-{}-{}.png", size, 0));
+            if spritesheet_path.exists() {
+                match image::open(&spritesheet_path) {
+                    Ok(img) => {
+                        let rgba = img.to_rgba8();
+                        eprintln!("[map] Loaded APRS symbols: {}x{}, size={}", 
+                            rgba.width(), rgba.height(), size);
+                        *cache = Some(rgba);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("[map] Failed to load {}: {}", spritesheet_path.display(), e);
+                    }
+                }
+            }
+        }
+        
+        Err("Could not find APRS symbols spritesheet".to_string())
     }
     
     /// Start background tile loading for visible tiles
@@ -371,7 +397,6 @@ use cairo::{Context, Format, ImageSurface};
 /// Custom map widget that renders OSM tiles
 pub struct MapWidget {
     pub widget: gtk::DrawingArea,
-    tile_cache: Arc<Mutex<HashMap<TileId, Arc<image::RgbaImage>>>>,
 }
 
 impl MapWidget {
@@ -381,18 +406,13 @@ impl MapWidget {
         area.set_hexpand(false);
         area.set_vexpand(false);
         
-        let tile_cache = Arc::new(Mutex::new(HashMap::new()));
-        
-        Self { widget: area, tile_cache }
-    }
-    
-    pub fn get_tile_cache(&self) -> Arc<Mutex<HashMap<TileId, Arc<image::RgbaImage>>>> {
-        Arc::clone(&self.tile_cache)
+        Self { widget: area }
     }
     
     /// Draw the map using Cairo
-    /// Uses the provided tile cache (typically from MapManager)
-    pub fn draw(&self, cr: &Context, width: i32, height: i32, state: &MapState, tile_cache: &Arc<Mutex<HashMap<TileId, Arc<image::RgbaImage>>>>) {
+    pub fn draw(&self, cr: &Context, width: i32, height: i32, state: &MapState, 
+                tile_cache: &Arc<Mutex<HashMap<TileId, Arc<image::RgbaImage>>>>,
+                aprs_symbols: &Arc<Mutex<Option<image::RgbaImage>>>) {
         let tile_size = 256.0;
         let zoom = state.zoom as u32;
         
@@ -450,7 +470,7 @@ impl MapWidget {
             }
         }
         
-        // Draw user position marker
+        // Draw user position marker (house icon style)
         if let Some((lat, lon)) = state.get_user_position() {
             let (ux, uy) = lat_lon_to_tile(lat, lon, zoom);
             
@@ -471,7 +491,8 @@ impl MapWidget {
             let _ = cr.fill();
         }
         
-        // Draw APRS station markers
+        // Draw APRS station markers with official symbols
+        let symbol_size = 24.0; // APRS symbol size
         for station in state.stations.values() {
             let (sx, sy) = lat_lon_to_tile(station.lat, station.lon, zoom);
             
@@ -479,19 +500,30 @@ impl MapWidget {
             let tile_frac_y = (sy - cy) * tile_size + height as f64 / 2.0 + pan_y;
             
             // Skip if off screen
-            if tile_frac_x < -20.0 || tile_frac_x > width as f64 + 20.0 ||
-               tile_frac_y < -20.0 || tile_frac_y > height as f64 + 20.0 {
+            if tile_frac_x < -symbol_size || tile_frac_x > width as f64 + symbol_size ||
+               tile_frac_y < -symbol_size || tile_frac_y > height as f64 + symbol_size {
                 continue;
             }
             
-            let (r, g, b, a) = station.station_type.color();
-            let size = station.station_type.marker_size();
+            // Get sprite position for this symbol
+            if let Some((row, col)) = station.symbol.sprite_position() {
+                // Try to draw from spritesheet
+                if let Some(spritesheet) = aprs_symbols.lock().unwrap().as_ref() {
+                    let symbol_img = extract_symbol(spritesheet, row, col, 24);
+                    if let Some(img) = symbol_img {
+                        // Draw the symbol centered on position
+                        let x = tile_frac_x - symbol_size / 2.0;
+                        let y = tile_frac_y - symbol_size / 2.0;
+                        Self::draw_tile_image(cr, &img, x, y, symbol_size);
+                        continue;
+                    }
+                }
+            }
             
-            cr.set_source_rgba(r as f64, g as f64, b as f64, a as f64);
-            cr.arc(tile_frac_x, tile_frac_y, size as f64 / 2.0, 0.0, 2.0 * std::f64::consts::PI);
+            // Fallback: draw a simple circle marker
+            cr.set_source_rgb(0.0, 0.5, 1.0);
+            cr.arc(tile_frac_x, tile_frac_y, 8.0, 0.0, 2.0 * std::f64::consts::PI);
             let _ = cr.fill();
-            
-            // White border
             cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.set_line_width(1.5);
             let _ = cr.stroke();
@@ -522,7 +554,7 @@ impl MapWidget {
             Err(_) => return,
         };
         
-        // Scale to fit tile size
+        // Scale to fit target size
         let scale_x = size / img_width as f64;
         let scale_y = size / img_height as f64;
         
@@ -534,4 +566,30 @@ impl MapWidget {
         let _ = cr.paint();
         cr.restore();
     }
+}
+
+/// Extract a symbol from the spritesheet
+fn extract_symbol(spritesheet: &image::RgbaImage, row: u32, col: u32, size: u32) -> Option<image::RgbaImage> {
+    let (sheet_width, sheet_height) = spritesheet.dimensions();
+    
+    let x = col;
+    let y = row;
+    
+    if x + size > sheet_width || y + size > sheet_height {
+        return None;
+    }
+    
+    let mut result = image::RgbaImage::new(size, size);
+    
+    for dy in 0..size {
+        for dx in 0..size {
+            let px = x + dx;
+            let py = y + dy;
+            if let Some(pixel) = spritesheet.get_pixel_checked(px, py) {
+                result.put_pixel(dx, dy, *pixel);
+            }
+        }
+    }
+    
+    Some(result)
 }
