@@ -4,11 +4,6 @@
 //! 1. Fetches OSM tiles directly via HTTP
 //! 2. Uses GTK4 DrawingArea for 2D rendering with built-in cairo
 //! 3. No Clutter or WebKit dependencies
-//!
-//! Benefits:
-//! - No internal sub-widgets forcing width requests
-//! - Perfect for 360px mobile displays
-//! - Lightweight and portable
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -62,8 +57,8 @@ pub struct CachedTile {
 
 /// Manages the map view, tiles, and APRS markers using GTK4
 pub struct MapManager {
-    /// The GTK DrawingArea for rendering
-    drawing_area: DrawingArea,
+    /// The GTK DrawingArea for rendering (created lazily in view_cloned)
+    drawing_area: Option<DrawingArea>,
     /// Shared map state
     state: Arc<Mutex<MapState>>,
     /// Cached tiles (tile_x, tile_y, zoom) -> CachedTile
@@ -79,30 +74,10 @@ impl MapManager {
         let tile_cache = Arc::new(Mutex::new(HashMap::new()));
         let needs_redraw = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Create DrawingArea for 2D rendering
-        let drawing_area = DrawingArea::new();
-        drawing_area.set_size_request(340, 580);
-        drawing_area.set_hexpand(false);
-        drawing_area.set_vexpand(false);
-        drawing_area.add_css_class("map-area");
-        
-        // Force size via CSS min-width
-        let css_provider = gtk::CssProvider::new();
-        css_provider.load_from_data(".map-area { min-width: 340px; max-width: 340px; }");
-        drawing_area.style_context().add_provider(&css_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-        
-        // Wrap in a constrained Box
-        let wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        wrapper.set_size_request(340, 620);
-        wrapper.set_hexpand(false);
-        wrapper.set_vexpand(false);
-        wrapper.set_halign(gtk::Align::Center);
-        wrapper.append(&drawing_area);
-
         eprintln!("[map] MapManager created with simple tile rendering");
 
         Self {
-            drawing_area,
+            drawing_area: None,
             state,
             tile_cache,
             needs_redraw,
@@ -111,47 +86,9 @@ impl MapManager {
 
     /// Initialize the map manager
     pub fn initialize(&mut self) {
-        // Set up drawing callback
-        self.setup_drawing();
-
+        // Drawing area will be created lazily in view_cloned()
         // Start tile prefetching
         self.prefetch_tiles();
-    }
-
-    /// Set up drawing callback
-    fn setup_drawing(&self) {
-        let state = Arc::clone(&self.state);
-        let tile_cache = Arc::clone(&self.tile_cache);
-        let needs_redraw_flag = Arc::clone(&self.needs_redraw);
-
-        self.drawing_area.set_draw_func(move |area, cr, width, height| {
-            // Clear with map background
-            cr.set_source_rgba(0.15, 0.17, 0.2, 1.0);
-            cr.paint();
-
-            let map_state = state.lock().unwrap();
-
-            // Draw map tiles
-            draw_tiles(&tile_cache, map_state.user_lat, map_state.user_lon,
-                      map_state.zoom, width, height, cr);
-
-            // Draw APRS markers
-            for (callsign, (lat, lon)) in &map_state.stations {
-                draw_aprs_marker(lat, lon, map_state.user_lat, map_state.user_lon,
-                                map_state.zoom, width, height, cr, callsign);
-            }
-
-            // Draw user position
-            if map_state.has_position {
-                draw_user_position(width as f64, height as f64, cr);
-            }
-            
-            // Check if we need another redraw due to pending tiles
-            if needs_redraw_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                needs_redraw_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                area.queue_draw();
-            }
-        });
     }
 
     /// Set the user's GPS position
@@ -164,8 +101,9 @@ impl MapManager {
             state.zoom = 12;
         }
 
-        self.needs_redraw.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.drawing_area.queue_draw();
+        if let Some(ref da) = self.drawing_area {
+            da.queue_draw();
+        }
 
         // Start tile fetching in background
         self.prefetch_tiles();
@@ -181,8 +119,9 @@ impl MapManager {
             state.has_position = true;
         }
 
-        self.needs_redraw.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.drawing_area.queue_draw();
+        if let Some(ref da) = self.drawing_area {
+            da.queue_draw();
+        }
 
         self.prefetch_tiles();
     }
@@ -194,8 +133,9 @@ impl MapManager {
             state.zoom = 12;
         }
 
-        self.needs_redraw.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.drawing_area.queue_draw();
+        if let Some(ref da) = self.drawing_area {
+            da.queue_draw();
+        }
     }
 
     /// Add or update an APRS station
@@ -212,20 +152,44 @@ impl MapManager {
             );
         }
 
-        self.needs_redraw.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.drawing_area.queue_draw();
+        if let Some(ref da) = self.drawing_area {
+            da.queue_draw();
+        }
     }
 
-    /// Get the DrawingArea widget
-    pub fn view(&self) -> &DrawingArea {
-        &self.drawing_area
+    /// Get the widget wrapped in a constrained container
+    pub fn view_cloned(&mut self) -> gtk4::Widget {
+        // Create DrawingArea for 2D rendering
+        let drawing_area = DrawingArea::new();
+        drawing_area.set_size_request(330, 600);
+        drawing_area.set_hexpand(false);
+        drawing_area.set_vexpand(false);
+        drawing_area.set_halign(gtk::Align::Center);
+        drawing_area.add_css_class("map-area");
+        
+        // Store in manager for queue_draw access
+        self.drawing_area = Some(drawing_area.clone());
+        
+        // Set up drawing callback
+        self.setup_drawing(&drawing_area);
+        
+        // Wrap in AdwClamp to limit width to 340px
+        let clamp = adw::Clamp::new();
+        clamp.set_size_request(330, 620);
+        clamp.set_hexpand(false);
+        clamp.set_vexpand(false);
+        clamp.set_maximum_size(340);
+        clamp.set_tightening_threshold(340);
+        
+        // Constrain drawing area to exact 340x600
+        drawing_area.set_size_request(330, 600);
+        drawing_area.set_hexpand(false);
+        drawing_area.set_vexpand(false);
+        
+        clamp.set_child(Some(&drawing_area));
+        clamp.upcast()
     }
-
-    /// Get the widget wrapped appropriately
-    pub fn view_cloned(&self) -> gtk4::Widget {
-        self.drawing_area.clone().upcast()
-    }
-
+    
     /// Check if map has any stations
     pub fn has_stations(&self) -> bool {
         !self.state.lock().unwrap().stations.is_empty()
@@ -238,7 +202,56 @@ impl MapManager {
     
     /// Request a redraw on the drawing area
     pub fn request_redraw(&self) {
-        self.drawing_area.queue_draw();
+        if let Some(ref da) = self.drawing_area {
+            da.queue_draw();
+        }
+    }
+
+    /// Set up drawing callback on the given drawing area
+    fn setup_drawing(&self, drawing_area: &DrawingArea) {
+        let state = Arc::clone(&self.state);
+        let tile_cache = Arc::clone(&self.tile_cache);
+        let needs_redraw_flag = Arc::clone(&self.needs_redraw);
+
+        drawing_area.set_draw_func(move |area, cr, width, height| {
+            // Clamp width to 340 to prevent map from expanding UI
+            let max_width = 340.0;
+            let draw_width = (width as f64).min(max_width);
+            let draw_height = height as f64;
+            
+            // Save context and clip to constrained area
+            cr.save();
+            cr.rectangle(0.0, 0.0, draw_width, draw_height);
+            cr.clip();
+            
+            // Clear with map background
+            cr.set_source_rgba(0.15, 0.17, 0.2, 1.0);
+            cr.paint();
+
+            let map_state = state.lock().unwrap();
+
+            // Draw map tiles (use constrained dimensions)
+            draw_tiles(&tile_cache, map_state.user_lat, map_state.user_lon,
+                      map_state.zoom, draw_width as i32, draw_height as i32, cr);
+
+            // Draw APRS markers
+            for (callsign, (lat, lon)) in &map_state.stations {
+                draw_aprs_marker(lat, lon, map_state.user_lat, map_state.user_lon,
+                                map_state.zoom, draw_width as i32, draw_height as i32, cr, callsign);
+            }
+
+            // Draw user position
+            if map_state.has_position {
+                draw_user_position(draw_width, draw_height, cr);
+            }
+            
+            cr.restore();
+            
+            if needs_redraw_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                needs_redraw_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                area.queue_draw();
+            }
+        });
     }
 
     /// Prefetch tiles for current view in background
@@ -420,7 +433,6 @@ fn draw_tiles(
 /// Draw a tile image using cairo
 fn draw_tile_image(cr: &cairo::Context, x: f64, y: f64, data: &[u8], width: u32, height: u32) {
     // Create cairo image surface from BGRA data
-    // Note: we need to reverse B and R channels
     let mut rgba_data = Vec::with_capacity(data.len());
     for chunk in data.chunks(4) {
         rgba_data.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);

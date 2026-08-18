@@ -238,17 +238,17 @@ fn create_ui(
     gps: &Arc<Mutex<GpsManager>>,
     settings: &SettingsManager,
 ) {
-    // Fixed 340px window
+    // Window sized to fit screen (content 320px + 40px for GTK padding)
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .default_width(340)
+        .default_width(300)
         .default_height(700)
         .title("PocketModem")
+        .width_request(300)
+        .height_request(700)
         .build();
     
-    window.set_size_request(340, 700);
     window.set_resizable(false);
-    window.set_default_size(340, 700);
     
     let saved_freq = settings.frequency();
     let saved_squelch = settings.squelch();
@@ -319,7 +319,7 @@ fn create_ui(
     let header_bar = adw::HeaderBar::builder()
         .title_widget(&adw::WindowTitle::new("PocketModem", ""))
         .build();
-    header_bar.set_size_request(340, 46);
+    header_bar.set_size_request(330, 46);
     
     let settings_btn = gtk::ToggleButton::new();
     settings_btn.set_icon_name("emblem-system-symbolic");
@@ -328,16 +328,19 @@ fn create_ui(
     header_bar.pack_end(&settings_btn);
     
     // =========================================================================
-    // MAIN PAGE - Fixed 340px Box container
+    // MAIN PAGE - Fixed 320px Box container
     // =========================================================================
     let clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    clamp.set_size_request(340, 700);
+    clamp.set_size_request(330, 700);
     clamp.set_hexpand(false);
+    clamp.set_vexpand(false);
+    clamp.set_halign(gtk::Align::Center);  // Center the 320px content
     
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content_box.set_size_request(340, 700);
+    content_box.set_size_request(330, 700);
     content_box.set_hexpand(false);
     content_box.set_vexpand(true);
+    content_box.set_halign(gtk::Align::Center);
     
     // --- Status indicators ---
     let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 32);
@@ -393,7 +396,7 @@ fn create_ui(
     freq_entry.set_text(&format!("{}.{:03}", saved_freq / 1000, saved_freq % 1000));
     gtk::prelude::EntryExt::set_alignment(&freq_entry, 0.5);
     freq_entry.add_css_class("freq-display");
-    freq_entry.set_size_request(340, 100);
+    freq_entry.set_size_request(330, 100);
     freq_entry.set_margin_start(16);
     freq_entry.set_margin_end(16);
     freq_entry.set_margin_top(8);
@@ -583,7 +586,7 @@ fn create_ui(
         row.set_hexpand(false);
         
         let row_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        row_spacer.set_hexpand(false);
+        row_spacer.set_hexpand(true);  // Expand to push edit button to right
         
         let edit_btn = gtk::Button::new();
         edit_btn.set_icon_name("document-edit-symbolic");
@@ -966,7 +969,7 @@ fn create_ui(
     }
     
     let aprs_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    aprs_page.set_size_request(340, 700);
+    aprs_page.set_size_request(330, 700);
     aprs_page.set_hexpand(false);
     
     let aprs_header = gtk::Label::new(Some("<b>APRS Messages</b>"));
@@ -988,7 +991,7 @@ fn create_ui(
     
     // APRS container - fixed 340px
     let aprs_clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    aprs_clamp.set_size_request(340, 700);
+    aprs_clamp.set_size_request(330, 700);
     aprs_clamp.set_hexpand(false);
     aprs_clamp.append(&aprs_page);
     
@@ -1003,22 +1006,32 @@ fn create_ui(
     let map_view = manager.view_cloned();
     let map_manager = Arc::new(Mutex::new(manager));
     
+    // Track map_page allocation
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    map_page.set_size_request(340, 700);
+    map_page.set_size_request(330, 700);
+    map_page.set_hexpand(false);
+    map_page.set_vexpand(true);
+    map_page.set_halign(gtk::Align::Center);
     
-    let gps_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let gps_header = gtk::Box::new(gtk::Orientation::Vertical, 4);
     gps_header.set_halign(gtk::Align::Center);
-    gps_header.set_margin_start(4);
-    gps_header.set_margin_end(4);
-    gps_header.set_margin_top(4);
-    gps_header.set_margin_bottom(4);
+    gps_header.set_hexpand(false);
+    gps_header.set_size_request(330, -1);
     
+    // GPS labels - constrained in vertical layout
     let locator_label = gtk::Label::new(Some("--"));
     locator_label.set_markup(&format!("<span color='#FFB000'>MAIDENHEAD: --</span>"));
     locator_label.add_css_class("locator-display");
+    locator_label.set_hexpand(false);
+    locator_label.set_size_request(330, -1);
     
     let coords_label = gtk::Label::new(Some("Lat: -- Lon: --"));
     coords_label.add_css_class("coords-display");
+    coords_label.set_hexpand(false);
+    coords_label.set_size_request(330, -1);
+    
+    gps_header.append(&locator_label);
+    gps_header.append(&coords_label);
     
     gps_header.append(&locator_label);
     gps_header.append(&coords_label);
@@ -1026,11 +1039,17 @@ fn create_ui(
     map_page.append(&gps_header);
     map_page.append(&map_view);
     
-    // Map container - fixed 340px
-    let map_clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    map_clamp.set_size_request(340, 700);
+    // Map container - use AdwClamp to limit width to 340px
+    let map_clamp = adw::Clamp::new();
+    map_clamp.set_size_request(330, 700);
     map_clamp.set_hexpand(false);
-    map_clamp.append(&map_page);
+    map_clamp.set_vexpand(false);
+    map_clamp.set_maximum_size(340);
+    map_clamp.set_tightening_threshold(340);
+    map_page.set_size_request(330, 700);
+    map_page.set_hexpand(false);
+    map_page.set_vexpand(false);
+    map_clamp.set_child(Some(&map_page));
     
     // =========================================================================
     // CAROUSEL
@@ -1039,10 +1058,23 @@ fn create_ui(
     carousel.set_interactive(true);
     carousel.set_hexpand(false);
     carousel.set_vexpand(true);
+    carousel.set_size_request(330, 654);  // Constrain carousel to prevent expansion
+    carousel.set_halign(gtk::Align::Center);
+    
+    // Wrap carousel in a constrained box
+    let carousel_wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    carousel_wrapper.set_size_request(330, 654);
+    carousel_wrapper.set_hexpand(false);
+    carousel_wrapper.set_vexpand(true);
+    carousel_wrapper.set_halign(gtk::Align::Center);
+    carousel_wrapper.append(&carousel);
+    carousel_wrapper.add_css_class("carousel-wrapper");
     
     carousel.append(&clamp);
     carousel.append(&aprs_clamp);
     carousel.append(&map_clamp);
+    
+    // Use wrapper instead of carousel directly for carousel_box
     
     let indicator = adw::CarouselIndicatorDots::new();
     indicator.set_carousel(Some(&carousel));
@@ -1050,20 +1082,20 @@ fn create_ui(
     indicator.set_margin_bottom(8);
     
     let carousel_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    carousel_box.set_size_request(340, 700);
+    carousel_box.set_size_request(330, 700);
     carousel_box.set_hexpand(false);
-    carousel_box.append(&carousel);
+    carousel_box.append(&carousel_wrapper);
     carousel_box.append(&indicator);
     
     // =========================================================================
     // SETTINGS PAGE
     // =========================================================================
     let settings_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    settings_page.set_size_request(340, 700);
+    settings_page.set_size_request(330, 700);
     settings_page.set_hexpand(false);
     
     let settings_clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    settings_clamp.set_size_request(340, 700);
+    settings_clamp.set_size_request(330, 700);
     settings_clamp.set_hexpand(false);
     
     let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1133,8 +1165,11 @@ fn create_ui(
     // ViewStack
     // =========================================================================
     let stack = adw::ViewStack::new();
-    stack.set_size_request(340, 654);
+    stack.set_size_request(330, 654);
     stack.set_hexpand(false);
+    stack.set_vexpand(false);
+    stack.set_halign(gtk::Align::Center);
+    stack.set_valign(gtk::Align::Start);
     
     stack.add_titled(&carousel_box, Some("main"), "Main");
     stack.add_titled(&settings_page, Some("settings"), "Settings");
@@ -1146,8 +1181,11 @@ fn create_ui(
     });
     
     let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_size_request(340, 654);
+    toast_overlay.set_size_request(330, 654);
     toast_overlay.set_hexpand(false);
+    toast_overlay.set_vexpand(false);
+    toast_overlay.set_halign(gtk::Align::Center);
+    toast_overlay.set_valign(gtk::Align::Start);
     toast_overlay.set_child(Some(&stack));
     
     // =========================================================================
@@ -1196,6 +1234,9 @@ fn create_ui(
     let locator_label_clone = locator_label.clone();
     let coords_label_clone = coords_label.clone();
     let map_manager_clone = Arc::clone(&map_manager);
+    let window_clone = window.clone();
+    let map_page_clone = map_page.clone();
+    let map_clamp_clone = map_clamp.clone();
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if let Ok(r) = radio_update.lock() {
@@ -1350,6 +1391,10 @@ fn create_ui(
             if map.needs_redraw() { map.request_redraw(); }
         }
         
+        // Status update tick counter
+        static TICK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let tick = TICK_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        
         ptt_label_update.set_text("PTT");
         
         glib::ControlFlow::Continue
@@ -1477,8 +1522,8 @@ fn create_ui(
         .aprs-comment { font-size: 13px; color: #888; font-style: italic; }
         .aprs-message-body { font-size: 14px; color: #aaa; }
         .aprs-empty-text { font-size: 14px; color: #666; padding: 32px; }
-        .locator-display { font-size: 18px; font-family: monospace; }
-        .coords-display { font-size: 14px; color: #888; font-family: monospace; }
+        .locator-display { font-size: 18px; font-family: monospace; min-width: 1px; }
+        .coords-display { font-size: 14px; color: #888; font-family: monospace; min-width: 1px; }
     "#);
     
     gtk::style_context_add_provider_for_display(
@@ -1487,13 +1532,24 @@ fn create_ui(
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION
     );
     
-    let main_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    main_container.set_size_request(340, 700);
-    main_container.set_hexpand(false);
-    main_container.append(&header_bar);
-    main_container.append(&toast_overlay);
+    // Wrap content in a Fixed container to force exact 340x700 size
+    // Wrap content in a Box with strict width constraint via CSS
+    let fixed_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    fixed_container.set_size_request(330, 700);
+    fixed_container.set_hexpand(false);
+    fixed_container.set_vexpand(false);
+    fixed_container.set_halign(gtk::Align::Center);  // Center the 340px content
+    fixed_container.set_valign(gtk::Align::Start);
     
-    window.set_content(Some(&main_container));
+    fixed_container.append(&header_bar);
+    fixed_container.append(&toast_overlay);
+    
+    window.set_content(Some(&fixed_container));
     window.show();
-    eprintln!("[debug] Window shown with size_request 340x700");
+    
+    // Force window size after content is set - GTK may expand during layout
+    window.set_size_request(330, 700);
+    window.set_default_size(340, 700);
+    
+
 }
