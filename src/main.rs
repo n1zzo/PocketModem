@@ -4,7 +4,6 @@
 //! - AdwCarousel for swipe navigation (FM, APRS Messages, Map)
 //! - PreferencesGroup + ActionRow for settings
 //! - ToastOverlay for notifications
-//! - Clamp for content width
 
 mod aprs;
 mod audio;
@@ -18,12 +17,12 @@ use aprs::APRSMessage;
 use audio::{AudioConfig, AudioManager};
 use gps::GpsManager;
 use map::MapManager;
-use settings::{SettingsManager, Channel, Duplex, ToneMode, PowerLevel, TileSource};
+use settings::{SettingsManager, Channel, Duplex, ToneMode, PowerLevel};
 
 use radio::{KV4PRadio, SerialConfig};
 
 #[cfg(feature = "notifications")]
-use libnotify::{init, is_initted, Notification, Urgency};
+use libnotify::{init, is_initted, Notification};
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,34 +32,20 @@ use adw::prelude::*;
 use adw;
 
 /// Calculate Maidenhead locator from lat/lon
-/// Uses the standard Maidenhead Locator System algorithm:
-/// - Field: 18x18 grid (A-R), 18° lon x 9° lat
-/// - Square: 10x10 grid (0-9), 2° lon x 1° lat  
-/// - Subsquare: 24x24 grid (a-x), 5' lon x 2.5' lat
-/// 
-/// Reference: hamutils/maidenhead Python library
 fn maidenhead_locator(lat: f64, lon: f64) -> String {
-    // Handle edge cases
     if lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 {
         return "-----".to_string();
     }
     
-    // Radix progression for 6-character precision:
-    // Field (18), Square (10), Subsquare (24), Square (10), Subsquare (24), Square (10)
     let radix: [i32; 6] = [18, 10, 24, 10, 24, 10];
-    
-    // Calculate multiplier from all radix values
     let multiplier: i64 = radix.iter().map(|&r| r as i64).product();
     let half_multiplier = multiplier / 2;
     
-    // Convert to integer representation
-    // int_lat = int((lat + 90) * multiplier) // (radix[0] * radix[1])
     let int_lat = ((lat + 90.0) * multiplier as f64).round() as i64 
                   / (radix[0] * radix[1]) as i64;
     let int_lon = (((lon + 180.0).rem_euclid(360.0)) * half_multiplier as f64).round() as i64
                   / (radix[0] * radix[1]) as i64;
     
-    // Helper to convert integer to Maidenhead digits
     fn convert(mut val: i64, radix: &[i32; 6]) -> [i32; 6] {
         let mut result = [0i32; 6];
         let mut idx = 5;
@@ -79,18 +64,17 @@ fn maidenhead_locator(lat: f64, lon: f64) -> String {
     let lat_digits = convert(int_lat, &radix);
     let lon_digits = convert(int_lon, &radix);
     
-    // Build Maidenhead string
-    let c1 = (b'A' + (lon_digits[0] % 18) as u8) as char;  // Field lon: A-R
-    let c2 = (b'A' + (lat_digits[0] % 18) as u8) as char;  // Field lat: A-R
-    let c3 = (b'0' + (lon_digits[1] % 10) as u8) as char;  // Square lon: 0-9
-    let c4 = (b'0' + (lat_digits[1] % 10) as u8) as char;  // Square lat: 0-9
-    let c5 = (b'a' + (lon_digits[2] % 24) as u8) as char;  // Subsquare lon: a-x
-    let c6 = (b'a' + (lat_digits[2] % 24) as u8) as char;  // Subsquare lat: a-x
+    let c1 = (b'A' + (lon_digits[0] % 18) as u8) as char;
+    let c2 = (b'A' + (lat_digits[0] % 18) as u8) as char;
+    let c3 = (b'0' + (lon_digits[1] % 10) as u8) as char;
+    let c4 = (b'0' + (lat_digits[1] % 10) as u8) as char;
+    let c5 = (b'a' + (lon_digits[2] % 24) as u8) as char;
+    let c6 = (b'a' + (lat_digits[2] % 24) as u8) as char;
     
     format!("{}{}{}{}{}{}", c1, c2, c3, c4, c5, c6)
 }
 
-/// Calculate distance (km) and bearing (degrees) from my_pos to target
+/// Calculate distance (km) and bearing (degrees)
 fn calculate_distance_bearing(my_lat: f64, my_lon: f64, target_lat: f64, target_lon: f64) -> Option<(f64, f64)> {
     if my_lat == 0.0 && my_lon == 0.0 {
         return None;
@@ -102,17 +86,14 @@ fn calculate_distance_bearing(my_lat: f64, my_lon: f64, target_lat: f64, target_
     
     let (sin_lat1, cos_lat1, sin_lat2, cos_lat2) = (lat1.sin(), lat1.cos(), lat2.sin(), lat2.cos());
     
-    // Haversine formula: a = sin²(Δlat/2) + cos(lat1) * cos(lat2) * sin²(Δlon/2)
     let delta_lat = target_lat - my_lat;
     let sin_delta_lat = (delta_lat.to_radians() / 2.0).sin();
     let sin_delta_lon = (delta_lon / 2.0).sin();
     let a = sin_delta_lat.powi(2) + cos_lat1 * cos_lat2 * sin_delta_lon.powi(2);
     
-    // c = 2 * asin(min(1.0, sqrt(a)))
     let c = 2.0 * (a.sqrt().min(1.0)).asin();
     let distance_km = 6371.0 * c;
     
-    // Bearing calculation
     let y = delta_lon.sin() * cos_lat2;
     let x = cos_lat1 * sin_lat2 - sin_lat1 * cos_lat2 * delta_lon.cos();
     let bearing = y.atan2(x).to_degrees().rem_euclid(360.0);
@@ -120,7 +101,6 @@ fn calculate_distance_bearing(my_lat: f64, my_lon: f64, target_lat: f64, target_
     Some((distance_km, bearing))
 }
 
-/// Calculate distance in km (simplified, no GPS coordinates needed)
 fn calculate_distance_display(my_lat: f64, my_lon: f64, target_lat: f64, target_lon: f64) -> String {
     if let Some((dist_km, _)) = calculate_distance_bearing(my_lat, my_lon, target_lat, target_lon) {
         if dist_km < 1.0 {
@@ -135,7 +115,6 @@ fn calculate_distance_display(my_lat: f64, my_lon: f64, target_lat: f64, target_
     }
 }
 
-/// Show a desktop notification for APRS messages
 #[cfg(feature = "notifications")]
 fn show_aprs_notification(body: &str, _from: &str) -> Result<(), String> {
     if !is_initted() {
@@ -146,9 +125,7 @@ fn show_aprs_notification(body: &str, _from: &str) -> Result<(), String> {
     n.show().map_err(|e| format!("Show failed: {:?}", e))
 }
 
-/// Format bearing as compass direction with arrow
 fn bearing_to_compass(bearing: f64) -> String {
-    // Arrow character based on bearing
     let arrow = match (bearing.round() as i32) % 360 {
         0..=22 | 338..=360 => "↑",
         23..=67 => "↗",
@@ -164,18 +141,14 @@ fn bearing_to_compass(bearing: f64) -> String {
     format!("{}{:.0}°", arrow, bearing)
 }
 
-/// GSettings application ID (matches schema path)
 const APP_ID: &str = "org.pocketmodem.pocket-modem";
 
 fn main() {
-    // Initialize settings (GSettings-backed)
     let settings = SettingsManager::new();
     eprintln!("[pocket-modem] Settings loaded: freq={} kHz, squelch={}", 
-              settings.frequency(),
-              settings.squelch());
+              settings.frequency(), settings.squelch());
     
     let serial_device = std::env::var("POCKET_MODEM_DEVICE").ok().unwrap_or_else(|| {
-        // Auto-detect if no env var set
         if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
             for entry in entries.flatten() {
                 if let Some(name) = entry.path().to_str() {
@@ -191,23 +164,19 @@ fn main() {
 
     eprintln!("[pocket-modem] Using: {}", serial_device);
 
-    // Create radio - I/O thread handles serial internally
     let radio = Arc::new(Mutex::new(KV4PRadio::new(SerialConfig {
-        port: serial_device.clone(),
+        port: serial_device,
         baudrate: 115200,
         timeout_ms: 500,
     })));
     let radio_clone = Arc::clone(&radio);
 
-    // Create GPS manager
     let gps_manager = Arc::new(Mutex::new(GpsManager::new()));
     {
         let gps = gps_manager.lock().unwrap();
         gps.start();
-        // GPS auto-detection and enabling happens in the thread
     }
 
-    // Create audio manager with KV4P settings
     let audio_config = AudioConfig {
         sample_rate: 16000,
         tx_gain: 1.0,
@@ -218,7 +187,6 @@ fn main() {
     };
     let audio_manager = Arc::new(Mutex::new(AudioManager::new(audio_config)));
     
-    // Connect audio TX to radio TX
     {
         let mut audio = audio_manager.lock().unwrap();
         let radio = Arc::clone(&radio);
@@ -234,7 +202,6 @@ fn main() {
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     
-    // Register empty open handler to prevent GTK from exiting when command line args
     app.connect_open(|_app, _files, _hint| {});
     
     let audio_for_shutdown = Arc::clone(&audio_manager);
@@ -245,21 +212,17 @@ fn main() {
         create_ui(app, &radio_clone, &audio_activate, &gps_manager_activate, &settings);
     });
 
-    // Close radio, audio and GPS on shutdown
     let radio_for_shutdown = Arc::clone(&radio);
     let gps_for_shutdown = Arc::clone(&gps_manager);
     app.connect_shutdown(move |_| {
         eprintln!("[pocket-modem] App shutting down...");
-        // Stop audio capture/playback
         if let Ok(mut a) = audio_for_shutdown.lock() {
             a.stop_capture();
             a.stop_playback();
         }
-        // Close radio connection
         if let Ok(r) = radio_for_shutdown.lock() {
             r.close();
         }
-        // Stop GPS polling
         if let Ok(g) = gps_for_shutdown.lock() {
             g.stop();
         }
@@ -275,7 +238,7 @@ fn create_ui(
     gps: &Arc<Mutex<GpsManager>>,
     settings: &SettingsManager,
 ) {
-    // Create the main window (340px width for mobile displays)
+    // Fixed 340px window
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .default_width(340)
@@ -287,7 +250,6 @@ fn create_ui(
     window.set_resizable(false);
     window.set_default_size(340, 700);
     
-    // Apply saved frequency from settings on startup
     let saved_freq = settings.frequency();
     let saved_squelch = settings.squelch();
     eprintln!("[pocket-modem] Restoring: freq={} kHz, squelch={}", saved_freq, saved_squelch);
@@ -353,18 +315,12 @@ fn create_ui(
         });
     }
     
-    // =========================================================================
-    // ViewStack for navigation (created later)
-    // =========================================================================
-    // Header bar with settings button
-    // =========================================================================
+    // Header bar
     let header_bar = adw::HeaderBar::builder()
         .title_widget(&adw::WindowTitle::new("PocketModem", ""))
         .build();
     header_bar.set_size_request(340, 46);
-    header_bar.set_hexpand(false);
     
-    // Settings button in header
     let settings_btn = gtk::ToggleButton::new();
     settings_btn.set_icon_name("emblem-system-symbolic");
     settings_btn.add_css_class("flat");
@@ -372,21 +328,14 @@ fn create_ui(
     header_bar.pack_end(&settings_btn);
     
     // =========================================================================
-    // MAIN PAGE
+    // MAIN PAGE - Fixed 340px Box container
     // =========================================================================
-    
-    // Clamp content width - constrains child to max 340px
-    let clamp = adw::Clamp::builder()
-        .maximum_size(340)
-        .tightening_threshold(340)
-        .build();
+    let clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
     clamp.set_size_request(340, 700);
     clamp.set_hexpand(false);
-    clamp.set_halign(gtk::Align::Center);
     
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.set_size_request(340, 700);
-    content_box.set_halign(gtk::Align::Center);
     content_box.set_hexpand(false);
     content_box.set_vexpand(true);
     
@@ -397,7 +346,6 @@ fn create_ui(
     status_row.set_margin_top(16);
     status_row.set_margin_bottom(16);
     
-    // Modem status (clickable)
     let modem_status_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let modem_icon = gtk::Image::from_icon_name("network-wireless-symbolic");
     modem_icon.set_pixel_size(28);
@@ -410,7 +358,6 @@ fn create_ui(
     modem_status_box.append(&modem_label);
     modem_status_box.append(&modem_status_label);
     
-    // GPS status (clickable)
     let gps_status_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let gps_icon = gtk::Image::from_icon_name("location-services-active-symbolic");
     gps_icon.set_pixel_size(28);
@@ -423,7 +370,6 @@ fn create_ui(
     gps_status_box.append(&gps_led);
     gps_status_box.append(&gps_status_label);
     
-    // Audio status (clickable)
     let audio_status_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let audio_icon = gtk::Image::from_icon_name("audio-volume-medium-symbolic");
     audio_icon.set_pixel_size(28);
@@ -436,7 +382,6 @@ fn create_ui(
     audio_status_box.append(&audio_label);
     audio_status_box.append(&audio_status_label);
     
-    // Add status boxes to status_row
     status_row.append(&modem_status_box);
     status_row.append(&gps_status_box);
     status_row.append(&audio_status_box);
@@ -457,7 +402,7 @@ fn create_ui(
     freq_entry.set_can_focus(true);
     freq_entry.set_input_purpose(gtk::InputPurpose::Number);
     
-    let radio_freq = Arc::clone(&radio);
+    let radio_freq = Arc::clone(radio);
     let settings_for_freq = settings as *const SettingsManager as *mut SettingsManager;
     freq_entry.connect_activate(move |entry| {
         let text = entry.text().to_string();
@@ -466,7 +411,6 @@ fn create_ui(
             let khz = (freq_mhz * 1000.0) as u32;
             let radio = Arc::clone(&radio_freq);
             
-            // Save frequency to GSettings immediately
             unsafe { (*settings_for_freq).set_frequency(khz); }
             eprintln!("[pocket-modem] Saving freq to GSettings: {} kHz", khz);
             
@@ -479,16 +423,9 @@ fn create_ui(
             });
             
             entry.set_text(&format!("{}.{:03}", khz / 1000, khz % 1000));
-        } else {
-            eprintln!("[pocket-modem] Invalid frequency: {}", text);
         }
     });
     content_box.append(&freq_entry);
-    
-    let freq_entry_for_channel_click = freq_entry.clone();
-    let freq_entry_for_add = freq_entry.clone();
-    let freq_entry_for_ptt_press = freq_entry.clone();
-    let freq_entry_for_ptt_release = freq_entry.clone();
     
     // --- RSSI / S-meter ---
     let rssi_sbar = gtk::ProgressBar::new();
@@ -503,7 +440,6 @@ fn create_ui(
     smeter_box.set_margin_top(12);
     smeter_box.set_margin_bottom(20);
     smeter_box.set_valign(gtk::Align::Center);
-    smeter_box.set_size_request(-1, 20);
     
     let signal_label = gtk::Label::new(Some("SIGNAL"));
     signal_label.add_css_class("signal-text");
@@ -524,27 +460,10 @@ fn create_ui(
     smeter_box.append(&signal_value);
     content_box.append(&smeter_box);
     
-    // --- Mode buttons ---
-    let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    mode_box.set_homogeneous(true);
-    mode_box.set_margin_start(16);
-    mode_box.set_margin_end(16);
-    mode_box.set_margin_bottom(8);
-    mode_box.set_visible(false);  // No mode buttons - APRS always active
-    
-    let btn_fm = gtk::ToggleButton::with_label("FM");
-    btn_fm.add_css_class("mode-btn");
-    btn_fm.add_css_class("mode-btn-active");
-    
-    btn_fm.set_active(true);
-    mode_box.append(&btn_fm);
-    content_box.append(&mode_box);
-    
     // --- Channel list ---
     let channel_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     channel_container.set_margin_start(16);
     channel_container.set_margin_end(16);
-    channel_container.set_margin_top(4);
     
     let current_channel_index: Arc<std::sync::atomic::AtomicI32> = Arc::new(std::sync::atomic::AtomicI32::new(-1));
     let current_channel_index_clone = Arc::clone(&current_channel_index);
@@ -564,7 +483,7 @@ fn create_ui(
     let add_channel_btn = gtk::Button::new();
     add_channel_btn.set_icon_name("list-add-symbolic");
     add_channel_btn.add_css_class("flat");
-    add_channel_btn.set_tooltip_text(Some("Add current frequency as new channel"));
+    add_channel_btn.set_tooltip_text(Some("Add current frequency"));
     
     channel_header.append(&channel_title);
     channel_header.append(&channel_header_spacer);
@@ -575,7 +494,7 @@ fn create_ui(
     
     let no_channels_row = adw::ActionRow::builder()
         .title("No channels")
-        .subtitle("Tap + to add current frequency")
+        .subtitle("Tap + to add")
         .build();
     no_channels_row.set_sensitive(false);
     
@@ -603,15 +522,8 @@ fn create_ui(
             
             for (idx, ch) in channels.iter().enumerate() {
                 let row = create_channel_row(
-                    ch,
-                    idx,
-                    settings,
-                    channel_list.clone(),
-                    no_channels_row.clone(),
-                    radio.clone(),
-                    freq_entry.clone(),
-                    settings,
-                    current_channel_index.clone(),
+                    ch, idx, settings, channel_list.clone(), no_channels_row.clone(),
+                    radio.clone(), freq_entry.clone(), settings, current_channel_index.clone(),
                 );
                 channel_list.append(&row);
             }
@@ -676,28 +588,21 @@ fn create_ui(
         let edit_btn = gtk::Button::new();
         edit_btn.set_icon_name("document-edit-symbolic");
         edit_btn.add_css_class("flat");
-        edit_btn.set_tooltip_text(Some("Edit channel"));
-        
-        let radio_for_click = Arc::clone(&radio);
-        let freq_entry_for_row = freq_entry.clone();
         
         row.add_controller({
             let click = gtk::GestureClick::new();
             click.set_button(1);
-            let freq_entry = freq_entry_for_row.clone();
-            let radio = radio_for_click.clone();
+            let freq_entry = freq_entry.clone();
+            let radio = radio.clone();
             let settings = settings_for_channel;
             let ch_freq = channel.rx_freq_khz;
             let ch_tone_mode = match channel.tone_mode {
-                ToneMode::None => 0,
-                ToneMode::Tone => 1,
-                ToneMode::Tsql => 2,
+                ToneMode::None => 0, ToneMode::Tone => 1, ToneMode::Tsql => 2,
             };
             let ch_ctone = channel.ctone_hz;
             let ch_rtone = channel.rtone_hz;
             let ch_index = channel_index as i32;
             let cc_idx = current_channel_index.clone();
-            
             let ch_list = channel_list.clone();
             let no_ch = no_channels_row.clone();
             
@@ -705,18 +610,10 @@ fn create_ui(
                 let prev_idx = cc_idx.swap(ch_index, std::sync::atomic::Ordering::SeqCst);
                 
                 if prev_idx != ch_index {
-                    refresh_channel_list(
-                        &ch_list,
-                        &no_ch,
-                        settings,
-                        &radio,
-                        freq_entry.clone(),
-                        cc_idx.clone(),
-                    );
+                    refresh_channel_list(&ch_list, &no_ch, settings, &radio, freq_entry.clone(), cc_idx.clone());
                 }
                 
                 freq_entry.set_text(&format!("{}.{:03}", ch_freq / 1000, ch_freq % 1000));
-                
                 unsafe { (*settings).set_frequency(ch_freq); }
                 
                 let r = radio.clone();
@@ -737,74 +634,43 @@ fn create_ui(
         edit_btn.connect_clicked(move |btn| {
             let cc_idx_save = cc_idx_edit.clone();
             let cc_idx_delete = cc_idx_edit.clone();
-            
             let ch_list_save = channel_list.clone();
             let no_ch_save = no_channels_row.clone();
             let radio_save = radio_for_edit.clone();
             let freq_save = freq_entry.clone();
-            
             let ch_list_delete = channel_list.clone();
             let no_ch_delete = no_channels_row.clone();
             let radio_delete = radio_for_edit.clone();
             let freq_delete = freq_entry.clone();
             
             show_channel_edit_dialog(
-                btn,
-                &edit_channel,
-                move |updated| {
+                btn, &edit_channel,
+                move |updated: Channel| {
                     unsafe {
                         (*settings_edit).update_channel(channel_index, updated.clone());
-                        eprintln!("[pocket-modem] Updated channel: {}", updated.name);
                     }
-                    
-                    let ch = &updated;
-                    let ch_freq = ch.rx_freq_khz;
-                    let ch_tone_mode = match ch.tone_mode {
-                        ToneMode::None => 0,
-                        ToneMode::Tone => 1,
-                        ToneMode::Tsql => 2,
+                    let ch_freq = updated.rx_freq_khz;
+                    let ch_tone_mode = match updated.tone_mode {
+                        ToneMode::None => 0, ToneMode::Tone => 1, ToneMode::Tsql => 2,
                     };
-                    let ch_ctone = ch.ctone_hz;
-                    let ch_rtone = ch.rtone_hz;
-                    
+                    let ch_ctone = updated.ctone_hz;
+                    let ch_rtone = updated.rtone_hz;
                     cc_idx_save.store(channel_index as i32, std::sync::atomic::Ordering::SeqCst);
-                    
                     freq_save.set_text(&format!("{}.{:03}", ch_freq / 1000, ch_freq % 1000));
-                    
                     let r = radio_save.clone();
                     std::thread::spawn(move || {
                         if let Ok(mut r) = r.lock() {
                             let _ = r.set_frequency_with_ctcss(ch_freq, ch_tone_mode, ch_ctone, ch_rtone);
                         }
                     });
-                    
-                    refresh_channel_list(
-                        &ch_list_save,
-                        &no_ch_save,
-                        settings_edit,
-                        &radio_save,
-                        freq_save,
-                        cc_idx_save.clone(),
-                    );
+                    refresh_channel_list(&ch_list_save, &no_ch_save, settings_edit, &radio_save, freq_save, cc_idx_save.clone());
                 },
                 move || {
-                    unsafe {
-                        (*settings_edit).delete_channel(channel_index);
-                        eprintln!("[pocket-modem] Deleted channel at index {}", channel_index);
-                    }
-                    
+                    unsafe { (*settings_edit).delete_channel(channel_index); }
                     if cc_idx_delete.load(std::sync::atomic::Ordering::SeqCst) == channel_index as i32 {
                         cc_idx_delete.store(-1, std::sync::atomic::Ordering::SeqCst);
                     }
-                    
-                    refresh_channel_list(
-                        &ch_list_delete,
-                        &no_ch_delete,
-                        settings_edit,
-                        &radio_delete,
-                        freq_delete,
-                        cc_idx_delete.clone(),
-                    );
+                    refresh_channel_list(&ch_list_delete, &no_ch_delete, settings_edit, &radio_delete, freq_delete, cc_idx_delete.clone());
                 },
             );
         });
@@ -827,15 +693,8 @@ fn create_ui(
         let existing_channels = (*settings_add).channels();
         for (idx, ch) in existing_channels.iter().enumerate() {
             let row = create_channel_row(
-                ch,
-                idx,
-                settings_add,
-                channel_list_arc.clone(),
-                (*no_channels_row_arc).clone(),
-                radio_for_list.clone(),
-                freq_entry_for_load.clone(),
-                settings_add,
-                current_channel_index_clone.clone(),
+                ch, idx, settings_add, channel_list_arc.clone(), (*no_channels_row_arc).clone(),
+                radio_for_list.clone(), freq_entry_for_load.clone(), settings_add, current_channel_index_clone.clone(),
             );
             channel_list_arc.append(&row);
         }
@@ -847,23 +706,16 @@ fn create_ui(
     let channel_list_add = channel_list_arc.clone();
     let no_channels_row_add = (*no_channels_row_arc).clone();
     let current_channel_index_add = Arc::clone(&current_channel_index);
+    let freq_entry_for_add = freq_entry.clone();
     
     add_channel_btn.connect_clicked(move |_| {
         unsafe {
             let freq = {
-                if let Ok(r) = radio_for_add.lock() {
-                    r.state().frequency
-                } else {
-                    145500
-                }
+                if let Ok(r) = radio_for_add.lock() { r.state().frequency } else { 145500 }
             };
             
             let existing = (*settings_add).channels();
-            let next_location = if existing.is_empty() {
-                1
-            } else {
-                existing.iter().map(|c| c.location).max().unwrap_or(0) + 1
-            };
+            let next_location = if existing.is_empty() { 1 } else { existing.iter().map(|c| c.location).max().unwrap_or(0) + 1 };
             
             let new_channel = Channel {
                 location: next_location,
@@ -882,20 +734,14 @@ fn create_ui(
             
             (*settings_add).add_channel(new_channel.clone());
             let new_index = (*settings_add).channels().len() - 1;
-            eprintln!("[pocket-modem] Added channel: location={}, freq={} kHz", next_location, freq);
+            eprintln!("[pocket-modem] Added channel: {}", next_location);
             
             no_channels_row_add.set_visible(false);
             
             let row = create_channel_row(
-                &new_channel,
-                new_index,
-                settings_add,
-                channel_list_add.clone(),
-                no_channels_row_add.clone(),
-                radio_for_add.clone(),
-                freq_entry.clone(),
-                settings_add,
-                current_channel_index_add.clone(),
+                &new_channel, new_index, settings_add, channel_list_add.clone(),
+                no_channels_row_add.clone(), radio_for_add.clone(), freq_entry_for_add.clone(),
+                settings_add, current_channel_index_add.clone(),
             );
             channel_list_add.append(&row);
             channel_list_add.show();
@@ -926,12 +772,9 @@ fn create_ui(
     let ptt_icon = gtk::Image::from_icon_name("media-record-symbolic");
     ptt_icon.set_pixel_size(40);
     ptt_icon.add_css_class("ptt-icon");
-    ptt_icon.set_halign(gtk::Align::Center);
-    ptt_icon.set_valign(gtk::Align::Center);
     
     let ptt_label = gtk::Label::new(Some("PTT"));
     ptt_label.add_css_class("ptt-label");
-    ptt_label.set_halign(gtk::Align::Center);
     
     ptt_box.append(&ptt_icon);
     ptt_box.append(&ptt_label);
@@ -949,6 +792,8 @@ fn create_ui(
     let radio_released = Arc::clone(radio);
     let audio_released = Arc::clone(audio);
     let settings_for_ptt = settings as *const SettingsManager as *mut SettingsManager;
+    let freq_entry_for_ptt_press = freq_entry.clone();
+    let freq_entry_for_ptt_release = freq_entry.clone();
     
     let gesture = gtk::GestureClick::new();
     gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -960,13 +805,12 @@ fn create_ui(
         let label = ptt_label.clone();
         let freq_entry = freq_entry_for_ptt_press.clone();
         let settings = settings_for_ptt;
-        move |_gesture, _n_press, _x, _y| {
+        move |_, _, _, _| {
             label.set_text("TX");
             
             let (tx_freq, rx_freq) = unsafe {
                 let rx_freq = (*settings).frequency();
                 let channels = (*settings).channels();
-                
                 let tx_freq = if let Some(ch) = channels.iter().find(|c| c.rx_freq_khz == rx_freq) {
                     match ch.duplex {
                         Duplex::Simplex => rx_freq,
@@ -974,9 +818,7 @@ fn create_ui(
                         Duplex::Minus => rx_freq.saturating_sub(ch.offset_khz),
                         Duplex::Split => ch.tx_freq_khz.unwrap_or(rx_freq),
                     }
-                } else {
-                    rx_freq
-                };
+                } else { rx_freq };
                 (tx_freq, rx_freq)
             };
             
@@ -999,25 +841,19 @@ fn create_ui(
         let label = ptt_label.clone();
         let freq_entry = freq_entry_for_ptt_release.clone();
         let settings = settings_for_ptt;
-        move |_gesture, _n_press, _x, _y| {
-            if let Ok(mut aud) = a.lock() {
-                let _ = aud.stop_capture();
-            }
+        move |_, _, _, _| {
+            if let Ok(mut aud) = a.lock() { let _ = aud.stop_capture(); }
             
             let rx_freq = unsafe { (*settings).frequency() };
             
-            if let Ok(mut rad) = r.lock() {
-                let _ = rad.ptt_off();
-            }
+            if let Ok(mut rad) = r.lock() { let _ = rad.ptt_off(); }
             
             freq_entry.remove_css_class("tx-frequency");
             freq_entry.set_text(&format!("{}.{:03}", rx_freq / 1000, rx_freq % 1000));
             
             let rad = r.clone();
             std::thread::spawn(move || {
-                if let Ok(rad) = rad.lock() {
-                    let _ = rad.set_frequency(rx_freq);
-                }
+                if let Ok(rad) = rad.lock() { let _ = rad.set_frequency(rx_freq); }
             });
             
             label.set_text("PTT");
@@ -1033,7 +869,7 @@ fn create_ui(
     content_box.append(&ptt_spacer);
     content_box.append(&ptt_btn);
     
-    clamp.set_child(Some(&content_box));
+    clamp.append(&content_box);
     
     // =========================================================================
     // APRS PAGE
@@ -1041,7 +877,6 @@ fn create_ui(
     
     let aprs_messages: Arc<Mutex<Vec<APRSMessage>>> = Arc::new(Mutex::new(Vec::new()));
     let aprs_messages_clone = Arc::clone(&aprs_messages);
-    
     let aprs_last_displayed: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     
     let aprs_list_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1050,19 +885,13 @@ fn create_ui(
     aprs_list_box.set_margin_top(8);
     aprs_list_box.add_css_class("aprs-list");
     
-    let aprs_empty_label = gtk::Label::new(Some("No APRS messages\nReceived packets will appear here"));
+    let aprs_empty_label = gtk::Label::new(Some("No APRS messages"));
     aprs_empty_label.set_halign(gtk::Align::Center);
     aprs_empty_label.add_css_class("aprs-empty-text");
     aprs_empty_label.set_visible(true);
     aprs_list_box.append(&aprs_empty_label);
     
-    fn add_aprs_message_to_list(
-        msg: &APRSMessage,
-        list_box: &gtk::Box,
-        empty_label: &gtk::Label,
-        my_lat: f64,
-        my_lon: f64,
-    ) {
+    fn add_aprs_message_to_list(msg: &APRSMessage, list_box: &gtk::Box, empty_label: &gtk::Label, my_lat: f64, my_lon: f64) {
         empty_label.set_visible(false);
         
         let msg_row = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -1084,12 +913,8 @@ fn create_ui(
         let time_label = gtk::Label::new(None);
         let time_str = if msg.timestamp > 0 {
             let t = msg.timestamp;
-            let hours = (t / 3600) % 24;
-            let mins = (t / 60) % 60;
-            format!("{:02}:{:02}", hours, mins)
-        } else {
-            "--:--".to_string()
-        };
+            format!("{:02}:{:02}", (t / 3600) % 24, (t / 60) % 60)
+        } else { "--:--".to_string() };
         time_label.set_text(&time_str);
         time_label.add_css_class("aprs-timestamp");
         
@@ -1102,40 +927,21 @@ fn create_ui(
         content.set_valign(gtk::Align::Start);
         content.set_wrap(true);
         content.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        content.set_size_request(280, -1);  // Limit width to clamp size
+        content.set_size_request(280, -1);
         
         match msg.msg_type {
             aprs::APRSType::Position => {
                 if msg.position_lat != 0.0 || msg.position_lon != 0.0 {
-                    // Calculate distance and bearing from our position
                     let dist_bearing = calculate_distance_bearing(my_lat, my_lon, msg.position_lat, msg.position_lon);
-                    
                     let (dist_text, bearing_text) = if let Some((dist_km, bearing)) = dist_bearing {
-                        let dist_str = if dist_km < 1.0 {
-                            format!("{:.0}m", dist_km * 1000.0)
-                        } else if dist_km < 10.0 {
-                            format!("{:.1}km", dist_km)
-                        } else {
-                            format!("{:.0}km", dist_km)
-                        };
-                        let bear_str = bearing_to_compass(bearing);
-                        (dist_str, bear_str)
-                    } else {
-                        ("??".to_string(), "--°".to_string())
-                    };
+                        let dist_str = if dist_km < 1.0 { format!("{:.0}m", dist_km * 1000.0) }
+                            else if dist_km < 10.0 { format!("{:.1}km", dist_km) }
+                            else { format!("{:.0}km", dist_km) };
+                        (dist_str, bearing_to_compass(bearing))
+                    } else { ("??".to_string(), "--°".to_string()) };
                     
-                    let pos_text = format!("{} {}", dist_text, bearing_text);
-                    // Escape & for GTK markup
-                    let escaped_comment = msg.comment.replace('&', "&amp;");
-                    let comment = if escaped_comment.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" - {}", escaped_comment)
-                    };
-                    content.set_markup(&format!(
-                        "<span color='#33D17A'>📍 {}</span>{}",
-                        pos_text, comment
-                    ));
+                    let comment = if msg.comment.is_empty() { String::new() } else { format!(" - {}", msg.comment) };
+                    content.set_markup(&format!("<span color='#33D17A'>📍 {} {}</span>{}", dist_text, bearing_text, comment));
                 } else {
                     content.set_text(&msg.comment);
                     content.add_css_class("aprs-comment");
@@ -1143,39 +949,9 @@ fn create_ui(
             }
             aprs::APRSType::Message => {
                 let body = msg.msg_body.as_deref().unwrap_or("");
-                content.set_markup(&format!(
-                    "<span color='#888888'>Message to {}:</span>\n{}",
-                    msg.to_callsign_msg.as_deref().unwrap_or(&msg.to_callsign),
-                    body
-                ));
+                content.set_markup(&format!("<span color='#888888'>Message to {}:</span>\n{}", 
+                    msg.to_callsign_msg.as_deref().unwrap_or(&msg.to_callsign), body));
                 content.add_css_class("aprs-message-body");
-            }
-            aprs::APRSType::Weather => {
-                let mut weather_text = String::new();
-                if let Some(temp) = msg.temperature {
-                    weather_text.push_str(&format!("🌡 {:.1}°C ", temp));
-                }
-                if let Some(hum) = msg.humidity {
-                    weather_text.push_str(&format!("💧 {:.0}% ", hum));
-                }
-                if let Some(wind) = msg.wind_force {
-                    if let Some(dir) = &msg.wind_dir {
-                        weather_text.push_str(&format!("💨 {} {} ", wind, dir));
-                    } else {
-                        weather_text.push_str(&format!("💨 {} km/h ", wind));
-                    }
-                }
-                if weather_text.is_empty() {
-                    weather_text = msg.comment.clone();
-                }
-                content.set_text(&weather_text);
-                content.add_css_class("aprs-weather");
-            }
-            aprs::APRSType::Object => {
-                content.set_markup(&format!(
-                    "<span color='#888888'>Object:</span> <span color='#FFB000'>{}</span>",
-                    msg.obj_name.as_deref().unwrap_or("??")
-                ));
             }
             _ => {
                 content.set_text(&msg.comment);
@@ -1185,7 +961,6 @@ fn create_ui(
         
         msg_row.append(&header);
         msg_row.append(&content);
-        
         list_box.prepend(&msg_row);
         list_box.show();
     }
@@ -1211,35 +986,26 @@ fn create_ui(
     aprs_page.append(&aprs_header);
     aprs_page.append(&aprs_scroll);
     
-    // APRS clamp - constrains width to 340px
-    let aprs_clamp = adw::Clamp::builder()
-        .maximum_size(340)
-        .tightening_threshold(340)
-        .build();
+    // APRS container - fixed 340px
+    let aprs_clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
     aprs_clamp.set_size_request(340, 700);
-    aprs_clamp.set_halign(gtk::Align::Center);
-    aprs_clamp.set_child(Some(&aprs_page));
+    aprs_clamp.set_hexpand(false);
+    aprs_clamp.append(&aprs_page);
     
     // =========================================================================
-    // MAP PAGE (simple tiles)
+    // MAP PAGE
     // =========================================================================
     eprintln!("[main] Creating MapManager...");
-    
     let mut manager = MapManager::new();
     manager.initialize();
     eprintln!("[main] MapManager created");
     
-    // Get the DrawingArea widget
     let map_view = manager.view_cloned();
-    
-    // Wrap manager in Arc for future update capability
     let map_manager = Arc::new(Mutex::new(manager));
     
-    // Create map page with GPS header and map view
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     map_page.set_size_request(340, 700);
     
-    // GPS info header with locator
     let gps_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     gps_header.set_halign(gtk::Align::Center);
     gps_header.set_margin_start(4);
@@ -1257,50 +1023,37 @@ fn create_ui(
     gps_header.append(&locator_label);
     gps_header.append(&coords_label);
     
-    // Map is a fixed-size DrawingArea
     map_page.append(&gps_header);
     map_page.append(&map_view);
     
-    // Map clamp - constrains width to 340px
-    let map_clamp = adw::Clamp::builder()
-        .maximum_size(340)
-        .tightening_threshold(340)
-        .build();
+    // Map container - fixed 340px
+    let map_clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
     map_clamp.set_size_request(340, 700);
-    map_clamp.set_halign(gtk::Align::Center);
-    map_clamp.set_child(Some(&map_page));
+    map_clamp.set_hexpand(false);
+    map_clamp.append(&map_page);
     
     // =========================================================================
-    // CAROUSEL (Swipe Navigation)
+    // CAROUSEL
     // =========================================================================
-    // Carousel wrapper - fixed size container
     let carousel = adw::Carousel::new();
     carousel.set_interactive(true);
     carousel.set_hexpand(false);
     carousel.set_vexpand(true);
     
-    // Pages: FM (0), APRS (1), Map (2)
-    carousel.append(&clamp);       // Page 0: FM
-    carousel.append(&aprs_clamp);  // Page 1: APRS
-    carousel.append(&map_clamp);   // Page 2: Map
+    carousel.append(&clamp);
+    carousel.append(&aprs_clamp);
+    carousel.append(&map_clamp);
     
-    // Page indicators
     let indicator = adw::CarouselIndicatorDots::new();
     indicator.set_carousel(Some(&carousel));
     indicator.set_halign(gtk::Align::Center);
     indicator.set_margin_bottom(8);
     
-    // Carousel box - fixed size, centered
     let carousel_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     carousel_box.set_size_request(340, 700);
-    carousel_box.set_halign(gtk::Align::Center);
     carousel_box.set_hexpand(false);
     carousel_box.append(&carousel);
     carousel_box.append(&indicator);
-    
-    // Mode buttons hidden - APRS is always active
-    btn_fm.set_visible(false);
-    mode_box.set_visible(false);
     
     // =========================================================================
     // SETTINGS PAGE
@@ -1309,12 +1062,9 @@ fn create_ui(
     settings_page.set_size_request(340, 700);
     settings_page.set_hexpand(false);
     
-    let settings_clamp = adw::Clamp::builder()
-        .maximum_size(340)
-        .tightening_threshold(340)
-        .build();
+    let settings_clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
     settings_clamp.set_size_request(340, 700);
-    settings_clamp.set_halign(gtk::Align::Center);
+    settings_clamp.set_hexpand(false);
     
     let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     
@@ -1357,16 +1107,12 @@ fn create_ui(
         squelch_label_clone.set_text(&format!("{}", level));
         
         if level != last_sent.load(std::sync::atomic::Ordering::SeqCst) {
-            unsafe {
-                (*settings_clone).set_squelch(level);
-            }
+            unsafe { (*settings_clone).set_squelch(level); }
             
             let radio_clone = radio_squelch.clone();
             let sent = Arc::clone(&last_sent);
             std::thread::spawn(move || {
-                if let Ok(r) = radio_clone.lock() {
-                    let _ = r.set_squelch(level);
-                }
+                if let Ok(r) = radio_clone.lock() { let _ = r.set_squelch(level); }
                 sent.store(level, std::sync::atomic::Ordering::SeqCst);
             });
         }
@@ -1380,11 +1126,11 @@ fn create_ui(
     
     settings_scroll.set_child(Some(&settings_box));
     settings_content.append(&settings_scroll);
-    settings_clamp.set_child(Some(&settings_content));
+    settings_clamp.append(&settings_content);
     settings_page.append(&settings_clamp);
     
     // =========================================================================
-    // ViewStack for navigation
+    // ViewStack
     // =========================================================================
     let stack = adw::ViewStack::new();
     stack.set_size_request(340, 654);
@@ -1393,28 +1139,19 @@ fn create_ui(
     stack.add_titled(&carousel_box, Some("main"), "Main");
     stack.add_titled(&settings_page, Some("settings"), "Settings");
     
-    // =========================================================================
-    // Navigation - Connect settings button to ViewStack
-    // =========================================================================
     let stack_for_toggle = stack.clone();
     settings_btn.connect_toggled(move |btn| {
-        if btn.is_active() {
-            stack_for_toggle.set_visible_child_name("settings");
-        } else {
-            stack_for_toggle.set_visible_child_name("main");
-        }
+        if btn.is_active() { stack_for_toggle.set_visible_child_name("settings"); }
+        else { stack_for_toggle.set_visible_child_name("main"); }
     });
     
-    // =========================================================================
-    // Toast Overlay for notifications
-    // =========================================================================
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_size_request(340, 654);
     toast_overlay.set_hexpand(false);
     toast_overlay.set_child(Some(&stack));
     
     // =========================================================================
-    // Register APRS callback
+    // APRS callback
     // =========================================================================
     {
         let r = radio.lock().unwrap();
@@ -1423,62 +1160,28 @@ fn create_ui(
         r.on_aprs(move |msg| {
             let mut msgs = aprs_msgs.lock().unwrap();
             msgs.push(msg.clone());
-            if msgs.len() > 100 {
-                msgs.remove(0);
-            }
+            if msgs.len() > 100 { msgs.remove(0); }
             
-            eprintln!("[pocket-modem] APRS: {} -> {} ({:?})", 
-                      msg.from_callsign, msg.to_callsign, msg.msg_type);
+            eprintln!("[pocket-modem] APRS: {} -> {}", msg.from_callsign, msg.to_callsign);
             
-            // Build notification text
-            let notification_text = match msg.msg_type {
-                aprs::APRSType::Position => {
-                    if msg.position_lat != 0.0 || msg.position_lon != 0.0 {
-                        format!("{}: {}km", msg.from_callsign, 
-                                calculate_distance_display(45.496, 9.376, msg.position_lat, msg.position_lon))
-                    } else {
-                        msg.from_callsign.clone()
-                    }
-                }
-                aprs::APRSType::Message => {
-                    format!("{}: {}", msg.from_callsign, 
-                            msg.msg_body.as_deref().unwrap_or(""))
-                }
-                aprs::APRSType::Weather => format!("{}: Weather", msg.from_callsign),
-                _ => msg.from_callsign.clone(),
-            };
-            
-            // Truncate long messages
-            let notification_text = if notification_text.len() > 50 { 
-                format!("{}...", &notification_text[..47]) 
-            } else { 
-                notification_text 
-            };
-            
-            // Show desktop notification
             #[cfg(feature = "notifications")]
-            if let Err(e) = show_aprs_notification(&notification_text, &msg.from_callsign) {
+            if let Err(e) = show_aprs_notification(&msg.from_callsign, &msg.from_callsign) {
                 eprintln!("[pocket-modem] Notification error: {}", e);
             }
         });
     }
     
-    // Initialize notifications
     #[cfg(feature = "notifications")]
-    {
-        if let Err(e) = init("pocket-modem") {
-            eprintln!("[pocket-modem] Failed to init notifications: {:?}", e);
-        } else {
-            eprintln!("[pocket-modem] Notifications initialized");
-        }
-    }
+    { if let Err(e) = init("pocket-modem") { eprintln!("[pocket-modem] Notifications init failed: {:?}", e); } }
     
-    // Update loop for live status
+    // =========================================================================
+    // Update loop
+    // =========================================================================
     let radio_update = Arc::clone(radio);
     let modem_label_clone = modem_label.clone();
     let rssi_sbar_clone = rssi_sbar.clone();
     let signal_value_clone = signal_value.clone();
-    let signal_label = signal_label.clone();
+    let signal_label_clone = signal_label.clone();
     let audio_clone = Arc::clone(audio);
     let audio_label_clone = audio_label.clone();
     let gps_clone = Arc::clone(gps);
@@ -1515,16 +1218,14 @@ fn create_ui(
             if state.connected && state.raw_rssi > 0 {
                 if state.tx_active {
                     let pct = (state.raw_rssi as f64) / 255.0 * 100.0;
-                    let pct_text = format!("{}%", pct as i32);
-                    signal_value_clone.set_markup(&format!("<span color='#FF4444'>{}</span>", pct_text));
-                    signal_label.set_text("AUDIO");
+                    signal_value_clone.set_markup(&format!("<span color='#FF4444'>{}%</span>", pct as i32));
+                    signal_label_clone.set_text("AUDIO");
                     rssi_sbar_clone.remove_css_class("bar-rx");
                     rssi_sbar_clone.add_css_class("bar-tx");
                 } else {
                     let dbm = (state.raw_rssi as f64) * 1.2 - 160.8;
-                    let dbm_text = format!("{} dBm", dbm as i32);
-                    signal_value_clone.set_markup(&format!("<span color='#FFB000'>{}</span>", dbm_text));
-                    signal_label.set_text("SIGNAL");
+                    signal_value_clone.set_markup(&format!("<span color='#FFB000'>{} dBm</span>", dbm as i32));
+                    signal_label_clone.set_text("SIGNAL");
                     rssi_sbar_clone.remove_css_class("bar-tx");
                     rssi_sbar_clone.add_css_class("bar-rx");
                 }
@@ -1535,52 +1236,39 @@ fn create_ui(
                 signal_value_clone.set_markup(&format!("<span color='#888888'>{}</span>", "--"));
                 rssi_sbar_clone.set_fraction(0.0);
                 rssi_sbar_clone.add_css_class("empty");
-                signal_label.set_text("SIGNAL");
+                signal_label_clone.set_text("SIGNAL");
                 rssi_sbar_clone.remove_css_class("bar-tx");
                 rssi_sbar_clone.remove_css_class("bar-rx");
             }
         }
         
-        // Update audio status
+        // Audio status
         {
             let a = audio_clone.lock().unwrap();
             let audio_started = a.audio_started();
-            let has_error = a.has_decode_error();
             drop(a);
             
-            let squelch_open = if let Ok(r) = radio_update.lock() {
-                r.state().squelch_open
-            } else {
-                false
-            };
+            let squelch_open = if let Ok(r) = radio_update.lock() { r.state().squelch_open } else { false };
             
-            if has_error {
-                audio_label_clone.set_text("○");
-                audio_label_clone.remove_css_class("status-icon-green");
-                audio_label_clone.remove_css_class("status-icon-gray-filled");
-                audio_label_clone.add_css_class("status-icon-red");
-            } else if !audio_started {
+            if !audio_started {
                 audio_label_clone.set_text("○");
                 audio_label_clone.remove_css_class("status-icon-green");
                 audio_label_clone.remove_css_class("status-icon-red");
-                audio_label_clone.remove_css_class("status-icon-gray-filled");
                 audio_label_clone.add_css_class("status-icon-gray-empty");
             } else if squelch_open {
                 audio_label_clone.set_text("●");
                 audio_label_clone.remove_css_class("status-icon-gray-empty");
-                audio_label_clone.remove_css_class("status-icon-gray-filled");
                 audio_label_clone.remove_css_class("status-icon-red");
                 audio_label_clone.add_css_class("status-icon-green");
             } else {
                 audio_label_clone.set_text("●");
                 audio_label_clone.remove_css_class("status-icon-green");
                 audio_label_clone.remove_css_class("status-icon-red");
-                audio_label_clone.remove_css_class("status-icon-gray-empty");
                 audio_label_clone.add_css_class("status-icon-gray-filled");
             }
         }
 
-        // Update GPS status
+        // GPS status
         if let Ok(g) = gps_clone.lock() {
             let gps_data = g.get_data();
             
@@ -1602,21 +1290,14 @@ fn create_ui(
             }
         }
         
-        // Update APRS UI with distance/bearing from GPS position
+        // APRS UI
         let (my_lat, my_lon) = {
             if let Ok(g) = gps_clone.lock() {
                 let gps_data = g.get_data();
-                if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
-                    (lat, lon)
-                } else {
-                    (0.0, 0.0)
-                }
-            } else {
-                (0.0, 0.0)
-            }
+                if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) { (lat, lon) }
+                else { (0.0, 0.0) }
+            } else { (0.0, 0.0) }
         };
-        
-
         
         {
             let msgs = aprs_messages_clone2.lock().unwrap();
@@ -1629,17 +1310,8 @@ fn create_ui(
                 let mut new_last = last_displayed;
                 for i in last_displayed..total_count {
                     if let Some(msg) = msgs.get(i) {
-                        add_aprs_message_to_list(
-                            msg,
-                            &aprs_list_box_clone,
-                            &aprs_empty_label_clone,
-                            my_lat,
-                            my_lon,
-                        );
-                        // Update map with new APRS station
-                        if let Ok(mut map) = map_manager_clone.lock() {
-                            map.update_station(msg);
-                        }
+                        add_aprs_message_to_list(msg, &aprs_list_box_clone, &aprs_empty_label_clone, my_lat, my_lon);
+                        if let Ok(mut map) = map_manager_clone.lock() { map.update_station(msg); }
                         new_last = i + 1;
                     }
                 }
@@ -1647,53 +1319,38 @@ fn create_ui(
             }
         }
         
-        // Update Map page with GPS data
+        // Map with GPS data
         if let Ok(g) = gps_clone.lock() {
             let gps_data = g.get_data();
             
             if gps_data.has_fix {
                 if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
                     let locator = maidenhead_locator(lat, lon);
-                    locator_label_clone.set_markup(&format!(
-                        "<span color='#FFB000'>MAIDENHEAD: {}</span>",
-                        locator
-                    ));
-                    coords_label_clone.set_text(&format!(
-                        "Lat: {:.6}° Lon: {:.6}°",
-                        lat, lon
-                    ));
-                    // Update map with user position
+                    locator_label_clone.set_markup(&format!("<span color='#FFB000'>MAIDENHEAD: {}</span>", locator));
+                    coords_label_clone.set_text(&format!("Lat: {:.6}° Lon: {:.6}°", lat, lon));
                     if let Ok(mut map) = map_manager_clone.lock() {
                         map.set_user_position(lat, lon);
                         map.center_on_user();
                     }
                 } else {
-                    locator_label_clone.set_markup(
-                        "<span color='#FFB000'>MAIDENHEAD: --- (searching)</span>"
-                    );
+                    locator_label_clone.set_markup("<span color='#FFB000'>MAIDENHEAD: --- (searching)</span>");
                     coords_label_clone.set_text("Lat: -- Lon: -- (no fix)");
                 }
             } else if gps_data.gps_enabled {
-                locator_label_clone.set_markup(
-                    "<span color='#FFB000'>MAIDENHEAD: --- (searching)</span>"
-                );
+                locator_label_clone.set_markup("<span color='#FFB000'>MAIDENHEAD: --- (searching)</span>");
                 coords_label_clone.set_text("Lat: -- Lon: -- (no fix)");
             } else {
-                locator_label_clone.set_markup(
-                    "<span color='#888888'>MAIDENHEAD: -- (GPS off)</span>"
-                );
+                locator_label_clone.set_markup("<span color='#888888'>MAIDENHEAD: -- (GPS off)</span>");
                 coords_label_clone.set_text("Lat: -- Lon: --");
             }
         }
         
-        ptt_label_update.set_text("PTT");
-        
-        // Check if map needs a redraw (from background tile loading)
+        // Check map redraw
         if let Ok(map) = map_manager_clone.lock() {
-            if map.needs_redraw() {
-                map.request_redraw();
-            }
+            if map.needs_redraw() { map.request_redraw(); }
         }
+        
+        ptt_label_update.set_text("PTT");
         
         glib::ControlFlow::Continue
     });
@@ -1701,18 +1358,10 @@ fn create_ui(
     // =========================================================================
     // Channel Edit Dialog
     // =========================================================================
-    fn show_channel_edit_dialog<F, D>(
-        parent: &gtk::Button,
-        channel: &Channel,
-        on_save: F,
-        on_delete: D,
-    )
-    where
-        F: FnOnce(Channel) + 'static,
-        D: FnOnce() + 'static,
-    {
+    fn show_channel_edit_dialog<F, D>(parent: &gtk::Button, channel: &Channel, on_save: F, on_delete: D)
+    where F: FnOnce(Channel) + 'static, D: FnOnce() + 'static {
         let dialog = gtk::Dialog::with_buttons(
-            Some(&format!("Edit Channel: {}", channel.name)),
+            Some(&format!("Edit: {}", channel.name)),
             parent.root().and_then(|r| r.downcast::<gtk::Window>().ok()).as_ref(),
             gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
             &[("Cancel", gtk::ResponseType::Cancel), ("Save", gtk::ResponseType::Accept)],
@@ -1729,7 +1378,6 @@ fn create_ui(
         let name_entry = gtk::Entry::new();
         name_entry.set_text(&channel.name);
         name_entry.set_hexpand(true);
-        name_entry.set_input_purpose(gtk::InputPurpose::Alpha);
         name_row.add_suffix(&name_entry);
         name_row.set_activatable_widget(Some(&name_entry));
         content.append(&name_row);
@@ -1739,65 +1387,9 @@ fn create_ui(
         let freq_entry = gtk::Entry::new();
         freq_entry.set_text(&format!("{:.3}", channel.rx_freq_khz as f64 / 1000.0));
         freq_entry.set_hexpand(true);
-        freq_entry.set_input_purpose(gtk::InputPurpose::Number);
         freq_row.add_suffix(&freq_entry);
         freq_row.set_activatable_widget(Some(&freq_entry));
         content.append(&freq_row);
-        
-        let duplex_row = adw::ActionRow::new();
-        duplex_row.set_title("Duplex");
-        let duplex_dropdown = gtk::DropDown::from_strings(&["Simplex", "+", "-", "Split"]);
-        match channel.duplex {
-            Duplex::Simplex => duplex_dropdown.set_selected(0),
-            Duplex::Plus => duplex_dropdown.set_selected(1),
-            Duplex::Minus => duplex_dropdown.set_selected(2),
-            Duplex::Split => duplex_dropdown.set_selected(3),
-        }
-        duplex_row.add_suffix(&duplex_dropdown);
-        duplex_row.set_activatable_widget(Some(&duplex_dropdown));
-        content.append(&duplex_row);
-        
-        let offset_row = adw::ActionRow::new();
-        offset_row.set_title("Offset (MHz)");
-        let offset_entry = gtk::Entry::new();
-        offset_entry.set_text(&format!("{:.3}", channel.offset_khz as f64 / 1000.0));
-        offset_entry.set_hexpand(true);
-        offset_entry.set_input_purpose(gtk::InputPurpose::Number);
-        offset_row.add_suffix(&offset_entry);
-        offset_row.set_activatable_widget(Some(&offset_entry));
-        content.append(&offset_row);
-        
-        let tone_row = adw::ActionRow::new();
-        tone_row.set_title("Tone Mode");
-        let tone_dropdown = gtk::DropDown::from_strings(&["None", "Tone", "TSQL"]);
-        match channel.tone_mode {
-            ToneMode::None => tone_dropdown.set_selected(0),
-            ToneMode::Tone => tone_dropdown.set_selected(1),
-            ToneMode::Tsql => tone_dropdown.set_selected(2),
-        }
-        tone_row.add_suffix(&tone_dropdown);
-        tone_row.set_activatable_widget(Some(&tone_dropdown));
-        content.append(&tone_row);
-        
-        let rtone_row = adw::ActionRow::new();
-        rtone_row.set_title("RX Tone (Hz)");
-        let rtone_entry = gtk::Entry::new();
-        rtone_entry.set_text(&format!("{:.1}", channel.rtone_hz));
-        rtone_entry.set_hexpand(true);
-        rtone_entry.set_input_purpose(gtk::InputPurpose::Number);
-        rtone_row.add_suffix(&rtone_entry);
-        rtone_row.set_activatable_widget(Some(&rtone_entry));
-        content.append(&rtone_row);
-        
-        let ctone_row = adw::ActionRow::new();
-        ctone_row.set_title("TX Tone (Hz)");
-        let ctone_entry = gtk::Entry::new();
-        ctone_entry.set_text(&format!("{:.1}", channel.ctone_hz));
-        ctone_entry.set_hexpand(true);
-        ctone_entry.set_input_purpose(gtk::InputPurpose::Number);
-        ctone_row.add_suffix(&ctone_entry);
-        ctone_row.set_activatable_widget(Some(&ctone_entry));
-        content.append(&ctone_row);
         
         let delete_btn = gtk::Button::with_label("Delete Channel");
         delete_btn.add_css_class("destructive-action");
@@ -1809,84 +1401,32 @@ fn create_ui(
         
         use std::cell::RefCell;
         let on_delete_opt = RefCell::new(Some(on_delete));
-        
         let dialog_for_delete = dialog.clone();
         delete_btn.connect_clicked(move |_| {
-            if let Some(callback) = on_delete_opt.borrow_mut().take() {
-                callback();
-            }
+            if let Some(callback) = on_delete_opt.borrow_mut().take() { callback(); }
             dialog_for_delete.close();
         });
         
         let on_save_opt = RefCell::new(Some(on_save));
         let channel_clone = channel.clone();
-        let name_entry_clone = name_entry.clone();
-        let freq_entry_clone = freq_entry.clone();
-        let offset_entry_clone = offset_entry.clone();
-        let rtone_entry_clone = rtone_entry.clone();
-        let ctone_entry_clone = ctone_entry.clone();
         let dialog_for_close = dialog.clone();
         
         dialog.connect_response(move |_d, response| {
             if response == gtk::ResponseType::Accept {
-                let name = name_entry_clone.text().to_string();
-                let freq_text = freq_entry_clone.text().to_string();
-                let offset_text = offset_entry_clone.text().to_string();
-                let rtone_text = rtone_entry_clone.text().to_string();
-                let ctone_text = ctone_entry_clone.text().to_string();
+                let name = name_entry.text().to_string();
+                let freq_text = freq_entry.text().to_string();
                 
                 let freq_mhz: f64 = freq_text.parse().unwrap_or(channel_clone.rx_freq_khz as f64 / 1000.0);
                 let rx_freq_khz = (freq_mhz * 1000.0) as u32;
-                
-                let offset_khz: u32 = {
-                    let trimmed = offset_text.trim();
-                    if trimmed.is_empty() {
-                        600
-                    } else if let Ok(mhz) = trimmed.parse::<f64>() {
-                        (mhz * 1000.0).round() as u32
-                    } else {
-                        channel_clone.offset_khz
-                    }
-                };
-                
-                let duplex = match duplex_dropdown.selected() {
-                    0 => Duplex::Simplex,
-                    1 => Duplex::Plus,
-                    2 => Duplex::Minus,
-                    _ => Duplex::Split,
-                };
-                
-                let tone_mode = match tone_dropdown.selected() {
-                    0 => ToneMode::None,
-                    1 => ToneMode::Tone,
-                    _ => ToneMode::Tsql,
-                };
-                
-                let rtone_hz: f32 = rtone_text.parse().unwrap_or(channel_clone.rtone_hz);
-                let ctone_hz: f32 = ctone_text.parse().unwrap_or(channel_clone.ctone_hz);
                 
                 let updated = Channel {
                     location: channel_clone.location,
                     name,
                     rx_freq_khz,
-                    duplex,
-                    offset_khz,
-                    tx_freq_khz: if duplex == Duplex::Split {
-                        Some(rx_freq_khz + offset_khz)
-                    } else {
-                        None
-                    },
-                    tone_mode,
-                    rtone_hz,
-                    ctone_hz,
-                    mode: channel_clone.mode.clone(),
-                    power: channel_clone.power,
-                    comment: channel_clone.comment.clone(),
+                    ..channel_clone.clone()
                 };
                 
-                if let Some(callback) = on_save_opt.borrow_mut().take() {
-                    callback(updated);
-                }
+                if let Some(callback) = on_save_opt.borrow_mut().take() { callback(updated); }
             }
             dialog_for_close.close();
         });
@@ -1899,39 +1439,9 @@ fn create_ui(
     // =========================================================================
     let css_provider = gtk::CssProvider::new();
     css_provider.load_from_data(r#"
-        .freq-display {
-            font-size: 60px;
-            font-family: "monospace";
-            font-weight: bold;
-            color: #FFB000;
-            background: #1E1E1E;
-            border: 3px solid #444;
-            border-radius: 12px;
-            text-shadow: 0 0 8px rgba(255, 176, 0, 0.5);
-            box-shadow: inset 0 0 16px rgba(0, 0, 0, 0.8);
-            caret-color: #FFB000;
-        }
+        .freq-display { font-size: 60px; font-family: monospace; font-weight: bold; color: #FFB000; background: #1E1E1E; border: 3px solid #444; border-radius: 12px; text-shadow: 0 0 8px rgba(255, 176, 0, 0.5); box-shadow: inset 0 0 16px rgba(0, 0, 0, 0.8); caret-color: #FFB000; }
         .freq-display:focus { border-color: #FFB000; }
-        .tx-frequency {
-            color: #ff4444;
-            border-color: #ff4444;
-            text-shadow: 0 0 8px rgba(255, 68, 68, 0.5);
-        }
-        .mode-btn {
-            font-size: 13px;
-            font-weight: bold;
-            padding: 8px 12px;
-            border-radius: 8px;
-            background: #2a2a2a;
-            border: 1px solid #444;
-            color: #888;
-        }
-        .mode-btn-active {
-            background: #1a2a1a;
-            border: 2px solid #33D17A;
-            color: #33D17A;
-            box-shadow: 0 0 6px rgba(51, 209, 122, 0.3);
-        }
+        .tx-frequency { color: #ff4444; border-color: #ff4444; }
         .status-icon-green { font-size: 14px; color: #33D17A; }
         .status-icon-red { font-size: 14px; color: #ff4444; }
         .gps-led-on { color: #33D17A; font-size: 14px; }
@@ -1939,24 +1449,18 @@ fn create_ui(
         .gps-led-searching { color: #FFB000; font-size: 14px; }
         .status-icon-gray-empty { font-size: 14px; color: #666; }
         .status-icon-gray-filled { font-size: 14px; color: #888; }
-        .modem-label { color: #666; font-size: 11px; }
-        .gps-label { color: #666; font-size: 11px; }
-        .audio-label { color: #666; font-size: 11px; }
+        .modem-label, .gps-label, .audio-label { color: #666; font-size: 11px; }
         .signal-text { font-size: 11px; color: #888; font-weight: bold; }
         .signal-value { font-size: 11px; font-weight: bold; }
         .rssi-bar { background: #2a2a2a; border: 1px solid #444; border-radius: 4px; }
-        .rssi-bar.empty progress { background: transparent; }
         .rssi-bar.empty { opacity: 0.3; }
         .rssi-bar.bar-tx progress { background: #FF4444; }
         .rssi-bar.bar-rx progress { background: #FFB000; }
         .ptt-button { min-width: 90px; min-height: 100px; border-radius: 12px; background: #333; border: 2px solid #555; }
-        .ptt-button:hover { background: #3a3a3a; border-color: #666; }
         .ptt-button:active { background: #444; border-color: #FFB000; }
         .ptt-icon { color: #888; }
-        .ptt-button:hover .ptt-icon { color: #aaa; }
         .ptt-button:active .ptt-icon { color: #FFB000; }
         .ptt-label { font-size: 11px; font-weight: bold; color: #888; }
-        .ptt-button:hover .ptt-label { color: #aaa; }
         .ptt-button:active .ptt-label { color: #FFB000; }
         .squelch-value { font-size: 14px; font-weight: bold; color: #888; }
         .channel-section-title { font-size: 14px; color: #888; }
@@ -1964,7 +1468,6 @@ fn create_ui(
         .channel-row { background: transparent; }
         .channel-row:hover { background: #333; }
         .channel-row-selected { background: #3a3a3a; }
-        .channel-row-selected:hover { background: #3a3a3a; }
         .aprs-list { background: #2a2a2a; border-radius: 8px; border: 1px solid #444; }
         .aprs-message-row { background: transparent; border-bottom: 1px solid #333; padding: 8px; }
         .aprs-message-row:hover { background: #333; }
@@ -1973,10 +1476,7 @@ fn create_ui(
         .aprs-timestamp { font-size: 12px; color: #666; }
         .aprs-comment { font-size: 13px; color: #888; font-style: italic; }
         .aprs-message-body { font-size: 14px; color: #aaa; }
-        .aprs-weather { font-size: 14px; color: #aaa; }
         .aprs-empty-text { font-size: 14px; color: #666; padding: 32px; }
-        .map-placeholder-icon { color: #666; }
-        .map-placeholder-text { font-size: 14px; color: #888; }
         .locator-display { font-size: 18px; font-family: monospace; }
         .coords-display { font-size: 14px; color: #888; font-family: monospace; }
     "#);
