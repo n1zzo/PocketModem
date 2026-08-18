@@ -1000,14 +1000,20 @@ fn create_ui(
     // =========================================================================
     let map_manager = Arc::new(Mutex::new(MapManager::new()));
     
+    // Detect dark mode via Adw::StyleManager
+    let dark_mode = adw::StyleManager::default().is_dark();
+    eprintln!("[pocket-modem] Initial dark mode: {}", dark_mode);
+    
+    // Store dark mode state for polling in UI timer
+    let dark_mode_state: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(dark_mode));
+    
     // Initialize the map with vector tiles
     {
         let mut mm = map_manager.lock().unwrap();
-        mm.initialize();
+        mm.initialize(dark_mode);
     }
     
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    map_page.set_size_request(330, 700);
     map_page.set_hexpand(false);
     map_page.set_vexpand(true);
     map_page.set_halign(gtk::Align::Center);
@@ -1034,9 +1040,10 @@ fn create_ui(
         let mm = map_manager.lock().unwrap();
         mm.view().clone()
     };
-    map_view.set_size_request(330, 400);
+    // Fill available space (below GPS header and above carousel)
     map_view.set_hexpand(false);
-    map_view.set_vexpand(false);
+    map_view.set_vexpand(true);
+    map_view.set_valign(gtk::Align::Fill);
     map_page.append(&map_view);
     
     // Map container
@@ -1234,6 +1241,7 @@ fn create_ui(
     let window_clone = window.clone();
     let map_page_clone = map_page.clone();
     let map_clamp_clone = map_clamp.clone();
+    let dark_mode_state_clone = Arc::clone(&dark_mode_state);
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if let Ok(r) = radio_update.lock() {
@@ -1386,11 +1394,17 @@ fn create_ui(
         }
         
         // Map drawing is handled automatically by libshumate
-        // Just ensure user position is updated when GPS changes
-        // (position is already set in the GPS section above)
+        // Check for dark mode changes and update map style
         {
-            // Nothing to do - libshumate handles tile rendering and user position
-            let _ = map_manager_clone.lock().unwrap().get_user_position();
+            let current_dark = adw::StyleManager::default().is_dark();
+            let prev_dark = dark_mode_state_clone.load(std::sync::atomic::Ordering::SeqCst);
+            if current_dark != prev_dark {
+                dark_mode_state_clone.store(current_dark, std::sync::atomic::Ordering::SeqCst);
+                eprintln!("[pocket-modem] Dark mode changed to: {}", current_dark);
+                if let Ok(mut mm) = map_manager_clone.lock() {
+                    mm.update_style(current_dark);
+                }
+            }
         }
         
         // Status update tick counter
