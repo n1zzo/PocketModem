@@ -1384,6 +1384,9 @@ fn create_ui(
                         add_aprs_message_to_list(msg, &aprs_list_box_clone, &aprs_empty_label_clone, my_lat, my_lon);
                         if let Ok(mut map) = map_manager_clone.lock() {
                             // update_station takes APRSMessage directly for libshumate
+                            eprintln!("[map] Adding station to map: {} at ({:.4}, {:.4}) symbol: {}{}", 
+                                msg.from_callsign, msg.position_lat, msg.position_lon,
+                                msg.symbol_table_id.unwrap_or('/'), msg.symbol_code.unwrap_or('?'));
                             map.update_station(msg);
                         }
                         new_last = i + 1;

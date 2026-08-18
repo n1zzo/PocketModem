@@ -144,11 +144,26 @@ impl APRSIconRenderer {
     }
 
     fn symbol_index(c: char) -> usize {
-        match c {
-            '0'..='9' => c as usize - '0' as usize,
-            'A'..='Z' => 10 + c as usize - 'A' as usize,
-            'a'..='z' => 36 + c as usize - 'a' as usize,
-            _ => 63,
+        // APRS symbol table mapping:
+        // 0-9: indices 0-9
+        // A-Z: indices 10-35 (10 + 0-25)
+        // a-x: indices 36-61 (36 + 0-23), skipping y and z
+        // >: index 62 (truck)
+        // \: index 63 (house)
+        
+        let ascii = c as u32;
+        if ascii >= 0x30 && ascii <= 0x39 {
+            (ascii - 0x30) as usize  // 0-9
+        } else if ascii >= 0x41 && ascii <= 0x5A {
+            10 + (ascii - 0x41) as usize  // A-Z
+        } else if ascii >= 0x61 && ascii <= 0x78 {
+            36 + (ascii - 0x61) as usize  // a-x (36-60)
+        } else if c == '>' {
+            62
+        } else if c == '\\' {
+            63
+        } else {
+            63  // Default fallback
         }
     }
 
@@ -156,6 +171,8 @@ impl APRSIconRenderer {
         let surf = ImageSurface::create(Format::ARgb32, size, size)
             .expect("icon surface");
         let cr = Context::new(&surf).expect("cairo context");
+        
+        eprintln!("[aprs_icons] render_icon: table={}, idx={}, size={}", table, idx, size);
         
         if let Some(ref sprite) = self.sprites[table] {
             let sprite_size = sprite.width() / COLS as i32;
@@ -177,11 +194,17 @@ impl APRSIconRenderer {
             cr.paint().ok();
         } else {
             // Fallback: colored circle
+            eprintln!("[aprs_icons] Using FALLBACK for table={}, idx={}", table, idx);
             let (r, g, b) = Self::fallback_color(idx);
             let cx = size as f64 / 2.0;
             cr.set_source_rgb(r, g, b);
             cr.arc(cx, cx, cx * 0.8, 0.0, 2.0 * std::f64::consts::PI);
             cr.fill().ok();
+            // Add a border so it's visible
+            cr.set_source_rgb(r * 0.5, g * 0.5, b * 0.5);
+            cr.set_line_width(2.0);
+            cr.arc(cx, cx, cx * 0.8, 0.0, 2.0 * std::f64::consts::PI);
+            cr.stroke().ok();
         }
         
         surf

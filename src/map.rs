@@ -578,8 +578,8 @@ impl MapManager {
             self.marker_layer.remove_marker(&old_marker);
         }
 
-        // Icon size (20x20 base, scaled for map markers)
-        let icon_size = 24;
+        // Icon size (larger for better visibility)
+        let icon_size = 32;
 
         // Get the APRS icon surface
         let icon_surface = self.icon_renderer.get_icon(
@@ -587,6 +587,9 @@ impl MapManager {
             msg.symbol_code,
             icon_size,
         );
+        eprintln!("[map] Icon surface: {}x{}, table={:?}, code={:?}", 
+                  icon_surface.width(), icon_surface.height(),
+                  msg.symbol_table_id, msg.symbol_code);
 
         // Create a DrawingArea to render the icon
         let drawing_area = gtk::DrawingArea::new();
@@ -594,17 +597,22 @@ impl MapManager {
 
         // Take ownership of the surface for the closure
         let surface = icon_surface.clone();
-        let callsign = msg.from_callsign.clone();
-        let comment = msg.comment.clone();
-        let is_dark = self.dark_mode;
 
-        // Since we know the icon size, use it directly
+        // Icon dimensions
         let icon_width = icon_size as f64;
         let icon_height = icon_size as f64;
+        
+        // Clone all data needed for closure
+        let callsign_for_draw = msg.from_callsign.clone();
+        let comment_for_tooltip = if msg.comment.is_empty() { String::new() } else { msg.comment.clone() };
 
+        let _surface = surface.clone();  // Keep alive
         drawing_area.set_draw_func(move |area, cr, width, height| {
-            // Draw the icon surface scaled to fit
-            // Scale to fit the drawing area while maintaining aspect ratio
+            // Draw a solid visible background first
+            cr.set_source_rgb(0.0, 1.0, 0.0);  // Green background
+            cr.paint().ok();
+            
+            // Draw the APRS icon on top
             let scale_x = width as f64 / icon_width;
             let scale_y = height as f64 / icon_height;
             let scale = scale_x.min(scale_y);
@@ -614,27 +622,38 @@ impl MapManager {
             let offset_x = (width as f64 - scaled_width) / 2.0;
             let offset_y = (height as f64 - scaled_height) / 2.0;
             
-            cr.set_source_surface(&surface, offset_x, offset_y);
-            cr.paint().expect("Failed to paint icon");
+            cr.set_source_surface(&_surface, offset_x, offset_y);
+            let _ = cr.paint();
             
-            // Draw callsign label below icon (optional, could be toggled)
-            // For now just draw the icon
+            // Draw border to see the icon bounds
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.set_line_width(1.0);
+            cr.rectangle(0.5, 0.5, width as f64 - 1.0, height as f64 - 1.0);
+            cr.stroke().ok();
         });
+        
+        eprintln!("[map] DrawingArea created with draw callback for {}", 
+                  msg.from_callsign);
 
         // Create tooltip with station info
         let tooltip_text = format!("{} - {}", msg.from_callsign, 
-            if msg.comment.is_empty() { "No comment" } else { &msg.comment });
+            if comment_for_tooltip.is_empty() { "No comment" } else { &comment_for_tooltip });
         drawing_area.set_tooltip_text(Some(&tooltip_text));
 
         // Create marker with icon
+        eprintln!("[map] Creating marker at lat={}, lon={}", msg.position_lat, msg.position_lon);
         let marker = Marker::builder()
             .latitude(msg.position_lat)
             .longitude(msg.position_lon)
             .child(&drawing_area)
             .build();
+        
+        eprintln!("[map] Marker built with child widget, size: {}x{}", icon_size, icon_size);
+        eprintln!("[map] Marker created, adding to layer");
 
         self.marker_layer.add_marker(&marker);
         self.station_markers.insert(key, marker);
+        eprintln!("[map] Marker added to layer, total markers: {}", self.station_markers.len());
         
         eprintln!("[map] Added APRS station: {} at ({:.4}, {:.4}), symbol: {}{}", 
                   msg.from_callsign, msg.position_lat, msg.position_lon,

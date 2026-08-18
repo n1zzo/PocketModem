@@ -313,7 +313,8 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
                         if ns == 'S' || ns == 's' { lat = -lat; }
                         if ew == 'W' || ew == 'w' { lon = -lon; }
                         // E/W at offset+17 is the SYMBOL CODE
-                        return Some((lat, lon, offset + 18));
+                        // consumed=17 points to E/W which IS the symbol
+                        return Some((lat, lon, offset + 17));
                     }
                 }
             }
@@ -335,9 +336,9 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
                         let mut lon = lon_deg + lon_min / 60.0;
                         if ns == 'S' || ns == 's' { lat = -lat; }
                         if ew == 'W' || ew == 'w' { lon = -lon; }
-                        // In Format B: lat(7) + N/S(1) + lon(8) + E/W(1) = 17 chars
-                        // E/W at offset+16 is the SYMBOL CODE
-                        return Some((lat, lon, offset + 17));
+                        // Format B: E/W at offset+16 is the SYMBOL CODE
+                        // consumed=16 points to E/W which IS the symbol
+                        return Some((lat, lon, offset + 16));
                     }
                 }
             }
@@ -361,9 +362,9 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
                         let mut lon = lon_deg + lon_min / 60.0;
                         if ns == 'S' || ns == 's' { lat = -lat; }
                         if ew == 'W' || ew == 'w' { lon = -lon; }
-                        // In Format C: lat(6) + N/S(1) + '/' + lon(7) + E/W(1) = 16 chars
-                        // E/W at lon_start+7 is the SYMBOL CODE
-                        return Some((lat, lon, lon_start + 8));
+                        // Format C: E/W at lon_start+7 is the SYMBOL CODE
+                        // consumed=lon_start+7 points to E/W which IS the symbol
+                        return Some((lat, lon, lon_start + 7));
                     }
                 }
             }

@@ -57,3 +57,11 @@ ringbuf = "0.3"
 [[bin]]
 name = "pocket-modem"
 path = "src/main.rs"
+
+[lib]
+name = "pocket_modem_aprs"
+path = "src/aprs.rs"
+
+[[test]]
+name = "aprs_parser_tests"
+path = "tests/aprs_parser_tests.rs"
