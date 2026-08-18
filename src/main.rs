@@ -129,6 +129,15 @@ fn show_aprs_notification(body: &str, _from: &str) -> Result<(), String> {
 /// Map margins for easier carousel swiping (in pixels)
 const MAP_MARGIN: i32 = 8;
 
+/// Escape special characters for Pango markup
+fn escape_markup(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+     .replace("'", "&apos;")
+}
+
 fn bearing_to_compass(bearing: f64) -> String {
     let arrow = match (bearing.round() as i32) % 360 {
         0..=22 | 338..=360 => "↑",
@@ -910,11 +919,11 @@ fn create_ui(
         header.set_halign(gtk::Align::Start);
         
         let from_label = gtk::Label::new(None);
-        from_label.set_markup(&format!("<span color='#FFB000'>{}</span>", msg.from_callsign));
+        from_label.set_markup(&format!("<span color='#FFB000'>{}</span>", escape_markup(&msg.from_callsign)));
         from_label.add_css_class("aprs-callsign");
         
         let to_label = gtk::Label::new(None);
-        to_label.set_markup(&format!("→ <span color='#FFB000'>{}</span>", msg.to_callsign));
+        to_label.set_markup(&format!("→ <span color='#FFB000'>{}</span>", escape_markup(&msg.to_callsign)));
         to_label.add_css_class("aprs-to-callsign");
         
         let time_label = gtk::Label::new(None);
@@ -947,7 +956,7 @@ fn create_ui(
                         (dist_str, bearing_to_compass(bearing))
                     } else { ("??".to_string(), "--°".to_string()) };
                     
-                    let comment = if msg.comment.is_empty() { String::new() } else { format!(" - {}", msg.comment) };
+                    let comment = if msg.comment.is_empty() { String::new() } else { format!(" - {}", escape_markup(&msg.comment)) };
                     content.set_markup(&format!("<span color='#33D17A'>📍 {} {}</span>{}", dist_text, bearing_text, comment));
                 } else {
                     content.set_text(&msg.comment);
@@ -957,7 +966,7 @@ fn create_ui(
             aprs::APRSType::Message => {
                 let body = msg.msg_body.as_deref().unwrap_or("");
                 content.set_markup(&format!("<span color='#888888'>Message to {}:</span>\n{}", 
-                    msg.to_callsign_msg.as_deref().unwrap_or(&msg.to_callsign), body));
+                    msg.to_callsign_msg.as_deref().unwrap_or(&msg.to_callsign), escape_markup(body)));
                 content.add_css_class("aprs-message-body");
             }
             _ => {
