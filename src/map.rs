@@ -608,11 +608,7 @@ impl MapManager {
 
         let _surface = surface.clone();  // Keep alive
         drawing_area.set_draw_func(move |area, cr, width, height| {
-            // Draw a solid visible background first
-            cr.set_source_rgb(0.0, 1.0, 0.0);  // Green background
-            cr.paint().ok();
-            
-            // Draw the APRS icon on top
+            // Draw the APRS icon directly
             let scale_x = width as f64 / icon_width;
             let scale_y = height as f64 / icon_height;
             let scale = scale_x.min(scale_y);
@@ -624,12 +620,6 @@ impl MapManager {
             
             cr.set_source_surface(&_surface, offset_x, offset_y);
             let _ = cr.paint();
-            
-            // Draw border to see the icon bounds
-            cr.set_source_rgb(1.0, 1.0, 1.0);
-            cr.set_line_width(1.0);
-            cr.rectangle(0.5, 0.5, width as f64 - 1.0, height as f64 - 1.0);
-            cr.stroke().ok();
         });
         
         eprintln!("[map] DrawingArea created with draw callback for {}", 
