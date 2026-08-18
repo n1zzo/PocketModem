@@ -7,7 +7,6 @@
 //! - MarkerLayer for APRS station markers
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use gtk::prelude::*;
 use libshumate::{
@@ -33,11 +32,10 @@ const DEFAULT_LAT: f64 = 46.8;
 const DEFAULT_LON: f64 = 8.2;
 
 // ============================================================================
-// Map Style (Mapbox GL JSON style matching GNOME Maps)
+// Map Style (simplified Mapbox GL JSON style)
 // ============================================================================
 
 /// Generate a Mapbox GL JSON style for the vector tiles
-/// Based on GNOME Maps style generator
 fn generate_map_style(is_dark: bool) -> String {
     // GNOME Maps color scheme
     let bg_color = if is_dark { "#191a19" } else { "#deddda" };
@@ -45,21 +43,11 @@ fn generate_map_style(is_dark: bool) -> String {
     let water_color = if is_dark { "#0f2f5e" } else { "#99c1f1" };
     
     // Text colors
-    let text_primary = if is_dark { "#deddda" } else { "#3d3846" };
-    let text_secondary = if is_dark { "#c0bfbc" } else { "#5e5c64" };
+    let text_color = if is_dark { "#deddda" } else { "#3d3846" };
     let text_halo = if is_dark { "#191a19" } else { "#deddda" };
     
-    // Road colors from GNOME Maps defs.js
-    let road_motor = if is_dark { "#58422e" } else { "#e1c172" };
-    let road_trunk = if is_dark { "#493727" } else { "#e9cf75" };
-    let road_secondary = if is_dark { "#453324" } else { "#ebd68a" };
-    let road_tertiary = if is_dark { "#413f39" } else { "#d7d2bc" };
-    let road_service = if is_dark { "#2a2924" } else { "#c8c7b4" };
-    let road_path = if is_dark { "#25242a" } else { "#bebdc8" };
-    let rail_color = if is_dark { "#91747b" } else { "#c89299" };
-
-    // Note: glyphs URL is used by Mapbox GL but may not be needed for libshumate
-    // "glyphs": "https://tiles.maps.jwestman.net/fonts/{fontstack}/{range}.pbf",
+    // Road color
+    let road_color = if is_dark { "#493727" } else { "#e9cf75" };
 
     format!(r#"{{
   "version": 8,
@@ -92,207 +80,35 @@ fn generate_map_style(is_dark: bool) -> String {
       "source-layer": "water",
       "paint": {{"fill-color": "{}"}}
     }},
-    
-    // === Roads - path/pedestrian (lowest priority) ===
     {{
-      "id": "road-path",
+      "id": "roads",
       "type": "line",
       "source": "vector-tiles",
       "source-layer": "transportation",
-      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "path", "footway", "cycleway"]],
-      "paint": {{
-        "line-color": "{}",
-        "line-width": 0.75,
-        "line-opacity": 0.7
-      }}
-    }},
-    
-    // === Roads - service/track ===
-    {{
-      "id": "road-service",
-      "type": "line",
-      "source": "vector-tiles",
-      "source-layer": "transportation",
-      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "service", "track"]],
-      "paint": {{
-        "line-color": "{}",
-        "line-width": 1,
-        "line-opacity": 0.8
-      }}
-    }},
-    
-    // === Roads - tertiary/minor ===
-    {{
-      "id": "road-tertiary",
-      "type": "line",
-      "source": "vector-tiles",
-      "source-layer": "transportation",
-      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "tertiary", "minor"]],
-      "paint": {{
-        "line-color": "{}",
-        "line-width": 1.5,
-        "line-opacity": 0.9
-      }}
-    }},
-    
-    // === Roads - secondary ===
-    {{
-      "id": "road-secondary",
-      "type": "line",
-      "source": "vector-tiles",
-      "source-layer": "transportation",
-      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "secondary"]],
+      "filter": ["==", "$type", "LineString"],
       "paint": {{
         "line-color": "{}",
         "line-width": 2,
         "line-opacity": 0.9
       }}
     }},
-    
-    // === Roads - trunk/primary ===
     {{
-      "id": "road-trunk",
-      "type": "line",
-      "source": "vector-tiles",
-      "source-layer": "transportation",
-      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "trunk", "primary"]],
-      "paint": {{
-        "line-color": "{}",
-        "line-width": 2.5,
-        "line-opacity": 0.95
-      }}
-    }},
-    
-    // === Roads - motorway ===
-    {{
-      "id": "road-motorway",
-      "type": "line",
-      "source": "vector-tiles",
-      "source-layer": "transportation",
-      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "motorway"]],
-      "paint": {{
-        "line-color": "{}",
-        "line-width": 3,
-        "line-opacity": 1
-      }}
-    }},
-    
-    // === Rail ===
-    {{
-      "id": "rail",
-      "type": "line",
-      "source": "vector-tiles",
-      "source-layer": "transportation",
-      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "rail"]],
-      "paint": {{
-        "line-color": "{}",
-        "line-width": 1,
-        "line-opacity": 0.7
-      }}
-    }},
-    
-    // === Place labels - country (largest, zoom 0-6) ===
-    {{
-      "id": "place-country",
+      "id": "places",
       "type": "symbol",
       "source": "vector-tiles",
       "source-layer": "place",
-      "filter": ["in", "class", "country"],
       "layout": {{
         "text-field": "{{name:latin}}",
-        "text-size": [
-          "interpolate", ["linear"], ["zoom"],
-          1, 14,
-          4, 18,
-          6, 24
-        ],
-        "text-transform": "uppercase"
+        "text-size": 12
       }},
       "paint": {{
         "text-color": "{}",
         "text-halo-color": "{}",
         "text-halo-width": 1.5
-      }}
-    }},
-    
-    // === Place labels - city (medium, zoom 4-12) ===
-    {{
-      "id": "place-city",
-      "type": "symbol",
-      "source": "vector-tiles",
-      "source-layer": "place",
-      "filter": ["in", "class", "city"],
-      "layout": {{
-        "text-field": "{{name:latin}}",
-        "text-size": [
-          "interpolate", ["linear"], ["zoom"],
-          4, 10,
-          6, 16,
-          12, 22
-        ]
-      }},
-      "paint": {{
-        "text-color": "{}",
-        "text-halo-color": "{}",
-        "text-halo-width": 1.5
-      }}
-    }},
-    
-    // === Place labels - town (smaller, zoom 9-13) ===
-    {{
-      "id": "place-town",
-      "type": "symbol",
-      "source": "vector-tiles",
-      "source-layer": "place",
-      "filter": ["in", "class", "town", "village"],
-      "layout": {{
-        "text-field": "{{name:latin}}",
-        "text-size": [
-          "interpolate", ["linear"], ["zoom"],
-          9, 10,
-          12, 16
-        ]
-      }},
-      "paint": {{
-        "text-color": "{}",
-        "text-halo-color": "{}",
-        "text-halo-width": 1
-      }}
-    }},
-    
-    // === Place labels - suburb (small, zoom 12+) ===
-    {{
-      "id": "place-suburb",
-      "type": "symbol",
-      "source": "vector-tiles",
-      "source-layer": "place",
-      "filter": ["in", "class", "neighborhood", "suburb", "quarter", "hamlet"],
-      "layout": {{
-        "text-field": "{{name:latin}}",
-        "text-size": [
-          "interpolate", ["linear"], ["zoom"],
-          12, 9,
-          15, 14
-        ],
-        "text-transform": "uppercase"
-      }},
-      "paint": {{
-        "text-color": "{}",
-        "text-halo-color": "{}",
-        "text-halo-width": 1
       }}
     }}
   ]
-}}"#, 
-      if is_dark { "Dark" } else { "Light" }, 
-      GNOME_TILE_URL, 
-      bg_color, land_color, water_color,
-      road_path, road_service, road_tertiary, road_secondary, road_trunk, road_motor, rail_color,
-      text_primary, text_halo,
-      text_primary, text_halo,
-      text_primary, text_halo,
-      text_secondary, text_halo
-    )
+}}"#, if is_dark { "Dark" } else { "Light" }, GNOME_TILE_URL, bg_color, land_color, water_color, road_color, text_color, text_halo)
 }
 
 // ============================================================================
@@ -363,17 +179,10 @@ impl MapManager {
         viewport.set_max_zoom_level(18);
         viewport.set_min_zoom_level(2);
         
-        // Set default position using builder pattern
-        let vp = Viewport::builder()
-            .zoom_level(DEFAULT_ZOOM)
-            .latitude(DEFAULT_LAT)
-            .longitude(DEFAULT_LON)
-            .build();
-        // Note: Viewport is already created by Map::new(), so we use the setters
+        // Set default position
         viewport.set_zoom_level(DEFAULT_ZOOM);
         
         eprintln!("[map] Created libshumate Map with VectorRenderer");
-        eprintln!("[map] Tile source: {}", GNOME_TILE_URL);
 
         // Create marker layer
         let marker_layer = MarkerLayer::new(&viewport);
@@ -394,7 +203,6 @@ impl MapManager {
     pub fn initialize(&mut self, dark_mode: bool) {
         // Check if already initialized
         if self.map_layer.is_some() {
-            // Just update the style if theme changed
             self.update_style(dark_mode);
             return;
         }
@@ -408,11 +216,8 @@ impl MapManager {
                 eprintln!("[map] VectorRenderer created successfully");
                 
                 // Create tile downloader
-                let downloader = TileDownloader::new(GNOME_TILE_URL);
+                let _downloader = TileDownloader::new(GNOME_TILE_URL);
                 eprintln!("[map] TileDownloader created");
-                
-                // Connect renderer to downloader
-                // Note: VectorRenderer handles the data source internally via style
                 
                 // Create map layer to display the tiles
                 let map_layer = MapLayer::new(&renderer, &self.viewport);
@@ -445,9 +250,9 @@ impl MapManager {
         if let Some(renderer) = &self.vector_renderer {
             let style_json = generate_map_style(dark_mode);
             eprintln!("[map] Updating style to {} mode", if dark_mode { "dark" } else { "light" });
-            // VectorRenderer style is set at creation; for dynamic updates,
-            // we would need to recreate the renderer (simplified for now)
-            let _ = renderer; // suppress unused warning
+            // Note: VectorRenderer style is set at creation; for dynamic updates,
+            // we would need to recreate the renderer
+            let _ = renderer;
             let _ = style_json;
         }
     }
@@ -554,18 +359,16 @@ fn get_aprs_symbol(msg: &APRSMessage) -> char {
 }
 
 // ============================================================================
-// Backward Compatibility (for current main.rs)
+// Backward Compatibility
 // ============================================================================
 
 impl MapManager {
-    /// Legacy method for current main.rs compatibility
+    /// Legacy method
     pub fn load_aprs_symbols(&mut self, _path: &std::path::Path) -> Result<(), String> {
-        // APRS symbol spritesheets not used with libshumate vector renderer
-        // Symbols are rendered via the vector tile style
         Ok(())
     }
 
-    /// Legacy method - returns map state
+    /// Legacy method
     pub fn get_state(&self) -> MapState {
         MapState {
             user_lat: self.user_lat,
@@ -578,24 +381,20 @@ impl MapManager {
         }
     }
 
-    /// Legacy method - no-op for libshumate
-    pub fn load_visible_tiles(&self, _start_x: i32, _start_y: i32, _tiles_x: i32, _tiles_y: i32, _zoom: u32) {
-        // Tiles are loaded automatically by libshumate
+    /// Legacy method
+    pub fn load_visible_tiles(&self, _start_x: i32, _start_y: i32, _tiles_x: i32, _tiles_y: i32, _zoom: u32) {}
+
+    /// Legacy method
+    pub fn request_redraw(&mut self) {}
+
+    /// Legacy method
+    pub fn get_tile_cache(&self) -> std::sync::Arc<std::sync::Mutex<HashMap<crate::map::TileId, std::sync::Arc<image::RgbaImage>>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()))
     }
 
     /// Legacy method
-    pub fn request_redraw(&mut self) {
-        // Redraw is handled automatically by libshumate
-    }
-
-    /// Legacy method
-    pub fn get_tile_cache(&self) -> Arc<Mutex<HashMap<crate::map::TileId, Arc<image::RgbaImage>>>> {
-        Arc::new(Mutex::new(HashMap::new()))
-    }
-
-    /// Legacy method
-    pub fn get_aprs_symbols(&self) -> Arc<Mutex<Option<image::RgbaImage>>> {
-        Arc::new(Mutex::new(None))
+    pub fn get_aprs_symbols(&self) -> std::sync::Arc<std::sync::Mutex<Option<image::RgbaImage>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(None))
     }
 
     /// Legacy method
@@ -611,13 +410,12 @@ impl MapManager {
     /// Legacy method
     pub fn pan(&mut self, dx: f64, dy: f64) {
         if let Some((lat, lon)) = self.get_user_position() {
-            // Simple pan by adjusting center
             let zoom = self.viewport.zoom_level();
             let scale = 1.0 / (2_f64.powf(zoom) * 256.0);
             self.map.center_on(lat + dy * scale, lon + dx * scale);
         }
     }
-    
+
     /// Legacy method
     pub fn center_on_user(&mut self) {
         if let Some((lat, lon)) = self.get_user_position() {
@@ -693,7 +491,7 @@ pub struct MapWidget {
 impl MapWidget {
     pub fn new() -> Self {
         let map = Map::new();
-        map.set_size_request(330, 400);
+        map.set_size_request(360, -1);
         Self { widget: map }
     }
 }
