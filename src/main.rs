@@ -1023,10 +1023,19 @@ fn create_ui(
     
     map_page.append(&gps_header);
     
-    // Map placeholder
-    let map_placeholder = gtk::Label::new(Some("Map: TBD"));
-    map_placeholder.set_margin_top(20);
-    map_page.append(&map_placeholder);
+    // Create map widget - share tile cache with map_manager
+    let map_widget = Arc::new(Mutex::new(map::MapWidget::new()));
+    // Copy tile cache reference to MapWidget
+    {
+        let mm = map_manager.lock().unwrap();
+        let mw = map_widget.lock().unwrap();
+        // Note: MapWidget creates its own cache, we'll update draw to use MapManager's cache
+    }
+    let map_drawing_area = {
+        let mw = map_widget.lock().unwrap();
+        mw.widget.clone()
+    };
+    map_page.append(&map_drawing_area);
     
     // Map container
     let map_clamp = adw::Clamp::new();
@@ -1338,7 +1347,22 @@ fn create_ui(
                 for i in last_displayed..total_count {
                     if let Some(msg) = msgs.get(i) {
                         add_aprs_message_to_list(msg, &aprs_list_box_clone, &aprs_empty_label_clone, my_lat, my_lon);
-                        if let Ok(mut map) = map_manager_clone.lock() { map.update_station(msg); }
+                        if let Ok(mut map) = map_manager_clone.lock() {
+                            // Extract symbol from comment if available
+                            let symbol = if !msg.comment.is_empty() {
+                                msg.comment.chars().next().unwrap_or('?')
+                            } else {
+                                '?'
+                            };
+                            map.update_station(
+                                &msg.from_callsign,
+                                msg.position_lat,
+                                msg.position_lon,
+                                symbol,
+                                &msg.comment,
+                                msg.timestamp as u32,
+                            );
+                        }
                         new_last = i + 1;
                     }
                 }
@@ -1357,7 +1381,6 @@ fn create_ui(
                     coords_label_clone.set_text(&format!("Lat: {:.6}° Lon: {:.6}°", lat, lon));
                     if let Ok(mut map) = map_manager_clone.lock() {
                         map.set_user_position(lat, lon);
-                        map.center_on_user();
                     }
                 } else {
                     locator_label_clone.set_markup("<span color='#FFB000'>MAIDENHEAD: --- (searching)</span>");
@@ -1372,9 +1395,49 @@ fn create_ui(
             }
         }
         
-        // Check map redraw
-        if let Ok(map) = map_manager_clone.lock() {
-            if map.needs_redraw() { map.request_redraw(); }
+        // Update map drawing
+        // Always redraw map to show loading tiles
+        {
+            let map_manager_for_draw = map_manager_clone.clone();
+            let map_widget_ref = Arc::clone(&map_widget);
+            let drawing_area = {
+                let mw = map_widget_ref.lock().unwrap();
+                mw.widget.clone()
+            };
+            
+            // Calculate visible tile range and start loading
+            if let Ok(mut map) = map_manager_for_draw.lock() {
+                let map_state = map.get_state();
+                let tile_size = 256.0;
+                let zoom = map_state.zoom as u32;
+                let width = 330.0;
+                let height = 400.0;
+                
+                // Use GPS position if available, otherwise use default (46.0, 8.0 - Switzerland)
+                let (center_lat, center_lon) = map_state.get_user_position().unwrap_or((46.0, 8.0));
+                let (cx, cy) = map::lat_lon_to_tile(center_lat, center_lon, zoom);
+                let tiles_x = (width as f64 / tile_size).ceil() as i32 + 2;
+                let tiles_y = (height as f64 / tile_size).ceil() as i32 + 2;
+                let start_x = (cx - (tiles_x as f64) / 2.0).floor() as i32;
+                let start_y = (cy - (tiles_y as f64) / 2.0).floor() as i32;
+                
+                // Start background tile loading
+                if map.needs_redraw() {
+                    map.load_visible_tiles(start_x, start_y, tiles_x, tiles_y, zoom);
+                    map.request_redraw();
+                }
+            }
+            
+            // Set draw callback and queue draw
+            let map_manager_for_callback = Arc::clone(&map_manager_for_draw);
+            let map_widget_for_callback = Arc::clone(&map_widget_ref);
+            drawing_area.set_draw_func(move |_, cr, width, height| {
+                let map_state = map_manager_for_callback.lock().unwrap().get_state();
+                let mw = map_widget_for_callback.lock().unwrap();
+                let cache = map_manager_for_callback.lock().unwrap().get_tile_cache();
+                mw.draw(&cr, width, height, &map_state, &cache);
+            });
+            drawing_area.queue_draw();
         }
         
         // Status update tick counter
