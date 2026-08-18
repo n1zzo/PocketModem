@@ -79,12 +79,25 @@ impl MapManager {
         let tile_cache = Arc::new(Mutex::new(HashMap::new()));
         let needs_redraw = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Create DrawingArea for 2D rendering (340px wide to match UI)
+        // Create DrawingArea for 2D rendering
         let drawing_area = DrawingArea::new();
         drawing_area.set_size_request(340, 580);
         drawing_area.set_hexpand(false);
         drawing_area.set_vexpand(false);
         drawing_area.add_css_class("map-area");
+        
+        // Force size via CSS min-width
+        let css_provider = gtk::CssProvider::new();
+        css_provider.load_from_data(".map-area { min-width: 340px; max-width: 340px; }");
+        drawing_area.style_context().add_provider(&css_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        
+        // Wrap in a constrained Box
+        let wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        wrapper.set_size_request(340, 620);
+        wrapper.set_hexpand(false);
+        wrapper.set_vexpand(false);
+        wrapper.set_halign(gtk::Align::Center);
+        wrapper.append(&drawing_area);
 
         eprintln!("[map] MapManager created with simple tile rendering");
 
