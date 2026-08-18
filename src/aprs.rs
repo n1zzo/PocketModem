@@ -613,38 +613,6 @@ pub fn ssid(callsign: &str) -> i32 {
     }
 }
 
-/// APRS debug/diagnostic functions
-#[allow(dead_code)]
-pub mod tests {
-    use super::*;
-    
-    /// Test packet for IR2BZ-1: 4535.01N/00957.87E
-    /// AX.25 frame from real packet
-    pub fn test_ir2bz1() {
-        // Real packet bytes (extracted from hex dump)
-        let frame: Vec<u8> = vec![
-            0x82, 0xA0, 0x9A, 0x92, 0x60, 0x62, 0x60,  // Dest: APMI01
-            0x92, 0xA4, 0x64, 0x84, 0xB4, 0x40, 0x61,  // Src: IR2BZ-1
-            0x03, 0xF0,  // Control + PID
-            0x21, 0x34, 0x35, 0x33, 0x35, 0x2E, 0x30, 0x31, 0x4E, 0x2F, 0x30, 0x30, 0x39, 0x35, 0x37, 0x2E, 0x38, 0x37, 0x45,  // Position: 4535.01N/00957.87E
-            0x49, 0x52, 0x4E, 0x47, 0x30, 0x30, 0x31, 0x36,  // IR2NG0016 (comment/symbol?)
-            0x69, 0x47, 0x61, 0x74, 0x65, 0x26, 0x57, 0x31, 0x2D, 0x4C, 0x52, 0x44, 0x32, 0x36, 0x64, 0x6F, 0x20, 0x4F, 0x52, 0x46, 0x41, 0x4E, 0x4F, 0x20, 0x43, 0x52, 0x4C, 0x4E, 0x65, 0x74, 0x2E, 0x30, 0x31, 0x30
-        ];
-        
-        eprintln!("[aprs_test] Frame length: {}", frame.len());
-        
-        if let Some(msg) = parse_ax25_frame(&frame) {
-            eprintln!("[aprs_test] Parsed: from={}, to={}, lat={}, lon={}", 
-                msg.from_callsign, msg.to_callsign, msg.position_lat, msg.position_lon);
-            eprintln!("[aprs_test] Symbol table: {:?}, code: {:?}", 
-                msg.symbol_table_id, msg.symbol_code);
-            eprintln!("[aprs_test] Comment: {}", msg.comment);
-        } else {
-            eprintln!("[aprs_test] Failed to parse!");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
