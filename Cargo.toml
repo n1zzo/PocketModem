@@ -18,9 +18,16 @@ gtk = { version = "0.11", package = "gtk4" }
 adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
 cairo-rs = "0.22"
 
-# Map display - HTTP tiles + image rendering
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Map display - walkers vector tiles
+walkers = "0.3"
+wgpu = "0.19"
 image = "0.25"
+
+# Egui for immediate-mode map rendering
+egui = "0.29"
+
+# Egui-GTK4 bridge for OpenGL integration
+eGui-gtk4 = { version = "0.9", package = "egui-gtk4" }
 
 # Desktop notifications
 libnotify = "1.0"

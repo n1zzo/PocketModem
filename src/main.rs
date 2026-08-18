@@ -998,15 +998,8 @@ fn create_ui(
     // =========================================================================
     // MAP PAGE
     // =========================================================================
-    eprintln!("[main] Creating MapManager...");
-    let mut manager = MapManager::new();
-    manager.initialize();
-    eprintln!("[main] MapManager created");
+    let map_manager = Arc::new(Mutex::new(MapManager::new()));
     
-    let map_view = manager.view_cloned();
-    let map_manager = Arc::new(Mutex::new(manager));
-    
-    // Track map_page allocation
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     map_page.set_size_request(330, 700);
     map_page.set_hexpand(false);
@@ -1016,39 +1009,32 @@ fn create_ui(
     let gps_header = gtk::Box::new(gtk::Orientation::Vertical, 4);
     gps_header.set_halign(gtk::Align::Center);
     gps_header.set_hexpand(false);
-    gps_header.set_size_request(330, -1);
     
-    // GPS labels - constrained in vertical layout
+    // GPS labels
     let locator_label = gtk::Label::new(Some("--"));
     locator_label.set_markup(&format!("<span color='#FFB000'>MAIDENHEAD: --</span>"));
     locator_label.add_css_class("locator-display");
-    locator_label.set_hexpand(false);
-    locator_label.set_size_request(330, -1);
     
     let coords_label = gtk::Label::new(Some("Lat: -- Lon: --"));
     coords_label.add_css_class("coords-display");
-    coords_label.set_hexpand(false);
-    coords_label.set_size_request(330, -1);
-    
-    gps_header.append(&locator_label);
-    gps_header.append(&coords_label);
     
     gps_header.append(&locator_label);
     gps_header.append(&coords_label);
     
     map_page.append(&gps_header);
-    map_page.append(&map_view);
     
-    // Map container - use AdwClamp to limit width to 340px
+    // Map placeholder
+    let map_placeholder = gtk::Label::new(Some("Map: TBD"));
+    map_placeholder.set_margin_top(20);
+    map_page.append(&map_placeholder);
+    
+    // Map container
     let map_clamp = adw::Clamp::new();
     map_clamp.set_size_request(330, 700);
     map_clamp.set_hexpand(false);
     map_clamp.set_vexpand(false);
     map_clamp.set_maximum_size(340);
     map_clamp.set_tightening_threshold(340);
-    map_page.set_size_request(330, 700);
-    map_page.set_hexpand(false);
-    map_page.set_vexpand(false);
     map_clamp.set_child(Some(&map_page));
     
     // =========================================================================
