@@ -66,7 +66,65 @@ impl APRSMessage {
 }
 
 /// Parse an AX.25 UI frame into an APRS message
+/// Parse an AX.25 UI frame into an APRS message
 pub fn parse_ax25_frame(frame: &[u8]) -> Option<APRSMessage> {
+    if frame.len() < 16 { return None; }
+    
+    // Find ctrl (0x03) and pid (0xF0) by scanning backwards
+    // They should be the last two bytes before the payload
+    let mut ctrl_idx = None;
+    let mut pid_idx = None;
+    for i in (0..frame.len() - 1).rev() {
+        if frame[i] == 0x03 && frame[i + 1] == 0xF0 {
+            ctrl_idx = Some(i);
+            pid_idx = Some(i + 1);
+            break;
+        }
+    }
+    
+    let (ctrl_idx, pid_idx) = match (ctrl_idx, pid_idx) {
+        (Some(c), Some(p)) => (c, p),
+        _ => return None,
+    };
+    
+    // Parse destination (first 7 bytes)
+    let (dst_call, _) = parse_callsign(&frame[0..7])?;
+    
+    // Source is typically at offset 7 (right after dest)
+    let (src_call, _) = parse_callsign(&frame[7..14])?;
+    
+    // Payload starts after PID
+    let payload_start = pid_idx + 1;
+    let payload = &frame[payload_start..];
+    
+    // Create base message
+    let mut msg = APRSMessage::new();
+    msg.from_callsign = src_call;
+    msg.to_callsign = dst_call;
+    
+    // Decode APRS payload based on DTI
+    if payload.is_empty() { return None; }
+    
+    let dti = payload[0] as char;
+    match dti {
+        '=' | '!' | '}' => decode_position(&mut msg, payload),    // Position (various formats)
+        '/' | '@' => decode_position(&mut msg, payload),          // Position with timestamp
+        ')' => decode_object(&mut msg, payload),                  // Object
+        ':' => decode_message(&mut msg, payload),                 // Message
+        '$' => decode_nmea(&mut msg, payload),                    // NMEA
+        '>' => decode_status(&mut msg, payload),                  // Status
+        '#' | '*' | '_' => decode_weather(&mut msg, payload),     // Weather
+        _ => {
+            msg.msg_type = APRSType::Unknown;
+            msg.comment = String::from_utf8_lossy(payload).trim_end().to_string();
+        }
+    }
+    
+    Some(msg)
+}
+
+/// Parse an AX.25 UI frame into an APRS message
+pub fn parse_ax25_frame_debug(frame: &[u8]) -> (Option<APRSMessage>, Option<char>, Option<char>) {
     if frame.len() < 16 { return None; }
     
     // Find ctrl (0x03) and pid (0xF0) by scanning backwards
@@ -247,18 +305,25 @@ fn decode_position(msg: &mut APRSMessage, payload: &[u8]) {
                 let sym2 = remainder[1] as char;
                 
                 // Valid APRS symbol: symbol table ID is /, \, #, or overlay digit
-                // / = primary table, \ = alternate table, # = overlay, 0-9 = overlay on table
                 let is_valid_table_id = matches!(sym1, '/' | '\\' | '#' | '0'..='9');
                 if is_valid_table_id && sym2.is_ascii_graphic() {
                     msg.symbol_table_id = Some(sym1);
                     msg.symbol_code = Some(sym2);
                     msg.comment = String::from_utf8_lossy(&remainder[2..]).trim_end().to_string();
                 } else {
+                    // No explicit symbol in remainder - use default (primary table, no code)
+                    // This means the remainder is all comment
                     msg.comment = String::from_utf8_lossy(remainder).trim_end().to_string();
                 }
             } else if !remainder.is_empty() {
                 msg.comment = String::from_utf8_lossy(remainder).trim_end().to_string();
             }
+        }
+        
+        // If no symbol was found, use default primary table
+        if msg.symbol_table_id.is_none() {
+            msg.symbol_table_id = Some('/');
+            msg.symbol_code = Some('?');
         }
     } else {
         // Couldn't parse position, treat rest as comment
@@ -287,8 +352,9 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
         }
     }
     
-    // Format A: DDMM.MM + N/S + / + DDDMM.MM + E/W (18 chars with / separator)
+    // Format A: DDMM.MM + N/S + / + DDDMM.MM + E/W
     // Example: 4534.19N/00927.35E
+    // The E/W at end IS the symbol code, '/' is just a separator
     if offset + 18 <= data.len() {
         let lat_str = String::from_utf8_lossy(&data[offset..offset + 7]);
         let ns = data[offset + 7] as char;
@@ -303,6 +369,7 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
                         let mut lon = lon_deg + lon_min / 60.0;
                         if ns == 'S' || ns == 's' { lat = -lat; }
                         if ew == 'W' || ew == 'w' { lon = -lon; }
+                        // E/W at offset+17 is the SYMBOL CODE
                         return Some((lat, lon, offset + 18));
                     }
                 }
@@ -325,6 +392,8 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
                         let mut lon = lon_deg + lon_min / 60.0;
                         if ns == 'S' || ns == 's' { lat = -lat; }
                         if ew == 'W' || ew == 'w' { lon = -lon; }
+                        // In Format B: lat(7) + N/S(1) + lon(8) + E/W(1) = 17 chars
+                        // E/W at offset+16 is the SYMBOL CODE
                         return Some((lat, lon, offset + 17));
                     }
                 }
@@ -349,6 +418,8 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
                         let mut lon = lon_deg + lon_min / 60.0;
                         if ns == 'S' || ns == 's' { lat = -lat; }
                         if ew == 'W' || ew == 'w' { lon = -lon; }
+                        // In Format C: lat(6) + N/S(1) + '/' + lon(7) + E/W(1) = 16 chars
+                        // E/W at lon_start+7 is the SYMBOL CODE
                         return Some((lat, lon, lon_start + 8));
                     }
                 }
@@ -539,6 +610,38 @@ pub fn ssid(callsign: &str) -> i32 {
         callsign[idx + 1..].parse().unwrap_or(0)
     } else {
         0
+    }
+}
+
+/// APRS debug/diagnostic functions
+#[allow(dead_code)]
+pub mod tests {
+    use super::*;
+    
+    /// Test packet for IR2BZ-1: 4535.01N/00957.87E
+    /// AX.25 frame from real packet
+    pub fn test_ir2bz1() {
+        // Real packet bytes (extracted from hex dump)
+        let frame: Vec<u8> = vec![
+            0x82, 0xA0, 0x9A, 0x92, 0x60, 0x62, 0x60,  // Dest: APMI01
+            0x92, 0xA4, 0x64, 0x84, 0xB4, 0x40, 0x61,  // Src: IR2BZ-1
+            0x03, 0xF0,  // Control + PID
+            0x21, 0x34, 0x35, 0x33, 0x35, 0x2E, 0x30, 0x31, 0x4E, 0x2F, 0x30, 0x30, 0x39, 0x35, 0x37, 0x2E, 0x38, 0x37, 0x45,  // Position: 4535.01N/00957.87E
+            0x49, 0x52, 0x4E, 0x47, 0x30, 0x30, 0x31, 0x36,  // IR2NG0016 (comment/symbol?)
+            0x69, 0x47, 0x61, 0x74, 0x65, 0x26, 0x57, 0x31, 0x2D, 0x4C, 0x52, 0x44, 0x32, 0x36, 0x64, 0x6F, 0x20, 0x4F, 0x52, 0x46, 0x41, 0x4E, 0x4F, 0x20, 0x43, 0x52, 0x4C, 0x4E, 0x65, 0x74, 0x2E, 0x30, 0x31, 0x30
+        ];
+        
+        eprintln!("[aprs_test] Frame length: {}", frame.len());
+        
+        if let Some(msg) = parse_ax25_frame(&frame) {
+            eprintln!("[aprs_test] Parsed: from={}, to={}, lat={}, lon={}", 
+                msg.from_callsign, msg.to_callsign, msg.position_lat, msg.position_lon);
+            eprintln!("[aprs_test] Symbol table: {:?}, code: {:?}", 
+                msg.symbol_table_id, msg.symbol_code);
+            eprintln!("[aprs_test] Comment: {}", msg.comment);
+        } else {
+            eprintln!("[aprs_test] Failed to parse!");
+        }
     }
 }
 

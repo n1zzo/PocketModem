@@ -157,6 +157,9 @@ fn bearing_to_compass(bearing: f64) -> String {
 const APP_ID: &str = "org.pocketmodem.pocket-modem";
 
 fn main() {
+    // Test APRS parsing on startup
+    aprs::tests::test_ir2bz1();
+    
     let settings = SettingsManager::new();
     eprintln!("[pocket-modem] Settings loaded: freq={} kHz, squelch={}", 
               settings.frequency(), settings.squelch());
