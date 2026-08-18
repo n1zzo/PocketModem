@@ -413,8 +413,9 @@ impl MapWidget {
     pub fn draw(&self, cr: &Context, width: i32, height: i32, state: &MapState, 
                 tile_cache: &Arc<Mutex<HashMap<TileId, Arc<image::RgbaImage>>>>,
                 aprs_symbols: &Arc<Mutex<Option<image::RgbaImage>>>) {
-        let tile_size = 256.0;
-        let zoom = state.zoom as u32;
+        // Use zoom 10 for rendering
+        let zoom = 10u32;
+        let tile_size = 256.0;  // OSM tile size
         
         // Default center if no GPS
         let (center_lat, center_lon) = state.get_user_position().unwrap_or((46.0, 8.0));
@@ -432,15 +433,14 @@ impl MapWidget {
         let pan_x = state.pan_x;
         let pan_y = state.pan_y;
         
-        // Center offset (tiles)
-        let center_offset_x = cx.fract() - tiles_x as f64 / 2.0;
-        let center_offset_y = cy.fract() - tiles_y as f64 / 2.0;
-        
         // Draw background
-        cr.set_source_rgb(0.1, 0.1, 0.1);
+        cr.set_source_rgb(0.15, 0.15, 0.15);
         let _ = cr.paint();
         
         // Draw tiles from cache
+        // Screen position: center of map is (width/2, height/2)
+        // Tiles are centered on (cx, cy) which maps to center of screen
+        // Pixel offset from center = (tile_coord - center_tile_coord) * tile_size
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 let tile_x = start_x + tx;
@@ -454,50 +454,63 @@ impl MapWidget {
                 
                 let tile_id = TileId { x: tile_x as u32, y: tile_y as u32, z: zoom as u8 };
                 
-                // Calculate screen position
-                let screen_x = (tx as f64 - center_offset_x) * tile_size - pan_x;
-                let screen_y = (ty as f64 - center_offset_y) * tile_size - pan_y;
+                // Calculate pixel offset from tile to center, then add screen center
+                let dx = tile_x as f64 - cx;  // tile position relative to center
+                let dy = tile_y as f64 - cy;
+                let screen_x = width as f64 / 2.0 + dx * tile_size + pan_x;
+                let screen_y = height as f64 / 2.0 + dy * tile_size + pan_y;
                 
                 // Try to get tile from cache
-                if let Some(tile) = tile_cache.lock().unwrap().get(&tile_id) {
-                    Self::draw_tile_image(cr, tile, screen_x, screen_y, tile_size);
+                if let Some(tile) = tile_cache.lock().unwrap().get(&tile_id).cloned() {
+                    Self::draw_tile_image(cr, &tile, screen_x, screen_y, tile_size);
                 } else {
-                    // Draw placeholder
-                    cr.set_source_rgb(0.15, 0.15, 0.15);
+                    // Draw placeholder - gray with grid lines
+                    cr.set_source_rgb(0.2, 0.2, 0.2);
                     cr.rectangle(screen_x, screen_y, tile_size, tile_size);
                     let _ = cr.fill();
+                    cr.set_source_rgb(0.3, 0.3, 0.3);
+                    cr.move_to(screen_x + tile_size / 2.0, screen_y);
+                    cr.line_to(screen_x + tile_size / 2.0, screen_y + tile_size);
+                    cr.move_to(screen_x, screen_y + tile_size / 2.0);
+                    cr.line_to(screen_x + tile_size, screen_y + tile_size / 2.0);
+                    let _ = cr.stroke();
                 }
             }
         }
         
-        // Draw user position marker (house icon style)
+        // Draw user position marker (green dot with glow)
         if let Some((lat, lon)) = state.get_user_position() {
             let (ux, uy) = lat_lon_to_tile(lat, lon, zoom);
             
-            let tile_frac_x = (ux - cx) * tile_size + width as f64 / 2.0 + pan_x;
-            let tile_frac_y = (uy - cy) * tile_size + height as f64 / 2.0 + pan_y;
+            let dx = ux - cx;
+            let dy = uy - cy;
+            let user_x = width as f64 / 2.0 + dx * tile_size + pan_x;
+            let user_y = height as f64 / 2.0 + dy * tile_size + pan_y;
             
             // Draw glow
             cr.set_source_rgba(0.2, 0.82, 0.48, 0.3);
-            cr.arc(tile_frac_x, tile_frac_y, 16.0, 0.0, 2.0 * std::f64::consts::PI);
+            cr.arc(user_x, user_y, 16.0, 0.0, 2.0 * std::f64::consts::PI);
             let _ = cr.fill();
             
             cr.set_source_rgba(0.2, 0.82, 0.48, 0.6);
-            cr.arc(tile_frac_x, tile_frac_y, 10.0, 0.0, 2.0 * std::f64::consts::PI);
+            cr.arc(user_x, user_y, 10.0, 0.0, 2.0 * std::f64::consts::PI);
             let _ = cr.fill();
             
             cr.set_source_rgba(0.2, 0.82, 0.48, 1.0);
-            cr.arc(tile_frac_x, tile_frac_y, 5.0, 0.0, 2.0 * std::f64::consts::PI);
+            cr.arc(user_x, user_y, 5.0, 0.0, 2.0 * std::f64::consts::PI);
             let _ = cr.fill();
         }
         
         // Draw APRS station markers with official symbols
-        let symbol_size = 24.0; // APRS symbol size
+        let symbol_size = 20.0; // APRS symbol size
         for station in state.stations.values() {
-            let (sx, sy) = lat_lon_to_tile(station.lat, station.lon, zoom);
+            // Use zoom 10 for consistency with tiles
+            let (sx, sy) = lat_lon_to_tile(station.lat, station.lon, 10);
             
-            let tile_frac_x = (sx - cx) * tile_size + width as f64 / 2.0 + pan_x;
-            let tile_frac_y = (sy - cy) * tile_size + height as f64 / 2.0 + pan_y;
+            let dx = sx - cx;
+            let dy = sy - cy;
+            let tile_frac_x = width as f64 / 2.0 + dx * tile_size + pan_x;
+            let tile_frac_y = height as f64 / 2.0 + dy * tile_size + pan_y;
             
             // Skip if off screen
             if tile_frac_x < -symbol_size || tile_frac_x > width as f64 + symbol_size ||

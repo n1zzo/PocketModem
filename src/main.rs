@@ -1419,24 +1419,30 @@ fn create_ui(
             // Calculate visible tile range and start loading
             if let Ok(mut map) = map_manager_for_draw.lock() {
                 let map_state = map.get_state();
-                let tile_size = 256.0;
-                let zoom = map_state.zoom as u32;
                 let width = 330.0;
                 let height = 400.0;
+                
+                // Use zoom 10 for both fetching and rendering
+                let zoom = 10u32;
+                let tile_size = 256.0;  // Native tile size
                 
                 // Use GPS position if available, otherwise use default (46.0, 8.0 - Switzerland)
                 let (center_lat, center_lon) = map_state.get_user_position().unwrap_or((46.0, 8.0));
                 let (cx, cy) = map::lat_lon_to_tile(center_lat, center_lon, zoom);
-                let tiles_x = (width as f64 / tile_size).ceil() as i32 + 2;
-                let tiles_y = (height as f64 / tile_size).ceil() as i32 + 2;
+                
+                // Calculate how many tiles fit on screen
+                let tiles_x = ((width as f64 / tile_size).ceil() as i32).max(2);
+                let tiles_y = ((height as f64 / tile_size).ceil() as i32).max(2);
+                
+                // Calculate tile range centered on position
                 let start_x = (cx - (tiles_x as f64) / 2.0).floor() as i32;
                 let start_y = (cy - (tiles_y as f64) / 2.0).floor() as i32;
                 
+                eprintln!("[main] center=({:.2}, {:.2}), tiles=({}x{})", cx, cy, tiles_x, tiles_y);
+                
                 // Start background tile loading
-                if map.needs_redraw() {
-                    map.load_visible_tiles(start_x, start_y, tiles_x, tiles_y, zoom);
-                    map.request_redraw();
-                }
+                map.load_visible_tiles(start_x, start_y, tiles_x, tiles_y, zoom);
+                map.request_redraw();
             }
             
             // Set draw callback and queue draw
