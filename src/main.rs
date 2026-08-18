@@ -1019,23 +1019,6 @@ fn create_ui(
     map_page.set_vexpand(true);
     map_page.set_halign(gtk::Align::Center);
     
-    let gps_header = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    gps_header.set_halign(gtk::Align::Center);
-    gps_header.set_hexpand(false);
-    
-    // GPS labels
-    let locator_label = gtk::Label::new(Some("--"));
-    locator_label.set_markup(&format!("<span color='#FFB000'>MAIDENHEAD: --</span>"));
-    locator_label.add_css_class("locator-display");
-    
-    let coords_label = gtk::Label::new(Some("Lat: -- Lon: --"));
-    coords_label.add_css_class("coords-display");
-    
-    gps_header.append(&locator_label);
-    gps_header.append(&coords_label);
-    
-    map_page.append(&gps_header);
-    
     // Get the libshumate Map widget
     let map_view = {
         let mm = map_manager.lock().unwrap();
@@ -1237,8 +1220,6 @@ fn create_ui(
     let aprs_list_box_clone = aprs_list_box.clone();
     let aprs_last_displayed_clone = Arc::clone(&aprs_last_displayed);
     
-    let locator_label_clone = locator_label.clone();
-    let coords_label_clone = coords_label.clone();
     let map_manager_clone = Arc::clone(&map_manager);
     let window_clone = window.clone();
     let map_page_clone = map_page.clone();
@@ -1376,22 +1357,26 @@ fn create_ui(
             
             if gps_data.has_fix {
                 if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
-                    let locator = maidenhead_locator(lat, lon);
-                    locator_label_clone.set_markup(&format!("<span color='#FFB000'>MAIDENHEAD: {}</span>", locator));
-                    coords_label_clone.set_text(&format!("Lat: {:.6}° Lon: {:.6}°", lat, lon));
-                    if let Ok(mut map) = map_manager_clone.lock() {
-                        map.set_user_position(lat, lon);
+                    // Only update map when position changes significantly (more than ~1m)
+                    let current_pos = if let Ok(map) = map_manager_clone.lock() {
+                        map.get_user_position()
+                    } else { None };
+                    
+                    let should_update = match current_pos {
+                        Some((old_lat, old_lon)) => {
+                            let lat_diff = (lat - old_lat).abs();
+                            let lon_diff = (lon - old_lon).abs();
+                            lat_diff > 0.0001 || lon_diff > 0.0001  // ~10m threshold
+                        }
+                        None => true,  // First position
+                    };
+                    
+                    if should_update {
+                        if let Ok(mut map) = map_manager_clone.lock() {
+                            map.set_user_position(lat, lon);
+                        }
                     }
-                } else {
-                    locator_label_clone.set_markup("<span color='#FFB000'>MAIDENHEAD: --- (searching)</span>");
-                    coords_label_clone.set_text("Lat: -- Lon: -- (no fix)");
                 }
-            } else if gps_data.gps_enabled {
-                locator_label_clone.set_markup("<span color='#FFB000'>MAIDENHEAD: --- (searching)</span>");
-                coords_label_clone.set_text("Lat: -- Lon: -- (no fix)");
-            } else {
-                locator_label_clone.set_markup("<span color='#888888'>MAIDENHEAD: -- (GPS off)</span>");
-                coords_label_clone.set_text("Lat: -- Lon: --");
             }
         }
         

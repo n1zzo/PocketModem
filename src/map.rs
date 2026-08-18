@@ -99,13 +99,13 @@ fn generate_map_style(is_dark: bool) -> String {
       "source-layer": "place",
       "layout": {{
         "text-field": "{{name:latin}}",
-        "text-size": 11,
-        "text-color": "{}",
-        "text-halo-color": "{}",
-        "text-halo-width": 1.5
+        "text-size": 11
       }},
       "paint": {{
-        "text-opacity": 0.9
+        "text-color": "{}",
+        "text-halo-color": "{}",
+        "text-halo-width": 1.5,
+        "text-opacity": 0.95
       }}
     }}
   ]
@@ -276,6 +276,11 @@ impl MapManager {
 
     /// Set the user's GPS position
     pub fn set_user_position(&mut self, lat: f64, lon: f64) {
+        // Only update if position changed
+        if self.user_lat == Some(lat) && self.user_lon == Some(lon) {
+            return;
+        }
+        
         self.user_lat = Some(lat);
         self.user_lon = Some(lon);
         
