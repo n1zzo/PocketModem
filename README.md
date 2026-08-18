@@ -80,7 +80,8 @@ See `AGENTS.md` for detailed debug notes.
 - [x] Add MODEM, GPS and AUDIO details with bottom sheet
 - [x] Handle channel edit
 - [x] Implement APRS, add toast for new messages
-- [ ] Add APRS message log and map views using carousel
+- [x] Add APRS message log and map views using carousel
+- [ ] Code refactor: move utils function in dedicated file, remove UI sizing constraints, move UI code to dedicated file, deal with unsafes.
 - [ ] Use libadwaita feature to show unrecoverable errors
 - [ ] Add flatpack build target
 - [ ] Noise squelch option

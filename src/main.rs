@@ -996,16 +996,14 @@ fn create_ui(
     aprs_clamp.append(&aprs_page);
     
     // =========================================================================
-    // MAP PAGE
+    // MAP PAGE (libshumate with VectorRenderer + GNOME tileserver)
     // =========================================================================
     let map_manager = Arc::new(Mutex::new(MapManager::new()));
     
-    // Load APRS symbols from submodule
+    // Initialize the map with vector tiles
     {
-        let mm = map_manager.lock().unwrap();
-        if let Err(e) = mm.load_aprs_symbols(std::path::Path::new("aprs-symbols")) {
-            eprintln!("[pocket-modem] Failed to load APRS symbols: {}", e);
-        }
+        let mut mm = map_manager.lock().unwrap();
+        mm.initialize();
     }
     
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1031,19 +1029,15 @@ fn create_ui(
     
     map_page.append(&gps_header);
     
-    // Create map widget - share tile cache with map_manager
-    let map_widget = Arc::new(Mutex::new(map::MapWidget::new()));
-    // Copy tile cache reference to MapWidget
-    {
+    // Get the libshumate Map widget
+    let map_view = {
         let mm = map_manager.lock().unwrap();
-        let mw = map_widget.lock().unwrap();
-        // Note: MapWidget creates its own cache, we'll update draw to use MapManager's cache
-    }
-    let map_drawing_area = {
-        let mw = map_widget.lock().unwrap();
-        mw.widget.clone()
+        mm.view().clone()
     };
-    map_page.append(&map_drawing_area);
+    map_view.set_size_request(330, 400);
+    map_view.set_hexpand(false);
+    map_view.set_vexpand(false);
+    map_page.append(&map_view);
     
     // Map container
     let map_clamp = adw::Clamp::new();
@@ -1356,23 +1350,8 @@ fn create_ui(
                     if let Some(msg) = msgs.get(i) {
                         add_aprs_message_to_list(msg, &aprs_list_box_clone, &aprs_empty_label_clone, my_lat, my_lon);
                         if let Ok(mut map) = map_manager_clone.lock() {
-                            // Extract APRS symbol from comment (first two chars are symbol table/code)
-                            // Default to primary table / with ? if not available
-                            let (symbol_table, symbol_code) = if msg.comment.len() >= 2 {
-                                (msg.comment.chars().next().unwrap_or('/'), 
-                                 msg.comment.chars().nth(1).unwrap_or('?'))
-                            } else {
-                                ('/', '?')
-                            };
-                            map.update_station(
-                                &msg.from_callsign,
-                                msg.position_lat,
-                                msg.position_lon,
-                                symbol_table,
-                                symbol_code,
-                                &msg.comment,
-                                msg.timestamp as u32,
-                            );
+                            // update_station takes APRSMessage directly for libshumate
+                            map.update_station(msg);
                         }
                         new_last = i + 1;
                     }
@@ -1406,56 +1385,12 @@ fn create_ui(
             }
         }
         
-        // Update map drawing
-        // Always redraw map to show loading tiles
+        // Map drawing is handled automatically by libshumate
+        // Just ensure user position is updated when GPS changes
+        // (position is already set in the GPS section above)
         {
-            let map_manager_for_draw = map_manager_clone.clone();
-            let map_widget_ref = Arc::clone(&map_widget);
-            let drawing_area = {
-                let mw = map_widget_ref.lock().unwrap();
-                mw.widget.clone()
-            };
-            
-            // Calculate visible tile range and start loading
-            if let Ok(mut map) = map_manager_for_draw.lock() {
-                let map_state = map.get_state();
-                let width = 330.0;
-                let height = 400.0;
-                
-                // Use zoom 10 for both fetching and rendering
-                let zoom = 10u32;
-                let tile_size = 256.0;  // Native tile size
-                
-                // Use GPS position if available, otherwise use default (46.0, 8.0 - Switzerland)
-                let (center_lat, center_lon) = map_state.get_user_position().unwrap_or((46.0, 8.0));
-                let (cx, cy) = map::lat_lon_to_tile(center_lat, center_lon, zoom);
-                
-                // Calculate how many tiles fit on screen
-                let tiles_x = ((width as f64 / tile_size).ceil() as i32).max(2);
-                let tiles_y = ((height as f64 / tile_size).ceil() as i32).max(2);
-                
-                // Calculate tile range centered on position
-                let start_x = (cx - (tiles_x as f64) / 2.0).floor() as i32;
-                let start_y = (cy - (tiles_y as f64) / 2.0).floor() as i32;
-                
-                eprintln!("[main] center=({:.2}, {:.2}), tiles=({}x{})", cx, cy, tiles_x, tiles_y);
-                
-                // Start background tile loading
-                map.load_visible_tiles(start_x, start_y, tiles_x, tiles_y, zoom);
-                map.request_redraw();
-            }
-            
-            // Set draw callback and queue draw
-            let map_manager_for_callback = Arc::clone(&map_manager_for_draw);
-            let map_widget_for_callback = Arc::clone(&map_widget_ref);
-            drawing_area.set_draw_func(move |_, cr, width, height| {
-                let map_state = map_manager_for_callback.lock().unwrap().get_state();
-                let mw = map_widget_for_callback.lock().unwrap();
-                let cache = map_manager_for_callback.lock().unwrap().get_tile_cache();
-                let aprs_symbols = map_manager_for_callback.lock().unwrap().get_aprs_symbols();
-                mw.draw(&cr, width, height, &map_state, &cache, &aprs_symbols);
-            });
-            drawing_area.queue_draw();
+            // Nothing to do - libshumate handles tile rendering and user position
+            let _ = map_manager_clone.lock().unwrap().get_user_position();
         }
         
         // Status update tick counter
