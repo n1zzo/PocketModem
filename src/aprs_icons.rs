@@ -38,6 +38,8 @@ impl APRSIconRenderer {
         let paths = [
             "symbols/aprs-symbols/png",
             "/usr/share/aprs-symbols",
+            "./symbols/aprs-symbols/png",
+            "../symbols/aprs-symbols/png",
         ];
         
         // Try sizes from large to small for best quality
@@ -51,10 +53,15 @@ impl APRSIconRenderer {
                 let name = format!("aprs-symbols-{}{}", size, suffix);
                 for base in &paths {
                     let path = format!("{}/{}", base, name);
-                    if let Ok(surf) = Self::load_png(&path) {
-                        eprintln!("[aprs_icons] Loaded: {}", path);
-                        sprites[table] = Some(surf);
-                        break;
+                    match Self::load_png(&path) {
+                        Ok(surf) => {
+                            eprintln!("[aprs_icons] Loaded table {} from {}", table, path);
+                            sprites[table] = Some(surf);
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("[aprs_icons] Failed {}: {}", path, e);
+                        }
                     }
                 }
             }

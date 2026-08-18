@@ -123,63 +123,6 @@ pub fn parse_ax25_frame(frame: &[u8]) -> Option<APRSMessage> {
     Some(msg)
 }
 
-/// Parse an AX.25 UI frame into an APRS message
-pub fn parse_ax25_frame_debug(frame: &[u8]) -> (Option<APRSMessage>, Option<char>, Option<char>) {
-    if frame.len() < 16 { return None; }
-    
-    // Find ctrl (0x03) and pid (0xF0) by scanning backwards
-    // They should be the last two bytes before the payload
-    let mut ctrl_idx = None;
-    let mut pid_idx = None;
-    for i in (0..frame.len() - 1).rev() {
-        if frame[i] == 0x03 && frame[i + 1] == 0xF0 {
-            ctrl_idx = Some(i);
-            pid_idx = Some(i + 1);
-            break;
-        }
-    }
-    
-    let (ctrl_idx, pid_idx) = match (ctrl_idx, pid_idx) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return None,
-    };
-    
-    // Parse destination (first 7 bytes)
-    let (dst_call, _) = parse_callsign(&frame[0..7])?;
-    
-    // Source is typically at offset 7 (right after dest)
-    let (src_call, _) = parse_callsign(&frame[7..14])?;
-    
-    // Payload starts after PID
-    let payload_start = pid_idx + 1;
-    let payload = &frame[payload_start..];
-    
-    // Create base message
-    let mut msg = APRSMessage::new();
-    msg.from_callsign = src_call;
-    msg.to_callsign = dst_call;
-    
-    // Decode APRS payload based on DTI
-    if payload.is_empty() { return None; }
-    
-    let dti = payload[0] as char;
-    match dti {
-        '=' | '!' | '}' => decode_position(&mut msg, payload),    // Position (various formats)
-        '/' | '@' => decode_position(&mut msg, payload),          // Position with timestamp
-        ')' => decode_object(&mut msg, payload),                  // Object
-        ':' => decode_message(&mut msg, payload),                 // Message
-        '$' => decode_nmea(&mut msg, payload),                    // NMEA
-        '>' => decode_status(&mut msg, payload),                  // Status
-        '#' | '*' | '_' => decode_weather(&mut msg, payload),     // Weather
-        _ => {
-            msg.msg_type = APRSType::Unknown;
-            msg.comment = String::from_utf8_lossy(payload).trim_end().to_string();
-        }
-    }
-    
-    Some(msg)
-}
-
 /// Parse a 7-byte AX.25 callsign field
 fn parse_callsign(data: &[u8]) -> Option<(String, usize)> {
     if data.len() < 7 { return None; }
