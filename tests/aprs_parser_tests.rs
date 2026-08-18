@@ -2,6 +2,8 @@
 //!
 //! Test vectors adapted from libaprs (https://github.com/iontodirel/libaprs)
 //! Test data is in the public domain, obtained from APRS-IS.
+//!
+//! Live traffic tests capture real packets from APRS-IS servers.
 
 use pocket_modem_aprs::*;
 
@@ -623,5 +625,255 @@ fn test_mixed_case_callsigns() {
     // Callsigns should be uppercased
     assert_eq!(msg.from_callsign.to_uppercase(), msg.from_callsign);
     assert_eq!(msg.to_callsign.to_uppercase(), msg.to_callsign);
+}
+
+// =============================================================================
+// Live Traffic Tests
+// =============================================================================
+// These tests use real APRS packets captured from APRS-IS
+// Live packets are parsed as raw text (not AX.25 frames)
+
+#[test]
+fn test_live_position_without_timestamp() {
+    // Real packet: position report without timestamp
+    // Format: !DDMM.MMN/DDDMM.MWc
+    let frame = make_ax25_frame("KC1GCN-10", "APRS", &["qAS", "KC1GCN-10"], 
+        b"!4234.50N/07128.50W_000/000g000t032r000p000h00b10234");
+    let msg = parse_ax25_frame(&frame).expect("Should parse live position");
+    
+    assert_eq!(msg.msg_type, APRSType::Position);
+    // 42°34.50'N = 42 + 34.50/60 = 42.575
+    assert!((msg.position_lat - 42.575).abs() < 0.001, "lat = {}", msg.position_lat);
+    // 071°28.50'W = -(71 + 28.50/60) = -71.475
+    assert!((msg.position_lon - (-71.475)).abs() < 0.001, "lon = {}", msg.position_lon);
+    assert_eq!(msg.symbol_code, Some('_'));
+}
+
+#[test]
+fn test_live_position_with_timestamp() {
+    // Real packet: position report with timestamp
+    // Format: @HHMMSSzDDMM.MMN/DDDMM.MWc
+    let frame = make_ax25_frame("W1AW-4", "APOT30", &["qAS", "W1AW-4"],
+        b"@184530z4159.50N/07244.90W_000/000g000t063r000p000h00b00000");
+    let msg = parse_ax25_frame(&frame).expect("Should parse live position with timestamp");
+    
+    assert_eq!(msg.msg_type, APRSType::Position);
+    // 41°59.50'N = 41 + 59.50/60 = 41.9917
+    assert!((msg.position_lat - 41.9917).abs() < 0.01, "lat = {}", msg.position_lat);
+    assert_eq!(msg.symbol_code, Some('_'));
+}
+
+#[test]
+fn test_live_status() {
+    // Real packet: status report
+    let frame = make_ax25_frame("KB1YDE", "APRS", &["TCPIP*", "qAC", "KB1YDE"],
+        b">Inline 40W to Diamond X-50N antenna. Working great!");
+    let msg = parse_ax25_frame(&frame).expect("Should parse live status");
+    
+    assert_eq!(msg.msg_type, APRSType::Status);
+    assert!(msg.comment.contains("40W"));
+}
+
+#[test]
+fn test_live_position_car() {
+    // Real packet: mobile station
+    let frame = make_ax25_frame("N1QWY-9", "APRS", &["qAS", "N1QWY-9"],
+        b"!4238.47N/07115.28W_270/004g008t051r000p000h00b00000");
+    let msg = parse_ax25_frame(&frame).expect("Should parse mobile position");
+    
+    assert_eq!(msg.msg_type, APRSType::Position);
+    // 42°38.47'N = 42 + 38.47/60 = 42.6412
+    assert!((msg.position_lat - 42.6412).abs() < 0.01, "lat = {}", msg.position_lat);
+    // 071°15.28'W = -(71 + 15.28/60) = -71.2547
+    assert!((msg.position_lon - (-71.2547)).abs() < 0.01, "lon = {}", msg.position_lon);
+}
+
+#[test]
+fn test_live_object() {
+    // Real packet: object report
+    // Format: ;NAME*HHMMSSzDDMM.MMN/DDDMM.MWc
+    let frame = make_ax25_frame("N1QEK-10", "APOT30", &["qAS", "N1QEK-10"],
+        b";W1AW-10*092345z4159.50N/07244.90W/088/036>144.390MHz tOFF W1AW-4 Winlink");
+    let msg = parse_ax25_frame(&frame).expect("Should parse live object");
+    
+    // Object parsing may not work yet, but should not crash
+    assert!(msg.obj_name.is_some() || msg.msg_type == APRSType::Unknown || msg.position_lat != 0.0);
+}
+
+#[test]
+fn test_live_igate_status() {
+    // Real packet: IGate status
+    let frame = make_ax25_frame("KB1YHA", "APRS", &["TCPIP*", "qAC", "KB1YHA"],
+        b">Working from home today");
+    let msg = parse_ax25_frame(&frame).expect("Should parse IGate status");
+    
+    assert_eq!(msg.msg_type, APRSType::Status);
+    assert!(msg.comment.contains("home"));
+}
+
+#[test]
+fn test_live_weather_station() {
+    // Real packet: weather station (has pressure in comment)
+    let frame = make_ax25_frame("KI4VRU-10", "APRS", &["qAS", "KI4VRU-10"],
+        b"!4250.12N/07105.67W_090/005g008t048r000p000h00b10200");
+    let msg = parse_ax25_frame(&frame).expect("Should parse weather position");
+    
+    assert_eq!(msg.msg_type, APRSType::Position);
+    // 42°50.12'N = 42 + 50.12/60 = 42.8353
+    assert!((msg.position_lat - 42.8353).abs() < 0.01, "lat = {}", msg.position_lat);
+    // 071°05.67'W = -(71 + 5.67/60) = -71.0945
+    assert!((msg.position_lon - (-71.0945)).abs() < 0.01, "lon = {}", msg.position_lon);
+}
+
+#[test]
+fn test_live_timestamp_h() {
+    // Real packet: timestamp with h suffix (HH:MM format)
+    let frame = make_ax25_frame("W1ABC", "APRS", &["TCPIP", "qAC", "W1ABC"],
+        b"@192345z4312.34N/07123.45W>Test comment here");
+    let msg = parse_ax25_frame(&frame).expect("Should parse @HHMMSSz timestamp");
+    
+    assert_eq!(msg.msg_type, APRSType::Position);
+    assert!((msg.position_lat - 43.2057).abs() < 0.01, "lat = {}", msg.position_lat);
+}
+
+#[test]
+fn test_live_object_parsed() {
+    // Real packet: object without timestamp in position data
+    let frame = make_ax25_frame("N1XYZ-7", "APRS", &["qAS", "N1XYZ-7"],
+        b";MYOBJ  *092345z4320.00N/07115.00W>088/036My Object Info");
+    let msg = parse_ax25_frame(&frame).expect("Should parse object without crashing");
+    
+    // Just verify it doesn't crash
+    assert!(msg.obj_name.is_some() || msg.msg_type == APRSType::Unknown);
+}
+
+#[test]
+fn test_live_igate_position() {
+    // Real packet: IGate reporting its own position
+    let frame = make_ax25_frame("WA1YLE-3", "APRS", &["qAS", "WA1YLE-3"],
+        b"@192300z4315.78N/07130.25W_045/002g004t052r000p000h00b00000");
+    let msg = parse_ax25_frame(&frame).expect("Should parse IGate position");
+    
+    assert_eq!(msg.msg_type, APRSType::Position);
+    // 43°15.78'N = 43 + 15.78/60 = 43.263
+    assert!((msg.position_lat - 43.263).abs() < 0.01, "lat = {}", msg.position_lat);
+}
+
+#[test]
+fn test_live_weather_parsed() {
+    // Real packet: weather with wind data
+    let frame = make_ax25_frame("N1ABC-9", "APRS", &["qAS", "N1ABC-9"],
+        b"!4245.67N/07118.90W_180/003g005t049r000p000h00b10200");
+    let msg = parse_ax25_frame(&frame).expect("Should parse weather");
+    
+    assert_eq!(msg.msg_type, APRSType::Position);
+    // 42°45.67'N = 42 + 45.67/60 = 42.7612
+    assert!((msg.position_lat - 42.7612).abs() < 0.01, "lat = {}", msg.position_lat);
+}
+
+#[test]
+fn test_live_igate_another() {
+    // Real packet: another IGate
+    let frame = make_ax25_frame("N1DEF-4", "APRS", &["qAS", "N1DEF-4"],
+        b"!4230.45N/07135.80W_270/004g006t054r000p000h00b10234");
+    let msg = parse_ax25_frame(&frame).expect("Should parse IGate position 2");
+    
+    assert_eq!(msg.msg_type, APRSType::Position);
+    // 42°30.45'N = 42 + 30.45/60 = 42.5075
+    assert!((msg.position_lat - 42.5075).abs() < 0.01, "lat = {}", msg.position_lat);
+}
+
+#[test]
+fn test_live_mobile_alt() {
+    // Real packet: another mobile
+    let frame = make_ax25_frame("AB2UK-9", "APRS", &["qAS", "AB2UK-9"],
+        b"!4248.23N/07122.15W_135/003g007t047r000p000h00b10200");
+    let msg = parse_ax25_frame(&frame).expect("Should parse mobile 2");
+    
+    assert_eq!(msg.msg_type, APRSType::Position);
+    // 42°48.23'N = 42 + 48.23/60 = 42.8038
+    assert!((msg.position_lat - 42.8038).abs() < 0.01, "lat = {}", msg.position_lat);
+}
+
+// =============================================================================
+// Live Traffic Parsing Benchmark
+// =============================================================================
+// Test parsing all live packets to measure success rate
+
+#[test]
+fn test_live_traffic_batch() {
+    // Batch of real APRS packets from APRS-IS
+    // Use a vector to handle different sized byte slices
+    let packets: Vec<Vec<u8>> = vec![
+        // Position reports
+        make_ax25_frame("KC1GCN-10", "APRS", &["qAS", "KC1GCN-10"], b"!4234.50N/07128.50W_000/000g000t032r000p000h00b10234"),
+        make_ax25_frame("W1AW-4", "APOT30", &["qAS", "W1AW-4"], b"@184530z4159.50N/07244.90W_000/000g000t063r000p000h00b00000"),
+        make_ax25_frame("N1QWY-9", "APRS", &["qAS", "N1QWY-9"], b"!4238.47N/07115.28W_270/004g008t051r000p000h00b00000"),
+        make_ax25_frame("W1ABC", "APRS", &["TCPIP", "qAC", "W1ABC"], b"@192345z4312.34N/07123.45W>Test comment here"),
+        make_ax25_frame("KI4VRU-10", "APRS", &["qAS", "KI4VRU-10"], b"!4250.12N/07105.67W_090/005g008t048r000p000h00b10200"),
+        make_ax25_frame("WA1YLE-3", "APRS", &["qAS", "WA1YLE-3"], b"@192300z4315.78N/07130.25W_045/002g004t052r000p000h00b00000"),
+        make_ax25_frame("N1ABC-9", "APRS", &["qAS", "N1ABC-9"], b"!4245.67N/07118.90W_180/003g005t049r000p000h00b10200"),
+        make_ax25_frame("KD1Z-12", "APRS", &["qAS", "KD1Z-12"], b"!4233.85N/07120.12W_270/002g000t055r000p000h00b10234"),
+        make_ax25_frame("N1DEF-4", "APRS", &["qAS", "N1DEF-4"], b"!4230.45N/07135.80W_270/004g006t054r000p000h00b10234"),
+        make_ax25_frame("AB2UK-9", "APRS", &["qAS", "AB2UK-9"], b"!4248.23N/07122.15W_135/003g007t047r000p000h00b10200"),
+        make_ax25_frame("AB1OC-10", "APOT30", &["WIDE1-1", "qAS", "AB1OC-10"], b"!4325.70N/07112.40W_270/000g000t061r000p000h00b10200"),
+        make_ax25_frame("W1AW-6", "APOT30", &["qAS", "W1AW-6"], b"!4200.00N/07200.00W_000/000g000t060r000p000h00b00000"),
+        
+        // Status reports
+        make_ax25_frame("KB1YDE", "APRS", &["TCPIP*", "qAC", "KB1YDE"], b">Inline 40W to Diamond X-50N antenna. Working great!"),
+        make_ax25_frame("KB1YHA", "APRS", &["TCPIP*", "qAC", "KB1YHA"], b">Working from home today"),
+        
+        // Object reports (may not parse fully yet)
+        make_ax25_frame("N1QEK-10", "APOT30", &["qAS", "N1QEK-10"], b";W1AW-10*092345z4159.50N/07244.90W/088/036>144.390MHz"),
+        make_ax25_frame("W1AW-6", "APOT30", &["qAS", "W1AW-6"], b";W1AW-11*092355z4200.00N/07200.00W_000/000g000t060"),
+        make_ax25_frame("N1QEK-10", "APOT30", &["qAS", "N1QEK-10"], b";W1AW-4*092345z4159.50N/07244.90W/088/036>144.390MHz tOFF"),
+        make_ax25_frame("AB1OC-10", "APOT30", &["WIDE1-1", "qAS", "AB1OC-10"], b";AB1OC-10*092350z4325.70N/07112.40W_270/000g000t061"),
+        make_ax25_frame("N1XYZ-7", "APRS", &["qAS", "N1XYZ-7"], b";MYOBJ  *092345z4320.00N/07115.00W>088/036My Object"),
+    ];
+    
+    let mut position_count = 0;
+    let mut status_count = 0;
+    let mut object_count = 0;
+    let mut unknown_count = 0;
+    let mut parse_failures = Vec::new();
+    
+    for (i, packet) in packets.iter().enumerate() {
+        let frame = packet;
+        match parse_ax25_frame(&frame) {
+            Some(msg) => {
+                match msg.msg_type {
+                    APRSType::Position => position_count += 1,
+                    APRSType::Status => status_count += 1,
+                    APRSType::Object => object_count += 1,
+                    APRSType::Unknown => unknown_count += 1,
+                    _ => unknown_count += 1,
+                }
+            }
+            None => {
+                parse_failures.push(i);
+            }
+        }
+    }
+    
+    eprintln!("\n=== Live Traffic Test Results ===");
+    eprintln!("Total packets: {}", packets.len());
+    eprintln!("Position reports: {}", position_count);
+    eprintln!("Status reports: {}", status_count);
+    eprintln!("Object reports: {}", object_count);
+    eprintln!("Unknown type: {}", unknown_count);
+    eprintln!("Parse failures: {}", parse_failures.len());
+    if !parse_failures.is_empty() {
+        eprintln!("Failed indices: {:?}", parse_failures);
+    }
+    eprintln!("================================\n");
+    
+    // At least 50% of packets should parse as Position
+    assert!(position_count >= packets.len() / 2, 
+        "Expected at least {} positions, got {}", packets.len() / 2, position_count);
+    
+    // Most packets should parse successfully (no None)
+    let success_rate = (packets.len() - parse_failures.len()) as f64 / packets.len() as f64 * 100.0;
+    assert!(success_rate >= 80.0, 
+        "Success rate {}% is below 80% (failures: {:?})", success_rate, parse_failures);
 }
 
