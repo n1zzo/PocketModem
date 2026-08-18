@@ -125,6 +125,9 @@ fn show_aprs_notification(body: &str, _from: &str) -> Result<(), String> {
     n.show().map_err(|e| format!("Show failed: {:?}", e))
 }
 
+/// Map margins for easier carousel swiping (in pixels)
+const MAP_MARGIN: i32 = 8;
+
 fn bearing_to_compass(bearing: f64) -> String {
     let arrow = match (bearing.round() as i32) % 360 {
         0..=22 | 338..=360 => "↑",
@@ -238,13 +241,13 @@ fn create_ui(
     gps: &Arc<Mutex<GpsManager>>,
     settings: &SettingsManager,
 ) {
-    // Window sized to fit screen (content 320px + 40px for GTK padding)
+    // Window sized to fit screen
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .default_width(300)
+        .default_width(340)
         .default_height(700)
         .title("PocketModem")
-        .width_request(300)
+        .width_request(340)
         .height_request(700)
         .build();
     
@@ -1014,30 +1017,59 @@ fn create_ui(
     }
     
     let map_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    map_page.set_size_request(360, -1);
+    map_page.set_size_request(320, -1);
     map_page.set_hexpand(false);
     map_page.set_vexpand(true);
     map_page.set_halign(gtk::Align::Center);
+    // Side margins create swipe zones for carousel
+    map_page.set_margin_top(MAP_MARGIN);
+    map_page.set_margin_bottom(MAP_MARGIN);
+    map_page.set_margin_start(4);
+    map_page.set_margin_end(4);
     
     // Get the libshumate Map widget
     let map_view = {
         let mm = map_manager.lock().unwrap();
         mm.view().clone()
     };
-    // Fill available space (below GPS header and above carousel)
-    map_view.set_size_request(360, -1);
+    // Fill available space with padding for easier carousel swiping
     map_view.set_hexpand(false);
     map_view.set_vexpand(true);
     map_view.set_valign(gtk::Align::Fill);
-    map_page.append(&map_view);
     
-    // Map container
+    // Create re-center button (positioned at bottom-right of map)
+    let recenter_btn = gtk::Button::new();
+    recenter_btn.set_icon_name("find-location-symbolic");
+    recenter_btn.add_css_class("map-recenter-btn");
+    recenter_btn.set_tooltip_text(Some("Center on my location"));
+    recenter_btn.set_halign(gtk::Align::End);
+    recenter_btn.set_valign(gtk::Align::End);
+    recenter_btn.set_margin_end(12);
+    recenter_btn.set_margin_bottom(12);
+    recenter_btn.set_size_request(40, 40);
+    
+    // Connect re-center button to map manager
+    let map_manager_for_recenter = Arc::clone(&map_manager);
+    recenter_btn.connect_clicked(move |_| {
+        if let Ok(mut mm) = map_manager_for_recenter.lock() {
+            mm.center_on_user();
+        }
+    });
+    
+    // Use Overlay to stack the button on top of the map
+    let map_overlay = gtk::Overlay::new();
+    map_overlay.set_child(Some(&map_view));
+    map_overlay.add_overlay(&recenter_btn);
+    
+    map_page.append(&map_overlay);
+    
+    // Map container with margins for carousel
     let map_clamp = adw::Clamp::new();
-    map_clamp.set_size_request(360, 700);
+    map_clamp.set_size_request(340, 700);
     map_clamp.set_hexpand(false);
     map_clamp.set_vexpand(false);
-    map_clamp.set_maximum_size(370);
-    map_clamp.set_tightening_threshold(370);
+    map_clamp.set_maximum_size(340);
+    map_clamp.set_tightening_threshold(340);
     map_clamp.set_child(Some(&map_page));
     
     // =========================================================================
@@ -1052,7 +1084,7 @@ fn create_ui(
     
     // Wrap carousel in a constrained box
     let carousel_wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    carousel_wrapper.set_size_request(360, 654);
+    carousel_wrapper.set_size_request(358, 654);
     carousel_wrapper.set_hexpand(false);
     carousel_wrapper.set_vexpand(true);
     carousel_wrapper.set_halign(gtk::Align::Center);
@@ -1071,7 +1103,7 @@ fn create_ui(
     indicator.set_margin_bottom(8);
     
     let carousel_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    carousel_box.set_size_request(360, 700);
+    carousel_box.set_size_request(358, 700);
     carousel_box.set_hexpand(false);
     carousel_box.append(&carousel_wrapper);
     carousel_box.append(&indicator);
@@ -1351,29 +1383,35 @@ fn create_ui(
             }
         }
         
-        // Map with GPS data
-        if let Ok(g) = gps_clone.lock() {
-            let gps_data = g.get_data();
-            
-            if gps_data.has_fix {
-                if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
-                    // Only update map when position changes significantly (more than ~1m)
-                    let current_pos = if let Ok(map) = map_manager_clone.lock() {
-                        map.get_user_position()
-                    } else { None };
-                    
-                    let should_update = match current_pos {
-                        Some((old_lat, old_lon)) => {
-                            let lat_diff = (lat - old_lat).abs();
-                            let lon_diff = (lon - old_lon).abs();
-                            lat_diff > 0.0001 || lon_diff > 0.0001  // ~10m threshold
-                        }
-                        None => true,  // First position
-                    };
-                    
-                    if should_update {
-                        if let Ok(mut map) = map_manager_clone.lock() {
-                            map.set_user_position(lat, lon);
+        // Map with GPS data - throttle updates to reduce lag
+        // Only check position every ~1 second even though timer runs at 100ms
+        static MAP_UPDATE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let update_tick = MAP_UPDATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        
+        if update_tick % 10 == 0 {  // Only update every 10 ticks (1 second)
+            if let Ok(g) = gps_clone.lock() {
+                let gps_data = g.get_data();
+                
+                if gps_data.has_fix {
+                    if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
+                        // Only update map when position changes significantly (more than ~10m)
+                        let current_pos = if let Ok(map) = map_manager_clone.lock() {
+                            map.get_user_position()
+                        } else { None };
+                        
+                        let should_update = match current_pos {
+                            Some((old_lat, old_lon)) => {
+                                let lat_diff = (lat - old_lat).abs();
+                                let lon_diff = (lon - old_lon).abs();
+                                lat_diff > 0.0001 || lon_diff > 0.0001  // ~10m threshold
+                            }
+                            None => true,  // First position
+                        };
+                        
+                        if should_update {
+                            if let Ok(mut map) = map_manager_clone.lock() {
+                                map.set_user_position(lat, lon);
+                            }
                         }
                     }
                 }
@@ -1393,10 +1431,6 @@ fn create_ui(
                 }
             }
         }
-        
-        // Status update tick counter
-        static TICK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let tick = TICK_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         
         ptt_label_update.set_text("PTT");
         
@@ -1527,6 +1561,14 @@ fn create_ui(
         .aprs-empty-text { font-size: 14px; color: #666; padding: 32px; }
         .locator-display { font-size: 18px; font-family: monospace; min-width: 1px; }
         .coords-display { font-size: 14px; color: #888; font-family: monospace; min-width: 1px; }
+        .user-marker { background: transparent; }
+        .user-marker-dot { color: #1a73e8; }
+        .aprs-marker { background: rgba(30, 30, 30, 0.8); border-radius: 4px; padding: 2px 4px; }
+        .aprs-symbol { font-size: 14px; color: #FFB000; }
+        .aprs-callsign { font-size: 11px; color: #deddda; }
+        .map-recenter-btn { background: rgba(30, 30, 30, 0.8); border-radius: 20px; min-width: 40px; min-height: 40px; }
+        .map-recenter-btn:hover { background: rgba(50, 50, 50, 0.9); }
+        .map-recenter-btn:active { background: rgba(70, 70, 70, 0.9); }
     "#);
     
     gtk::style_context_add_provider_for_display(
@@ -1535,13 +1577,12 @@ fn create_ui(
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION
     );
     
-    // Wrap content in a Fixed container to force exact 340x700 size
-    // Wrap content in a Box with strict width constraint via CSS
+    // Wrap content in a Box with strict width constraint
     let fixed_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    fixed_container.set_size_request(360, 700);
+    fixed_container.set_size_request(340, 700);
     fixed_container.set_hexpand(false);
     fixed_container.set_vexpand(false);
-    fixed_container.set_halign(gtk::Align::Center);  // Center the 360px content
+    fixed_container.set_halign(gtk::Align::Center);
     fixed_container.set_valign(gtk::Align::Start);
     
     fixed_container.append(&header_bar);

@@ -82,6 +82,7 @@ See `AGENTS.md` for detailed debug notes.
 - [x] Implement APRS, add toast for new messages
 - [x] Add APRS message log and map views using carousel
 - [ ] Code refactor: move utils function in dedicated file, remove UI sizing constraints, move UI code to dedicated file, deal with unsafes.
+- [ ] Fix light theme
 - [ ] Use libadwaita feature to show unrecoverable errors
 - [ ] Add flatpack build target
 - [ ] Noise squelch option

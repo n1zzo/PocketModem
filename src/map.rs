@@ -31,27 +31,91 @@ const DEFAULT_ZOOM: f64 = 10.0;
 const DEFAULT_LAT: f64 = 46.8;
 const DEFAULT_LON: f64 = 8.2;
 
+/// Map margins for easier carousel swiping (in pixels)
+const MAP_MARGIN: i32 = 8;
+
 // ============================================================================
-// Map Style (simplified Mapbox GL JSON style)
+// Map Style (based on GNOME Maps defs.js)
 // ============================================================================
+
+/// GNOME Maps color palette (from defs.js)
+mod gnome_colors {
+    pub fn background(is_dark: bool) -> &'static str {
+        if is_dark { "#191a19" } else { "#deddda" }
+    }
+    
+    pub fn foreground(is_dark: bool) -> &'static str {
+        if is_dark { "#deddda" } else { "#3d3846" }
+    }
+    
+    pub fn water(is_dark: bool) -> &'static str {
+        if is_dark { "#0f2f5e" } else { "#99c1f1" }
+    }
+    
+    pub fn land(is_dark: bool) -> &'static str {
+        if is_dark { "#242524" } else { "#e8e5de" }
+    }
+    
+    pub fn landuse(is_dark: bool) -> &'static str {
+        if is_dark { "#1e211e" } else { "#e8e5de" }
+    }
+    
+    pub fn grass(is_dark: bool) -> &'static str {
+        if is_dark { "#334034" } else { "#adccb3" }
+    }
+    
+    pub fn wood(is_dark: bool) -> &'static str {
+        if is_dark { "#29342a" } else { "#a3c2a9" }
+    }
+    
+    pub fn road_main(is_dark: bool) -> &'static str {
+        if is_dark { "#493727" } else { "#e9cf75" }
+    }
+    
+    pub fn road_secondary(is_dark: bool) -> &'static str {
+        if is_dark { "#453324" } else { "#ebd68a" }
+    }
+    
+    pub fn road_street(is_dark: bool) -> &'static str {
+        if is_dark { "#413f39" } else { "#d7d2bc" }
+    }
+    
+    pub fn road_path(is_dark: bool) -> &'static str {
+        if is_dark { "#25242a" } else { "#bebdc8" }
+    }
+    
+    pub fn building(is_dark: bool) -> &'static str {
+        if is_dark { "#3d3d3d" } else { "#c4c0b8" }
+    }
+    
+    pub fn text_secondary(is_dark: bool) -> &'static str {
+        if is_dark { "#c0bfbc" } else { "#5e5c64" }
+    }
+}
 
 /// Generate a Mapbox GL JSON style for the vector tiles
+/// Matching GNOME Maps style exactly
 fn generate_map_style(is_dark: bool) -> String {
-    // GNOME Maps color scheme
-    let bg_color = if is_dark { "#191a19" } else { "#deddda" };
-    let land_color = if is_dark { "#242524" } else { "#e8e7d0" };
-    let water_color = if is_dark { "#0f2f5e" } else { "#99c1f1" };
-    
-    // Text colors
-    let text_color = if is_dark { "#deddda" } else { "#3d3846" };
-    let text_halo = if is_dark { "#191a19" } else { "#deddda" };
-    
-    // Road color
-    let road_color = if is_dark { "#493727" } else { "#e9cf75" };
+    let bg = gnome_colors::background(is_dark);
+    let fg = gnome_colors::foreground(is_dark);
+    let fg_secondary = gnome_colors::text_secondary(is_dark);
+    let water = gnome_colors::water(is_dark);
+    let land = gnome_colors::land(is_dark);
+    let landuse = gnome_colors::landuse(is_dark);
+    let grass = gnome_colors::grass(is_dark);
+    let wood = gnome_colors::wood(is_dark);
+    let road = gnome_colors::road_main(is_dark);
+    let street = gnome_colors::road_street(is_dark);
+    let secondary = gnome_colors::road_secondary(is_dark);
+    let path = gnome_colors::road_path(is_dark);
+    let building = gnome_colors::building(is_dark);
+    let name = if is_dark { "Dark" } else { "Light" };
 
+    // Build style matching GNOME Maps exactly
+    // Using proper Mapbox Style expressions
     format!(r#"{{
   "version": 8,
-  "name": "PocketModem {}",
+  "name": "GNOME Maps {}",
   "sources": {{
     "vector-tiles": {{
       "type": "vector",
@@ -74,6 +138,30 @@ fn generate_map_style(is_dark: bool) -> String {
       "paint": {{"fill-color": "{}"}}
     }},
     {{
+      "id": "landuse-residential",
+      "type": "fill",
+      "source": "vector-tiles",
+      "source-layer": "landuse",
+      "filter": ["in", "class", "residential", "commercial", "industrial", "retail", "education", "hospital"],
+      "paint": {{"fill-color": "{}"}}
+    }},
+    {{
+      "id": "landuse-grass",
+      "type": "fill",
+      "source": "vector-tiles",
+      "source-layer": "landcover",
+      "filter": ["in", "class", "grass", "pitch"],
+      "paint": {{"fill-color": "{}", "fill-opacity": 0.6}}
+    }},
+    {{
+      "id": "landuse-wood",
+      "type": "fill",
+      "source": "vector-tiles",
+      "source-layer": "landcover",
+      "filter": ["in", "class", "wood", "forest"],
+      "paint": {{"fill-color": "{}", "fill-opacity": 0.5}}
+    }},
+    {{
       "id": "water",
       "type": "fill",
       "source": "vector-tiles",
@@ -81,34 +169,133 @@ fn generate_map_style(is_dark: bool) -> String {
       "paint": {{"fill-color": "{}"}}
     }},
     {{
-      "id": "roads",
+      "id": "transportation-path",
       "type": "line",
       "source": "vector-tiles",
       "source-layer": "transportation",
-      "filter": ["==", "$type", "LineString"],
+      "filter": ["in", "class", "path", "track", "footway", "steps", "cycleway"],
       "paint": {{
         "line-color": "{}",
-        "line-width": 2,
-        "line-opacity": 0.9
+        "line-width": 1,
+        "line-dasharray": [1.5, 2],
+        "line-cap": "round"
       }}
     }},
     {{
-      "id": "places",
+      "id": "transportation-street",
+      "type": "line",
+      "source": "vector-tiles",
+      "source-layer": "transportation",
+      "filter": ["in", "class", "tertiary", "minor", "service"],
+      "paint": {{
+        "line-color": "{}",
+        "line-width": 1.5,
+        "line-opacity": 0.9,
+        "line-cap": "round"
+      }}
+    }},
+    {{
+      "id": "transportation-secondary",
+      "type": "line",
+      "source": "vector-tiles",
+      "source-layer": "transportation",
+      "filter": ["==", "class", "secondary"],
+      "paint": {{
+        "line-color": "{}",
+        "line-width": 2.5,
+        "line-opacity": 0.9,
+        "line-cap": "round"
+      }}
+    }},
+    {{
+      "id": "transportation-road",
+      "type": "line",
+      "source": "vector-tiles",
+      "source-layer": "transportation",
+      "filter": ["in", "class", "primary", "trunk", "motorway"],
+      "paint": {{
+        "line-color": "{}",
+        "line-width": 3,
+        "line-opacity": 0.9,
+        "line-cap": "round"
+      }}
+    }},
+    {{
+      "id": "buildings",
+      "type": "fill",
+      "source": "vector-tiles",
+      "source-layer": "building",
+      "minzoom": 15,
+      "paint": {{"fill-color": "{}"}}
+    }},
+    {{
+      "id": "place-city",
       "type": "symbol",
       "source": "vector-tiles",
       "source-layer": "place",
+      "filter": ["==", "class", "city"],
       "layout": {{
-        "text-field": "{{name:latin}}",
-        "text-size": 12
+        "text-field": ["coalesce", ["get", "name:en"], ["get", "name"]],
+        "text-font": ["Adwaita Sans Bold"],
+        "text-size": 20,
+        "text-padding": 10
       }},
       "paint": {{
-        "text-color": "{}",
-        "text-halo-color": "{}",
-        "text-halo-width": 1.5
+        "text-color": "{}"
+      }}
+    }},
+    {{
+      "id": "place-town-village",
+      "type": "symbol",
+      "source": "vector-tiles",
+      "source-layer": "place",
+      "filter": ["in", "class", "town", "village"],
+      "layout": {{
+        "text-field": ["coalesce", ["get", "name:en"], ["get", "name"]],
+        "text-font": ["Adwaita Sans Bold"],
+        "text-size": 14,
+        "text-padding": 10
+      }},
+      "paint": {{
+        "text-color": "{}"
+      }}
+    }},
+    {{
+      "id": "poi",
+      "type": "symbol",
+      "source": "vector-tiles",
+      "source-layer": "poi",
+      "minzoom": 16,
+      "layout": {{
+        "text-field": ["coalesce", ["get", "name:en"], ["get", "name"]],
+        "text-font": ["Adwaita Sans Italic"],
+        "text-size": 11,
+        "text-offset": [0, 0.7],
+        "text-padding": 10
+      }},
+      "paint": {{
+        "text-color": "{}"
+      }}
+    }},
+    {{
+      "id": "road-name",
+      "type": "symbol",
+      "source": "vector-tiles",
+      "source-layer": "transportation_name",
+      "minzoom": 14,
+      "layout": {{
+        "text-field": ["coalesce", ["get", "name:en"], ["get", "name"]],
+        "text-font": ["Adwaita Sans"],
+        "text-size": 10,
+        "symbol-placement": "line",
+        "text-offset": [0, 1]
+      }},
+      "paint": {{
+        "text-color": "{}"
       }}
     }}
   ]
-}}"#, if is_dark { "Dark" } else { "Light" }, GNOME_TILE_URL, bg_color, land_color, water_color, road_color, text_color, text_halo)
+}}"#, name, GNOME_TILE_URL, bg, land, landuse, grass, wood, water, path, street, secondary, road, building, fg, fg, fg, fg)
 }
 
 // ============================================================================
@@ -158,8 +345,16 @@ pub struct MapManager {
     /// Current user position
     user_lat: Option<f64>,
     user_lon: Option<f64>,
+    /// User position marker (GPS dot)
+    user_marker: Option<Marker>,
     /// Vector renderer (to keep alive)
     vector_renderer: Option<VectorRenderer>,
+    /// Track if viewport changes should update user marker position
+    viewport_listener_id: Option<glib::SignalHandlerId>,
+    /// Whether the map has been centered on user position yet
+    has_centered_on_user: bool,
+    /// Current dark mode state (for marker styling)
+    dark_mode: bool,
 }
 
 impl MapManager {
@@ -195,15 +390,20 @@ impl MapManager {
             station_markers: HashMap::new(),
             user_lat: None,
             user_lon: None,
+            user_marker: None,
             vector_renderer: None,
+            viewport_listener_id: None,
+            has_centered_on_user: false,
+            dark_mode: true,
         }
     }
 
     /// Initialize the map with vector renderer
     pub fn initialize(&mut self, dark_mode: bool) {
+        self.dark_mode = dark_mode;
         // Check if already initialized
         if self.map_layer.is_some() {
-            self.update_style(dark_mode);
+            self.update_style_internal(dark_mode);
             return;
         }
 
@@ -214,6 +414,7 @@ impl MapManager {
         match VectorRenderer::new("vector-tiles", &style_json) {
             Ok(renderer) => {
                 eprintln!("[map] VectorRenderer created successfully");
+                eprintln!("[map] Style: {}", if dark_mode { "dark" } else { "light" });
                 
                 // Create tile downloader
                 let _downloader = TileDownloader::new(GNOME_TILE_URL);
@@ -245,15 +446,43 @@ impl MapManager {
         }
     }
     
-    /// Update map style when theme changes
+    /// Update map style when theme changes (public API)
     pub fn update_style(&mut self, dark_mode: bool) {
-        if let Some(renderer) = &self.vector_renderer {
-            let style_json = generate_map_style(dark_mode);
-            eprintln!("[map] Updating style to {} mode", if dark_mode { "dark" } else { "light" });
-            // Note: VectorRenderer style is set at creation; for dynamic updates,
-            // we would need to recreate the renderer
-            let _ = renderer;
-            let _ = style_json;
+        self.update_style_internal(dark_mode);
+    }
+    
+    /// Internal style update - recreates the renderer for full style change
+    fn update_style_internal(&mut self, dark_mode: bool) {
+        // Update dark mode state
+        self.dark_mode = dark_mode;
+        
+        // Generate new style
+        let style_json = generate_map_style(dark_mode);
+        eprintln!("[map] Updating style to {} mode", if dark_mode { "dark" } else { "light" });
+        
+        // Remove old layers
+        if let Some(ref layer) = self.map_layer {
+            self.map.remove_layer(layer);
+        }
+        
+        // Recreate vector renderer with new style
+        match VectorRenderer::new("vector-tiles", &style_json) {
+            Ok(renderer) => {
+                // Create new map layer
+                let map_layer = MapLayer::new(&renderer, &self.viewport);
+                self.map.add_layer(&map_layer);
+                
+                self.map_layer = Some(map_layer);
+                self.vector_renderer = Some(renderer.clone());
+                
+                // Set as reference map source
+                self.viewport.set_reference_map_source(Some(&renderer));
+                
+                eprintln!("[map] Style updated successfully");
+            }
+            Err(e) => {
+                eprintln!("[map] Failed to update style: {:?}", e);
+            }
         }
     }
 
@@ -264,17 +493,65 @@ impl MapManager {
 
     /// Set the user's GPS position
     pub fn set_user_position(&mut self, lat: f64, lon: f64) {
-        // Only update if position changed
-        if self.user_lat == Some(lat) && self.user_lon == Some(lon) {
-            return;
-        }
-        
         self.user_lat = Some(lat);
         self.user_lon = Some(lon);
         
-        // Pan to user position
-        self.map.center_on(lat, lon);
-        eprintln!("[map] Centered on user position: {:.4}, {:.4}", lat, lon);
+        // Update or create user marker
+        if let Some(marker) = &mut self.user_marker {
+            // Update existing marker position
+            marker.set_latitude(lat);
+            marker.set_longitude(lon);
+        } else {
+            // Create new user marker - yellow circle with dynamic border
+            let drawing_area = gtk::DrawingArea::new();
+            drawing_area.set_size_request(16, 16);
+            
+            // Capture dark mode for closure
+            let is_dark = self.dark_mode;
+            drawing_area.set_draw_func(move |_area, cr, _width, _height| {
+                // Draw yellow circle
+                cr.set_source_rgb(1.0, 0.69, 0.0); // #FFB000
+                cr.arc(8.0, 8.0, 7.0, 0.0, 2.0 * std::f64::consts::PI);
+                cr.fill().expect("Failed to fill circle");
+                
+                // Draw border - white in dark mode, black in light mode
+                if is_dark {
+                    cr.set_source_rgb(1.0, 1.0, 1.0); // White
+                } else {
+                    cr.set_source_rgb(0.0, 0.0, 0.0); // Black
+                }
+                cr.set_line_width(1.5);
+                cr.arc(8.0, 8.0, 7.0, 0.0, 2.0 * std::f64::consts::PI);
+                cr.stroke().expect("Failed to stroke circle");
+            });
+            
+            let marker = Marker::builder()
+                .latitude(lat)
+                .longitude(lon)
+                .child(&drawing_area)
+                .build();
+            
+            self.marker_layer.add_marker(&marker);
+            self.user_marker = Some(marker);
+            eprintln!("[map] Created user position marker (yellow circle, dark={})", is_dark);
+        }
+        
+        // Only center on map on first position, then let user pan freely
+        if !self.has_centered_on_user {
+            self.map.center_on(lat, lon);
+            self.has_centered_on_user = true;
+            eprintln!("[map] Centered on initial user position: {:.4}, {:.4}", lat, lon);
+        } else {
+            eprintln!("[map] Updated user position (not centering): {:.4}, {:.4}", lat, lon);
+        }
+    }
+
+    /// Force center the map on user's current position (for re-center button)
+    pub fn center_on_user(&mut self) {
+        if let (Some(lat), Some(lon)) = (self.user_lat, self.user_lon) {
+            self.map.center_on(lat, lon);
+            eprintln!("[map] Re-centered on user: {:.4}, {:.4}", lat, lon);
+        }
     }
 
     /// Center map on a specific location
@@ -334,6 +611,14 @@ impl MapManager {
     /// Check if map has any stations
     pub fn has_stations(&self) -> bool {
         !self.station_markers.is_empty()
+    }
+    
+    /// Clean up resources
+    pub fn cleanup(&mut self) {
+        // Remove user marker if present
+        if let Some(marker) = self.user_marker.take() {
+            self.marker_layer.remove_marker(&marker);
+        }
     }
 }
 
@@ -413,13 +698,6 @@ impl MapManager {
             let zoom = self.viewport.zoom_level();
             let scale = 1.0 / (2_f64.powf(zoom) * 256.0);
             self.map.center_on(lat + dy * scale, lon + dx * scale);
-        }
-    }
-
-    /// Legacy method
-    pub fn center_on_user(&mut self) {
-        if let Some((lat, lon)) = self.get_user_position() {
-            self.map.center_on(lat, lon);
         }
     }
 
