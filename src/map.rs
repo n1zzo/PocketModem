@@ -33,21 +33,33 @@ const DEFAULT_LAT: f64 = 46.8;
 const DEFAULT_LON: f64 = 8.2;
 
 // ============================================================================
-// Map Style (simplified Mapbox GL JSON style)
+// Map Style (Mapbox GL JSON style matching GNOME Maps)
 // ============================================================================
 
 /// Generate a Mapbox GL JSON style for the vector tiles
-/// Based on GNOME Maps style generator (simplified for PocketModem)
+/// Based on GNOME Maps style generator
 fn generate_map_style(is_dark: bool) -> String {
-    let bg_color = if is_dark { "#1a1a1a" } else { "#f8f9fa" };
-    let land_color = if is_dark { "#2d2d2d" } else { "#e8e0d8" };
-    let water_color = if is_dark { "#2a4a6a" } else { "#a8d4e6" };
-    // Roads: lighter in dark mode for visibility
-    let road_color = if is_dark { "#6a6a6a" } else { "#d0d0d0" };
-    let road_width = if is_dark { 2.0 } else { 1.5 };
-    // Text: bright in dark mode, dark in light mode
-    let text_color = if is_dark { "#ffffff" } else { "#222222" };
-    let text_halo = if is_dark { "#1a1a1a" } else { "#ffffff" };
+    // GNOME Maps color scheme
+    let bg_color = if is_dark { "#191a19" } else { "#deddda" };
+    let land_color = if is_dark { "#242524" } else { "#e8e7d0" };
+    let water_color = if is_dark { "#0f2f5e" } else { "#99c1f1" };
+    
+    // Text colors
+    let text_primary = if is_dark { "#deddda" } else { "#3d3846" };
+    let text_secondary = if is_dark { "#c0bfbc" } else { "#5e5c64" };
+    let text_halo = if is_dark { "#191a19" } else { "#deddda" };
+    
+    // Road colors from GNOME Maps defs.js
+    let road_motor = if is_dark { "#58422e" } else { "#e1c172" };
+    let road_trunk = if is_dark { "#493727" } else { "#e9cf75" };
+    let road_secondary = if is_dark { "#453324" } else { "#ebd68a" };
+    let road_tertiary = if is_dark { "#413f39" } else { "#d7d2bc" };
+    let road_service = if is_dark { "#2a2924" } else { "#c8c7b4" };
+    let road_path = if is_dark { "#25242a" } else { "#bebdc8" };
+    let rail_color = if is_dark { "#91747b" } else { "#c89299" };
+
+    // Note: glyphs URL is used by Mapbox GL but may not be needed for libshumate
+    // "glyphs": "https://tiles.maps.jwestman.net/fonts/{fontstack}/{range}.pbf",
 
     format!(r#"{{
   "version": 8,
@@ -80,36 +92,207 @@ fn generate_map_style(is_dark: bool) -> String {
       "source-layer": "water",
       "paint": {{"fill-color": "{}"}}
     }},
+    
+    // === Roads - path/pedestrian (lowest priority) ===
     {{
-      "id": "roads",
+      "id": "road-path",
       "type": "line",
       "source": "vector-tiles",
       "source-layer": "transportation",
-      "filter": ["==", "$type", "LineString"],
+      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "path", "footway", "cycleway"]],
       "paint": {{
         "line-color": "{}",
-        "line-width": {},
+        "line-width": 0.75,
+        "line-opacity": 0.7
+      }}
+    }},
+    
+    // === Roads - service/track ===
+    {{
+      "id": "road-service",
+      "type": "line",
+      "source": "vector-tiles",
+      "source-layer": "transportation",
+      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "service", "track"]],
+      "paint": {{
+        "line-color": "{}",
+        "line-width": 1,
+        "line-opacity": 0.8
+      }}
+    }},
+    
+    // === Roads - tertiary/minor ===
+    {{
+      "id": "road-tertiary",
+      "type": "line",
+      "source": "vector-tiles",
+      "source-layer": "transportation",
+      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "tertiary", "minor"]],
+      "paint": {{
+        "line-color": "{}",
+        "line-width": 1.5,
         "line-opacity": 0.9
       }}
     }},
+    
+    // === Roads - secondary ===
     {{
-      "id": "places",
+      "id": "road-secondary",
+      "type": "line",
+      "source": "vector-tiles",
+      "source-layer": "transportation",
+      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "secondary"]],
+      "paint": {{
+        "line-color": "{}",
+        "line-width": 2,
+        "line-opacity": 0.9
+      }}
+    }},
+    
+    // === Roads - trunk/primary ===
+    {{
+      "id": "road-trunk",
+      "type": "line",
+      "source": "vector-tiles",
+      "source-layer": "transportation",
+      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "trunk", "primary"]],
+      "paint": {{
+        "line-color": "{}",
+        "line-width": 2.5,
+        "line-opacity": 0.95
+      }}
+    }},
+    
+    // === Roads - motorway ===
+    {{
+      "id": "road-motorway",
+      "type": "line",
+      "source": "vector-tiles",
+      "source-layer": "transportation",
+      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "motorway"]],
+      "paint": {{
+        "line-color": "{}",
+        "line-width": 3,
+        "line-opacity": 1
+      }}
+    }},
+    
+    // === Rail ===
+    {{
+      "id": "rail",
+      "type": "line",
+      "source": "vector-tiles",
+      "source-layer": "transportation",
+      "filter": ["all", ["==", "$type", "LineString"], ["in", "class", "rail"]],
+      "paint": {{
+        "line-color": "{}",
+        "line-width": 1,
+        "line-opacity": 0.7
+      }}
+    }},
+    
+    // === Place labels - country (largest, zoom 0-6) ===
+    {{
+      "id": "place-country",
       "type": "symbol",
       "source": "vector-tiles",
       "source-layer": "place",
+      "filter": ["in", "class", "country"],
       "layout": {{
         "text-field": "{{name:latin}}",
-        "text-size": 11
+        "text-size": [
+          "interpolate", ["linear"], ["zoom"],
+          1, 14,
+          4, 18,
+          6, 24
+        ],
+        "text-transform": "uppercase"
       }},
       "paint": {{
         "text-color": "{}",
         "text-halo-color": "{}",
-        "text-halo-width": 1.5,
-        "text-opacity": 0.95
+        "text-halo-width": 1.5
+      }}
+    }},
+    
+    // === Place labels - city (medium, zoom 4-12) ===
+    {{
+      "id": "place-city",
+      "type": "symbol",
+      "source": "vector-tiles",
+      "source-layer": "place",
+      "filter": ["in", "class", "city"],
+      "layout": {{
+        "text-field": "{{name:latin}}",
+        "text-size": [
+          "interpolate", ["linear"], ["zoom"],
+          4, 10,
+          6, 16,
+          12, 22
+        ]
+      }},
+      "paint": {{
+        "text-color": "{}",
+        "text-halo-color": "{}",
+        "text-halo-width": 1.5
+      }}
+    }},
+    
+    // === Place labels - town (smaller, zoom 9-13) ===
+    {{
+      "id": "place-town",
+      "type": "symbol",
+      "source": "vector-tiles",
+      "source-layer": "place",
+      "filter": ["in", "class", "town", "village"],
+      "layout": {{
+        "text-field": "{{name:latin}}",
+        "text-size": [
+          "interpolate", ["linear"], ["zoom"],
+          9, 10,
+          12, 16
+        ]
+      }},
+      "paint": {{
+        "text-color": "{}",
+        "text-halo-color": "{}",
+        "text-halo-width": 1
+      }}
+    }},
+    
+    // === Place labels - suburb (small, zoom 12+) ===
+    {{
+      "id": "place-suburb",
+      "type": "symbol",
+      "source": "vector-tiles",
+      "source-layer": "place",
+      "filter": ["in", "class", "neighborhood", "suburb", "quarter", "hamlet"],
+      "layout": {{
+        "text-field": "{{name:latin}}",
+        "text-size": [
+          "interpolate", ["linear"], ["zoom"],
+          12, 9,
+          15, 14
+        ],
+        "text-transform": "uppercase"
+      }},
+      "paint": {{
+        "text-color": "{}",
+        "text-halo-color": "{}",
+        "text-halo-width": 1
       }}
     }}
   ]
-}}"#, if is_dark { "Dark" } else { "Light" }, GNOME_TILE_URL, bg_color, land_color, water_color, road_color, road_width, text_color, text_halo)
+}}"#, 
+      if is_dark { "Dark" } else { "Light" }, 
+      GNOME_TILE_URL, 
+      bg_color, land_color, water_color,
+      road_path, road_service, road_tertiary, road_secondary, road_trunk, road_motor, rail_color,
+      text_primary, text_halo,
+      text_primary, text_halo,
+      text_primary, text_halo,
+      text_secondary, text_halo
+    )
 }
 
 // ============================================================================
