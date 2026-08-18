@@ -103,14 +103,24 @@ impl APRSIconRenderer {
         let mut buf = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
         
-        // Convert RGBA to premultiplied ARGB
+        eprintln!("[aprs_icons] PNG: {}x{}, color_type={:?}", 
+                  info.width, info.height, info.color_type);
+        
+        // PNG stores as RGBA: [R=0, G=1, B=2, A=3]
+        // Cairo ARGB32: [A, R, G, B] as a single 32-bit value, or [B, G, R, A] bytes on little-endian
+        // So we need to reorder: [R, G, B, A] → [B, G, R, A]
+        // PNG stores as RGBA: [R=0, G=1, B=2, A=3]
+        // Cairo ARGB32: [A, R, G, B] as 32-bit value
+        // On little-endian this is stored as [B, G, R, A] in memory
         let mut argb = Vec::with_capacity(info.width as usize * info.height as usize * 4);
         for px in buf.chunks(4) {
             if px.len() >= 4 {
-                argb.push(px[3]); // A
-                argb.push(px[0]); // R  
-                argb.push(px[1]); // G
-                argb.push(px[2]); // B
+                // byte0=px[0]=R, byte1=px[1]=G, byte2=px[2]=B, byte3=px[3]=A
+                // Cairo needs [A, R, G, B] on little-endian: [B, G, R, A]
+                argb.push(px[2]); // B (byte 0)
+                argb.push(px[1]); // G (byte 1)
+                argb.push(px[0]); // R (byte 2)
+                argb.push(px[3]); // A (byte 3)
             }
         }
         
@@ -144,35 +154,76 @@ impl APRSIconRenderer {
     }
 
     fn symbol_index(c: char) -> usize {
-        // APRS symbol table mapping:
-        // 0-9: indices 0-9
-        // A-Z: indices 10-35 (10 + 0-25)
-        // a-x: indices 36-61 (36 + 0-23), skipping y and z
-        // >: index 62 (truck)
-        // \: index 63 (house)
+        // APRS symbol table mapping (indices 0-127):
+        // Standard APRS symbol table order (matches aprs-symbols spritesheet)
+        // Based on: http://www.aprs.org/symbols/symbols-new.txt
+        //
+        // Row 0 (0-15):   0-9, :, ;, <, =, >, ?, @, A
+        // Row 1 (16-31):  B-O (16 symbols)
+        // Row 2 (32-47):  P-Z, [, \\, ], ^, _, `, a-b (16 symbols)
+        // Row 3 (48-63):  c-n (16 symbols)
+        // Row 4 (64-79):  o-z, more special chars
+        // Row 5 (80-95):  overlay table start
+        // etc.
         
-        let ascii = c as u32;
-        if ascii >= 0x30 && ascii <= 0x39 {
-            (ascii - 0x30) as usize  // 0-9
-        } else if ascii >= 0x41 && ascii <= 0x5A {
-            10 + (ascii - 0x41) as usize  // A-Z
-        } else if ascii >= 0x61 && ascii <= 0x78 {
-            36 + (ascii - 0x61) as usize  // a-x (36-60)
-        } else if c == '>' {
-            62
-        } else if c == '\\' {
-            63
-        } else {
-            63  // Default fallback
-        }
+        let idx = match c {
+            // Row 0: 0-9 and special characters
+            '0'..='9' => c as usize - '0' as usize,  // 0-9 -> indices 0-9
+            ':' => 10,
+            ';' => 11,
+            '<' => 12,
+            '=' => 13,
+            '>' => 14,
+            '?' => 15,
+            '@' => 16,
+            'A' => 17,
+            
+            // Row 1: B-O
+            'B' => 18, 'C' => 19, 'D' => 20, 'E' => 21, 'F' => 22,
+            'G' => 23, 'H' => 24, 'I' => 25, 'J' => 26, 'K' => 27,
+            'L' => 28, 'M' => 29, 'N' => 30, 'O' => 31,
+            
+            // Row 2: P-Z and special
+            'P' => 32, 'Q' => 33, 'R' => 34, 'S' => 35, 'T' => 36,
+            'U' => 37, 'V' => 38, 'W' => 39, 'X' => 40, 'Y' => 41,
+            'Z' => 42,
+            '[' => 43, '\\' => 44, ']' => 45, '^' => 46, '_' => 47,
+            '`' => 48, 'a' => 49, 'b' => 50,
+            
+            // Row 3: c-n
+            'c' => 51, 'd' => 52, 'e' => 53, 'f' => 54, 'g' => 55,
+            'h' => 56, 'i' => 57, 'j' => 58, 'k' => 59, 'l' => 60,
+            'm' => 61, 'n' => 62,
+            
+            // Row 4: o-z and truck/house
+            'o' => 63, 'p' => 64, 'q' => 65, 'r' => 66, 's' => 67,
+            't' => 68, 'u' => 69, 'v' => 70, 'w' => 71, 'x' => 72,
+            'y' => 73, 'z' => 74,
+            
+            // APRS special symbols that might appear
+            '#' => 75,  // Number in circle / DX cluster
+            '$' => 76,  // Money/sign
+            '%' => 77,  // Bank/ATM
+            '&' => 78,  // Arrow
+            '*' => 79,  // Star
+            '(' => 80,  // Left paren
+            ')' => 81,  // Right paren
+            '+' => 82,  // Plus
+            ',' => 83,  // Comma
+            '-' => 84,  // Dash
+            '.' => 85,  // Dot
+            '/' => 86,  // Forward slash (already used as table ID, but also a symbol)
+            
+            // Fallback
+            _ => 63,  // Default to house-like symbol
+        };
+        idx
     }
 
     fn render_icon(&self, table: usize, idx: usize, size: i32) -> ImageSurface {
         let surf = ImageSurface::create(Format::ARgb32, size, size)
             .expect("icon surface");
         let cr = Context::new(&surf).expect("cairo context");
-        
-        eprintln!("[aprs_icons] render_icon: table={}, idx={}, size={}", table, idx, size);
         
         if let Some(ref sprite) = self.sprites[table] {
             let sprite_size = sprite.width() / COLS as i32;
@@ -194,7 +245,6 @@ impl APRSIconRenderer {
             cr.paint().ok();
         } else {
             // Fallback: colored circle
-            eprintln!("[aprs_icons] Using FALLBACK for table={}, idx={}", table, idx);
             let (r, g, b) = Self::fallback_color(idx);
             let cx = size as f64 / 2.0;
             cr.set_source_rgb(r, g, b);

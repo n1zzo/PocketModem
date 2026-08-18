@@ -587,9 +587,7 @@ impl MapManager {
             msg.symbol_code,
             icon_size,
         );
-        eprintln!("[map] Icon surface: {}x{}, table={:?}, code={:?}", 
-                  icon_surface.width(), icon_surface.height(),
-                  msg.symbol_table_id, msg.symbol_code);
+        // Get the APRS icon surface
 
         // Create a DrawingArea to render the icon
         let drawing_area = gtk::DrawingArea::new();
@@ -602,11 +600,9 @@ impl MapManager {
         let icon_width = icon_size as f64;
         let icon_height = icon_size as f64;
         
-        // Clone all data needed for closure
-        let callsign_for_draw = msg.from_callsign.clone();
+        // Clone comment for tooltip
         let comment_for_tooltip = if msg.comment.is_empty() { String::new() } else { msg.comment.clone() };
 
-        let _surface = surface.clone();  // Keep alive
         drawing_area.set_draw_func(move |area, cr, width, height| {
             // Draw the APRS icon directly
             let scale_x = width as f64 / icon_width;
@@ -618,12 +614,9 @@ impl MapManager {
             let offset_x = (width as f64 - scaled_width) / 2.0;
             let offset_y = (height as f64 - scaled_height) / 2.0;
             
-            cr.set_source_surface(&_surface, offset_x, offset_y);
+            cr.set_source_surface(&surface, offset_x, offset_y);
             let _ = cr.paint();
         });
-        
-        eprintln!("[map] DrawingArea created with draw callback for {}", 
-                  msg.from_callsign);
 
         // Create tooltip with station info
         let tooltip_text = format!("{} - {}", msg.from_callsign, 
@@ -631,24 +624,29 @@ impl MapManager {
         drawing_area.set_tooltip_text(Some(&tooltip_text));
 
         // Create marker with icon
-        eprintln!("[map] Creating marker at lat={}, lon={}", msg.position_lat, msg.position_lon);
         let marker = Marker::builder()
             .latitude(msg.position_lat)
             .longitude(msg.position_lon)
             .child(&drawing_area)
             .build();
-        
-        eprintln!("[map] Marker built with child widget, size: {}x{}", icon_size, icon_size);
-        eprintln!("[map] Marker created, adding to layer");
 
         self.marker_layer.add_marker(&marker);
-        self.station_markers.insert(key, marker);
-        eprintln!("[map] Marker added to layer, total markers: {}", self.station_markers.len());
         
-        eprintln!("[map] Added APRS station: {} at ({:.4}, {:.4}), symbol: {}{}", 
-                  msg.from_callsign, msg.position_lat, msg.position_lon,
-                  msg.symbol_table_id.unwrap_or('/'), 
-                  msg.symbol_code.unwrap_or('?'));
+        // Force the DrawingArea to realize and queue a redraw
+        // GTK4 doesn't automatically draw new child widgets - need to schedule a draw
+        drawing_area.set_size_request(icon_size, icon_size);
+        drawing_area.set_visible(true);
+        
+        // Use tick_callback to ensure draw happens after widget is realized
+        let weak_drawing_area = drawing_area.downgrade();
+        drawing_area.add_tick_callback(move |area, _clock| {
+            if let Some(da) = weak_drawing_area.upgrade() {
+                da.queue_draw();
+            }
+            glib::ControlFlow::Break  // Don't continue calling, only once
+        });
+        
+        self.station_markers.insert(key, marker);
     }
 
     /// Get user position

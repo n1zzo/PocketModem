@@ -241,29 +241,34 @@ fn decode_position(msg: &mut APRSMessage, payload: &[u8]) {
         // Rest is comment/symbol
         if consumed < data.len() {
             let remainder = &data[consumed..];
-            // Look for symbol table ID (first char after position)
-            // and symbol code (second char)
-            if remainder.len() >= 2 {
-                let sym1 = remainder[0] as char;
-                let sym2 = remainder[1] as char;
+            
+            // Symbol extraction after position:
+            // Standard APRS format: DDMM.MMN/DDDMM.MME#SYMBOL...
+            // - '/' at position 8 is the SYMBOL TABLE ID (primary)
+            // - 'E' at position 17 is the LONGTUDE DIRECTION (NOT a symbol)
+            // - Symbol code is at position 18 (immediately after E/W)
+            
+            if remainder.len() >= 1 {
+                let sym_char = remainder[0] as char;
                 
-                // Valid APRS symbol: symbol table ID is /, \, #, or overlay digit
-                let is_valid_table_id = matches!(sym1, '/' | '\\' | '#' | '0'..='9');
-                if is_valid_table_id && sym2.is_ascii_graphic() {
-                    msg.symbol_table_id = Some(sym1);
-                    msg.symbol_code = Some(sym2);
-                    msg.comment = String::from_utf8_lossy(&remainder[2..]).trim_end().to_string();
+                // The first character after E/W is the APRS symbol
+                // It can be any printable ASCII (except space/control)
+                if sym_char.is_ascii_graphic() && !sym_char.is_ascii_whitespace() {
+                    msg.symbol_table_id = Some('/');  // Default to primary table
+                    msg.symbol_code = Some(sym_char);
+                    
+                    // Rest is comment
+                    if remainder.len() > 1 {
+                        msg.comment = String::from_utf8_lossy(&remainder[1..]).trim_end().to_string();
+                    }
                 } else {
-                    // No explicit symbol in remainder - use default (primary table, no code)
-                    // This means the remainder is all comment
+                    // No valid symbol found
                     msg.comment = String::from_utf8_lossy(remainder).trim_end().to_string();
                 }
-            } else if !remainder.is_empty() {
-                msg.comment = String::from_utf8_lossy(remainder).trim_end().to_string();
             }
         }
         
-        // If no symbol was found, use default primary table
+        // If no symbol was found, use default primary table with '?'
         if msg.symbol_table_id.is_none() {
             msg.symbol_table_id = Some('/');
             msg.symbol_code = Some('?');
@@ -295,9 +300,11 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
         }
     }
     
-    // Format A: DDMM.MM + N/S + / + DDDMM.MM + E/W
-    // Example: 4534.19N/00927.35E
-    // The E/W at end IS the symbol code, '/' is just a separator
+    // Format A: DDMM.MM + N/S + / + DDDMM.MM + E/W + [symbol]
+    // Example: 4534.19N/00927.35E#  (18 chars for position, symbol at 18)
+    // - '/' at offset+8 is the SYMBOL TABLE ID
+    // - E/W at offset+17 is the longitude direction
+    // - Symbol code is at offset+18
     if offset + 18 <= data.len() {
         let lat_str = String::from_utf8_lossy(&data[offset..offset + 7]);
         let ns = data[offset + 7] as char;
@@ -312,17 +319,19 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
                         let mut lon = lon_deg + lon_min / 60.0;
                         if ns == 'S' || ns == 's' { lat = -lat; }
                         if ew == 'W' || ew == 'w' { lon = -lon; }
-                        // E/W at offset+17 is the SYMBOL CODE
-                        // consumed=17 points to E/W which IS the symbol
-                        return Some((lat, lon, offset + 17));
+                        // Symbol is at offset+18 (after the E/W direction)
+                        return Some((lat, lon, offset + 18));
                     }
                 }
             }
         }
     }
     
-    // Format B: DDMM.MM + N/S + DDDMM.MM + E/W (17 chars, no / separator)
-    // Example: 4534.19N00927.35E
+    // Format B: DDMM.MM + N/S + DDDMM.MM + E/W + [symbol] (17+ chars, no / separator)
+    // Example: 4534.19N00927.35E#
+    // - No explicit symbol table, uses default '/'
+    // - E/W at offset+16 is the longitude direction
+    // - Symbol code is at offset+17
     if offset + 17 <= data.len() {
         let lat_str = String::from_utf8_lossy(&data[offset..offset + 7]);
         let ns = data[offset + 7] as char;
@@ -336,17 +345,19 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
                         let mut lon = lon_deg + lon_min / 60.0;
                         if ns == 'S' || ns == 's' { lat = -lat; }
                         if ew == 'W' || ew == 'w' { lon = -lon; }
-                        // Format B: E/W at offset+16 is the SYMBOL CODE
-                        // consumed=16 points to E/W which IS the symbol
-                        return Some((lat, lon, offset + 16));
+                        // Symbol is at offset+17 (after the E/W direction)
+                        return Some((lat, lon, offset + 17));
                     }
                 }
             }
         }
     }
     
-    // Format C: DDMM.MM + N/S + / + DDDMM.MM + E/W (15 chars, no decimal on minutes)
-    // Example: 4534.N/00927.E
+    // Format C: DDMM.MM + N/S + / + DDDMM.MM + E/W + [symbol] (15+ chars, no decimal on minutes)
+    // Example: 4534.N/00927.E#
+    // - '/' at offset+7 is the SYMBOL TABLE ID
+    // - E/W at offset+14 is the longitude direction
+    // - Symbol code is at offset+15
     if offset + 15 <= data.len() {
         let lat_str = String::from_utf8_lossy(&data[offset..offset + 6]);
         if let Some((lat_deg, lat_min)) = parse_deg_min(&lat_str) {
@@ -362,9 +373,8 @@ fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, usize)> {
                         let mut lon = lon_deg + lon_min / 60.0;
                         if ns == 'S' || ns == 's' { lat = -lat; }
                         if ew == 'W' || ew == 'w' { lon = -lon; }
-                        // Format C: E/W at lon_start+7 is the SYMBOL CODE
-                        // consumed=lon_start+7 points to E/W which IS the symbol
-                        return Some((lat, lon, lon_start + 7));
+                        // Symbol is at lon_start+8 (after the E/W direction)
+                        return Some((lat, lon, lon_start + 8));
                     }
                 }
             }
