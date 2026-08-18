@@ -6,6 +6,7 @@
 //! - ToastOverlay for notifications
 
 mod aprs;
+mod aprs_icons;
 mod audio;
 mod gps;
 mod kiss;

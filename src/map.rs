@@ -16,6 +16,7 @@ use libshumate::{
 };
 
 use crate::aprs::APRSMessage;
+use crate::aprs_icons::APRSIconRenderer;
 
 // ============================================================================
 // Constants
@@ -355,6 +356,8 @@ pub struct MapManager {
     has_centered_on_user: bool,
     /// Current dark mode state (for marker styling)
     dark_mode: bool,
+    /// APRS icon renderer
+    icon_renderer: APRSIconRenderer,
 }
 
 impl MapManager {
@@ -395,6 +398,7 @@ impl MapManager {
             viewport_listener_id: None,
             has_centered_on_user: false,
             dark_mode: true,
+            icon_renderer: APRSIconRenderer::new(),
         }
     }
 
@@ -574,33 +578,68 @@ impl MapManager {
             self.marker_layer.remove_marker(&old_marker);
         }
 
-        // Create widget for marker
-        let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        container.add_css_class("aprs-marker");
+        // Icon size (20x20 base, scaled for map markers)
+        let icon_size = 24;
 
-        // Get APRS symbol
-        let symbol_char = get_aprs_symbol(msg);
-        let symbol_label = gtk::Label::new(Some(&symbol_char.to_string()));
-        symbol_label.add_css_class("aprs-symbol");
+        // Get the APRS icon surface
+        let icon_surface = self.icon_renderer.get_icon(
+            msg.symbol_table_id,
+            msg.symbol_code,
+            icon_size,
+        );
 
-        let call_label = gtk::Label::new(Some(&msg.from_callsign));
-        call_label.add_css_class("aprs-callsign");
+        // Create a DrawingArea to render the icon
+        let drawing_area = gtk::DrawingArea::new();
+        drawing_area.set_size_request(icon_size, icon_size);
 
-        container.append(&symbol_label);
-        container.append(&call_label);
+        // Take ownership of the surface for the closure
+        let surface = icon_surface.clone();
+        let callsign = msg.from_callsign.clone();
+        let comment = msg.comment.clone();
+        let is_dark = self.dark_mode;
 
-        // Create marker with child widget using builder
+        // Since we know the icon size, use it directly
+        let icon_width = icon_size as f64;
+        let icon_height = icon_size as f64;
+
+        drawing_area.set_draw_func(move |area, cr, width, height| {
+            // Draw the icon surface scaled to fit
+            // Scale to fit the drawing area while maintaining aspect ratio
+            let scale_x = width as f64 / icon_width;
+            let scale_y = height as f64 / icon_height;
+            let scale = scale_x.min(scale_y);
+            
+            let scaled_width = icon_width * scale;
+            let scaled_height = icon_height * scale;
+            let offset_x = (width as f64 - scaled_width) / 2.0;
+            let offset_y = (height as f64 - scaled_height) / 2.0;
+            
+            cr.set_source_surface(&surface, offset_x, offset_y);
+            cr.paint().expect("Failed to paint icon");
+            
+            // Draw callsign label below icon (optional, could be toggled)
+            // For now just draw the icon
+        });
+
+        // Create tooltip with station info
+        let tooltip_text = format!("{} - {}", msg.from_callsign, 
+            if msg.comment.is_empty() { "No comment" } else { &msg.comment });
+        drawing_area.set_tooltip_text(Some(&tooltip_text));
+
+        // Create marker with icon
         let marker = Marker::builder()
             .latitude(msg.position_lat)
             .longitude(msg.position_lon)
-            .child(&container)
+            .child(&drawing_area)
             .build();
 
         self.marker_layer.add_marker(&marker);
         self.station_markers.insert(key, marker);
         
-        eprintln!("[map] Added APRS station: {} at ({:.4}, {:.4})", 
-                  msg.from_callsign, msg.position_lat, msg.position_lon);
+        eprintln!("[map] Added APRS station: {} at ({:.4}, {:.4}), symbol: {}{}", 
+                  msg.from_callsign, msg.position_lat, msg.position_lon,
+                  msg.symbol_table_id.unwrap_or('/'), 
+                  msg.symbol_code.unwrap_or('?'));
     }
 
     /// Get user position
@@ -625,21 +664,6 @@ impl MapManager {
 impl Default for MapManager {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Get APRS symbol character based on message type
-fn get_aprs_symbol(msg: &APRSMessage) -> char {
-    match msg.msg_type {
-        crate::aprs::APRSType::Position => '>',
-        crate::aprs::APRSType::Object => 'O',
-        crate::aprs::APRSType::Weather => '@',
-        crate::aprs::APRSType::Message => '*',
-        _ => '?',
     }
 }
 

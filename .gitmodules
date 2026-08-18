@@ -1,3 +1,6 @@
 [submodule "aprs-symbols"]
 	path = aprs-symbols
 	url = https://github.com/hessu/aprs-symbols
+[submodule "symbols/aprs-symbols"]
+	path = symbols/aprs-symbols
+	url = https://github.com/hessu/aprs-symbols

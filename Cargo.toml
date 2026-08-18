@@ -24,6 +24,7 @@ libshumate = { version = "0.8", features = ["v1_2"] }
 
 # Image processing for APRS symbol spritesheets
 image = "0.25"
+png = "0.17"
 
 # Desktop notifications
 libnotify = "1.0"

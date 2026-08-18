@@ -32,6 +32,12 @@ pub struct APRSMessage {
     pub comment: String,
     pub relay_callsign: String,
     
+    // APRS Symbol (symbol table ID and symbol code from position report)
+    // Symbol table ID: '/' (primary) or '\\' (alternate)
+    // Symbol code: character from APRS symbol table
+    pub symbol_table_id: Option<char>,
+    pub symbol_code: Option<char>,
+    
     // Message-specific
     pub msg_body: Option<String>,
     pub to_callsign_msg: Option<String>,
@@ -237,13 +243,19 @@ fn decode_position(msg: &mut APRSMessage, payload: &[u8]) {
             // Look for symbol table ID (first char after position)
             // and symbol code (second char)
             if remainder.len() >= 2 {
-                // remainder[0] = symbol table ID, remainder[1] = symbol code
-                let comment_start = if remainder[0].is_ascii_graphic() && remainder[1].is_ascii_graphic() {
-                    2
+                let sym1 = remainder[0] as char;
+                let sym2 = remainder[1] as char;
+                
+                // Valid APRS symbol: symbol table ID is / or \, symbol code is graphic
+                if (sym1 == '/' || sym1 == '\\') && sym2.is_ascii_graphic() {
+                    msg.symbol_table_id = Some(sym1);
+                    msg.symbol_code = Some(sym2);
+                    msg.comment = String::from_utf8_lossy(&remainder[2..]).trim_end().to_string();
                 } else {
-                    0
-                };
-                msg.comment = String::from_utf8_lossy(&remainder[comment_start..]).trim_end().to_string();
+                    msg.comment = String::from_utf8_lossy(remainder).trim_end().to_string();
+                }
+            } else if !remainder.is_empty() {
+                msg.comment = String::from_utf8_lossy(remainder).trim_end().to_string();
             }
         }
     } else {
