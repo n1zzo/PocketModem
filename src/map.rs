@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use gtk::prelude::*;
 use libshumate::{
-    Map, MapLayer, MapSource, Marker, MarkerLayer,
+    prelude::LocationExt,
+    Map, MapLayer, Marker, MarkerLayer,
     TileDownloader, VectorRenderer, Viewport,
 };
 
@@ -168,12 +169,17 @@ impl MapManager {
         let viewport = map.viewport().expect("Map should have a Viewport");
         
         // Set zoom limits
-        viewport.set_max_zoom_level(18.0);
-        viewport.set_min_zoom_level(2.0);
+        viewport.set_max_zoom_level(18);
+        viewport.set_min_zoom_level(2);
         
-        // Set default position
+        // Set default position using builder pattern
+        let vp = Viewport::builder()
+            .zoom_level(DEFAULT_ZOOM)
+            .latitude(DEFAULT_LAT)
+            .longitude(DEFAULT_LON)
+            .build();
+        // Note: Viewport is already created by Map::new(), so we use the setters
         viewport.set_zoom_level(DEFAULT_ZOOM);
-        viewport.set_location(DEFAULT_LAT, DEFAULT_LON);
         
         eprintln!("[map] Created libshumate Map with VectorRenderer");
         eprintln!("[map] Tile source: {}", GNOME_TILE_URL);
@@ -224,8 +230,14 @@ impl MapManager {
                 // Add marker layer
                 self.map.add_layer(&self.marker_layer);
                 
+                // Clone renderer before moving into vector_renderer
+                let renderer_for_viewport = renderer.clone();
+                
                 self.map_layer = Some(map_layer);
                 self.vector_renderer = Some(renderer);
+                
+                // Set reference map source for viewport
+                self.viewport.set_reference_map_source(Some(&renderer_for_viewport));
                 
                 eprintln!("[map] Map initialized with vector tiles");
             }
@@ -270,10 +282,6 @@ impl MapManager {
             self.marker_layer.remove_marker(&old_marker);
         }
 
-        // Create marker
-        let marker = Marker::new();
-        marker.set_location(msg.position_lat, msg.position_lon);
-
         // Create widget for marker
         let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         container.add_css_class("aprs-marker");
@@ -289,7 +297,12 @@ impl MapManager {
         container.append(&symbol_label);
         container.append(&call_label);
 
-        marker.set_child(Some(&container));
+        // Create marker with child widget using builder
+        let marker = Marker::builder()
+            .latitude(msg.position_lat)
+            .longitude(msg.position_lon)
+            .child(&container)
+            .build();
 
         self.marker_layer.add_marker(&marker);
         self.station_markers.insert(key, marker);
@@ -336,7 +349,7 @@ fn get_aprs_symbol(msg: &APRSMessage) -> char {
 
 impl MapManager {
     /// Legacy method for current main.rs compatibility
-    pub fn load_aprs_symbols(&mut self, _path: std::path::Path) -> Result<(), String> {
+    pub fn load_aprs_symbols(&mut self, _path: &std::path::Path) -> Result<(), String> {
         // APRS symbol spritesheets not used with libshumate vector renderer
         // Symbols are rendered via the vector tile style
         Ok(())
@@ -387,17 +400,17 @@ impl MapManager {
 
     /// Legacy method
     pub fn pan(&mut self, dx: f64, dy: f64) {
-        if let (Some(lat), Some(lon)) = self.get_user_position() {
+        if let Some((lat, lon)) = self.get_user_position() {
             // Simple pan by adjusting center
             let zoom = self.viewport.zoom_level();
             let scale = 1.0 / (2_f64.powf(zoom) * 256.0);
             self.map.center_on(lat + dy * scale, lon + dx * scale);
         }
     }
-
+    
     /// Legacy method
     pub fn center_on_user(&mut self) {
-        if let (Some(lat), Some(lon)) = self.get_user_position() {
+        if let Some((lat, lon)) = self.get_user_position() {
             self.map.center_on(lat, lon);
         }
     }
