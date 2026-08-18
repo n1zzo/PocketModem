@@ -33,14 +33,34 @@ impl APRSIconRenderer {
     }
 
     fn load_sprites() -> [Option<ImageSurface>; 3] {
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".to_string());
+        eprintln!("[aprs_icons] CWD: {}", cwd);
+        
         let mut sprites: [Option<ImageSurface>; 3] = [None, None, None];
         
-        let paths = [
-            "symbols/aprs-symbols/png",
-            "/usr/share/aprs-symbols",
-            "./symbols/aprs-symbols/png",
-            "../symbols/aprs-symbols/png",
+        // Try multiple relative and absolute paths
+        let exe_path = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        let mut paths = vec![
+            "symbols/aprs-symbols/png".to_string(),
+            "./symbols/aprs-symbols/png".to_string(),
+            "../symbols/aprs-symbols/png".to_string(),
         ];
+        
+        // Add exe directory as fallback
+        // Exe is at: /path/to/PocketModem/target/release/pocket-modem
+        // Symbols are at: /path/to/PocketModem/symbols/aprs-symbols/png/
+        if let Some(ref exe_dir) = exe_path {
+            // ../../ from target/release to PocketModem root
+            if let Some(parent) = exe_dir.parent() {
+                let project_root = parent.parent().unwrap_or(parent);
+                paths.push(format!("{}/symbols/aprs-symbols/png", project_root.display()));
+                eprintln!("[aprs_icons] exe_dir={}, project_root={}", exe_dir.display(), project_root.display());
+            }
+        }
+        
+        // Add common system paths
+        paths.push("/usr/share/aprs-symbols".to_string());
+        paths.push("/usr/local/share/aprs-symbols".to_string());
         
         // Try sizes from large to small for best quality
         for size in [128, 64, 48, 32, 24] {
