@@ -92,10 +92,14 @@ impl APRSIconRenderer {
             .map_err(|e| e.to_string())
     }
 
-    /// Get icon for symbol (table_id: '/' or '\\', code: the APRS symbol character)
+    /// Get icon for symbol
+    /// table_id: '/' (primary), '\\' (secondary), or '#'/0-9 (overlay)
     pub fn get_icon(&self, table_id: Option<char>, code: Option<char>, size: i32) -> ImageSurface {
         let table = match table_id.unwrap_or('/') {
-            '\\' => 1,
+            '/' => 0,     // Primary table
+            '\\' => 1,    // Secondary table  
+            '#' => 2,     // Overlay characters
+            '0'..='9' => 2, // Overlay on base table - use overlay sprites
             _ => 0,
         };
         let sym = code.unwrap_or('?');
