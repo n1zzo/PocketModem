@@ -587,11 +587,12 @@ impl MapManager {
             msg.symbol_code,
             icon_size,
         );
-        // Get the APRS icon surface
-
+        
         // Create a DrawingArea to render the icon
         let drawing_area = gtk::DrawingArea::new();
         drawing_area.set_size_request(icon_size, icon_size);
+        drawing_area.set_hexpand(false);
+        drawing_area.set_vexpand(false);
 
         // Take ownership of the surface for the closure
         let surface = icon_surface.clone();
@@ -600,11 +601,14 @@ impl MapManager {
         let icon_width = icon_size as f64;
         let icon_height = icon_size as f64;
         
-        // Clone comment for tooltip
+        // Clone data for closures
         let comment_for_tooltip = if msg.comment.is_empty() { String::new() } else { msg.comment.clone() };
+        let callsign_for_debug = msg.from_callsign.clone();
 
+        let surface_for_closure = surface.clone();
+        let callsign_for_draw = callsign_for_debug.clone();
         drawing_area.set_draw_func(move |area, cr, width, height| {
-            // Draw the APRS icon directly
+            // Draw the APRS icon
             let scale_x = width as f64 / icon_width;
             let scale_y = height as f64 / icon_height;
             let scale = scale_x.min(scale_y);
@@ -614,8 +618,8 @@ impl MapManager {
             let offset_x = (width as f64 - scaled_width) / 2.0;
             let offset_y = (height as f64 - scaled_height) / 2.0;
             
-            cr.set_source_surface(&surface, offset_x, offset_y);
-            let _ = cr.paint();
+            cr.set_source_surface(&surface_for_closure, offset_x, offset_y);
+            cr.paint().ok();
         });
 
         // Create tooltip with station info
@@ -632,20 +636,16 @@ impl MapManager {
 
         self.marker_layer.add_marker(&marker);
         
-        // Force the DrawingArea to realize and queue a redraw
-        // GTK4 doesn't automatically draw new child widgets - need to schedule a draw
-        drawing_area.set_size_request(icon_size, icon_size);
-        drawing_area.set_visible(true);
-        
-        // Use tick_callback to ensure draw happens after widget is realized
+        // Schedule draw after widget is realized
         let weak_drawing_area = drawing_area.downgrade();
         drawing_area.add_tick_callback(move |area, _clock| {
             if let Some(da) = weak_drawing_area.upgrade() {
+                da.queue_allocate();
                 da.queue_draw();
             }
-            glib::ControlFlow::Break  // Don't continue calling, only once
+            glib::ControlFlow::Break
         });
-        
+
         self.station_markers.insert(key, marker);
     }
 

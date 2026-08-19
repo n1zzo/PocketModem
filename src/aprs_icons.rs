@@ -103,35 +103,16 @@ impl APRSIconRenderer {
         let mut buf = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
         
-        eprintln!("[aprs_icons] PNG: {}x{}, color_type={:?}", 
-                  info.width, info.height, info.color_type);
-        
-        // PNG stores as RGBA: [R=0, G=1, B=2, A=3]
-        // Cairo ARGB32: [A, R, G, B] as a single 32-bit value, or [B, G, R, A] bytes on little-endian
-        // So we need to reorder: [R, G, B, A] → [B, G, R, A]
-        // PNG stores as RGBA: [R=0, G=1, B=2, A=3]
-        // Cairo ARGB32: [A, R, G, B] as 32-bit value
-        // On little-endian this is stored as [B, G, R, A] in memory
-        let mut argb = Vec::with_capacity(info.width as usize * info.height as usize * 4);
-        for px in buf.chunks(4) {
-            if px.len() >= 4 {
-                // byte0=px[0]=R, byte1=px[1]=G, byte2=px[2]=B, byte3=px[3]=A
-                // Cairo needs [A, R, G, B] on little-endian: [B, G, R, A]
-                argb.push(px[2]); // B (byte 0)
-                argb.push(px[1]); // G (byte 1)
-                argb.push(px[0]); // R (byte 2)
-                argb.push(px[3]); // A (byte 3)
-            }
-        }
+        // Store raw RGBA data
         
         let stride = ((info.width * 4 + 3) & !3) as i32;
-        ImageSurface::create_for_data(argb, Format::ARgb32, info.width as i32, info.height as i32, stride)
+        ImageSurface::create_for_data(buf, Format::ARgb32, info.width as i32, info.height as i32, stride)
             .map_err(|e| e.to_string())
     }
 
     /// Get icon for symbol
     /// table_id: '/' (primary), '\\' (secondary), or '#'/0-9 (overlay)
-    pub fn get_icon(&self, table_id: Option<char>, code: Option<char>, size: i32) -> ImageSurface {
+    pub fn get_icon(&mut self, table_id: Option<char>, code: Option<char>, size: i32) -> ImageSurface {
         let table = match table_id.unwrap_or('/') {
             '/' => 0,     // Primary table
             '\\' => 1,    // Secondary table  
@@ -220,7 +201,62 @@ impl APRSIconRenderer {
         idx
     }
 
-    fn render_icon(&self, table: usize, idx: usize, size: i32) -> ImageSurface {
+    fn render_icon(&mut self, table: usize, idx: usize, size: i32) -> ImageSurface {
+        let surf = ImageSurface::create(Format::ARgb32, size, size)
+            .expect("icon surface");
+        let cr = Context::new(&surf).expect("cairo context");
+        
+        if let Some(ref mut sprite) = self.sprites[table] {
+            let w = sprite.width() as i32;
+            let h = sprite.height() as i32;
+            let sprite_size = w / COLS as i32;
+            let col = idx % COLS;
+            let row = idx / COLS;
+            let sx = col as f64 * sprite_size as f64;
+            let sy = row as f64 * sprite_size as f64;
+            
+            // Read sprite data (clone to get owned copy)
+            let sprite_data = match sprite.data() {
+                Ok(d) => d.to_vec(),
+                Err(e) => {
+                    eprintln!("[aprs_icons] Failed to read sprite data: {}", e);
+                    return surf;
+                }
+            };
+            
+            // Create sprite surface from owned data
+            let stride = ((w * 4 + 3) & !3) as i32;
+            let sprite_surf = match ImageSurface::create_for_data(
+                sprite_data,
+                Format::ARgb32,
+                w,
+                h,
+                stride
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[aprs_icons] Failed to create sprite surface: {}", e);
+                    return surf;
+                }
+            };
+            
+            // Scale: sprite_size -> size
+            cr.scale(size as f64 / sprite_size as f64, size as f64 / sprite_size as f64);
+            cr.set_source_surface(&sprite_surf, -sx, -sy);
+            cr.paint().ok();
+        } else {
+            // Fallback: colored circle
+            let (r, g, b) = Self::fallback_color(idx);
+            cr.set_source_rgb(r, g, b);
+            cr.paint().ok();
+        }
+        
+        surf
+    }
+    
+    // Keep old implementation in comments for reference:
+    /*
+    fn render_icon_OLD(&self, table: usize, idx: usize, size: i32) -> ImageSurface {
         let surf = ImageSurface::create(Format::ARgb32, size, size)
             .expect("icon surface");
         let cr = Context::new(&surf).expect("cairo context");
@@ -259,7 +295,9 @@ impl APRSIconRenderer {
         
         surf
     }
+    */
 
+    #[allow(dead_code)]
     fn fallback_color(idx: usize) -> (f64, f64, f64) {
         match idx / 16 {
             0 => (1.0, 0.75, 0.0),     // 0-9: yellow

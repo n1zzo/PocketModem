@@ -1230,13 +1230,6 @@ fn create_ui(
             let mut msgs = aprs_msgs.lock().unwrap();
             msgs.push(msg.clone());
             if msgs.len() > 100 { msgs.remove(0); }
-            
-            eprintln!("[pocket-modem] APRS: {} -> {}", msg.from_callsign, msg.to_callsign);
-            
-            #[cfg(feature = "notifications")]
-            if let Err(e) = show_aprs_notification(&msg.from_callsign, &msg.from_callsign) {
-                eprintln!("[pocket-modem] Notification error: {}", e);
-            }
         });
     }
     
@@ -1383,10 +1376,6 @@ fn create_ui(
                     if let Some(msg) = msgs.get(i) {
                         add_aprs_message_to_list(msg, &aprs_list_box_clone, &aprs_empty_label_clone, my_lat, my_lon);
                         if let Ok(mut map) = map_manager_clone.lock() {
-                            // update_station takes APRSMessage directly for libshumate
-                            eprintln!("[map] Adding station to map: {} at ({:.4}, {:.4}) symbol: {}{}", 
-                                msg.from_callsign, msg.position_lat, msg.position_lon,
-                                msg.symbol_table_id.unwrap_or('/'), msg.symbol_code.unwrap_or('?'));
                             map.update_station(msg);
                         }
                         new_last = i + 1;

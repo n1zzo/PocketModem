@@ -953,7 +953,6 @@ fn process_packet(
         }
         // KISS DATA frames (0x00) - raw AX.25 packets from AFSK decoder
         0x00 => {
-            // KISS DATA frames (0x00) - raw AX.25 packets from AFSK decoder
             if !pkt.payload.is_empty() {
                 if let Some(msg) = aprs::parse_ax25_frame(&pkt.payload) {
                     if let Some(ref cb) = callbacks.lock().unwrap().aprs {
