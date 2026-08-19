@@ -578,9 +578,10 @@ impl MapManager {
             self.marker_layer.remove_marker(&old_marker);
         }
 
-        // Icon size + banner height
+        // Icon size + banner height (2 lines of text)
         let icon_size = 32;
-        let banner_height = 14;
+        let banner_height = 28;
+        let total_width = 48;  // Wider for callsign + distance
         let total_height = icon_size + banner_height;
 
         // Get the APRS icon surface
@@ -592,7 +593,7 @@ impl MapManager {
         
         // Create a DrawingArea to render the icon
         let drawing_area = gtk::DrawingArea::new();
-        drawing_area.set_size_request(icon_size, total_height);
+        drawing_area.set_size_request(total_width, total_height);
         drawing_area.set_hexpand(false);
         drawing_area.set_vexpand(false);
 
@@ -616,8 +617,6 @@ impl MapManager {
         };
 
         let surface_for_closure = surface.clone();
-        let banner_text = format!("{} {}", callsign_for_draw, distance_text);
-        let text_len = banner_text.len() as f64;
         
         drawing_area.set_draw_func(move |area, cr, width, height| {
             // Draw the APRS icon
@@ -636,24 +635,26 @@ impl MapManager {
             // Draw callsign + distance banner below icon
             let w = width as f64;
             let h = height as f64;
-            let banner_y = h - 12.0;
             
             // Banner background
             cr.set_source_rgba(0.0, 0.0, 0.0, 0.7);
-            cr.rectangle(0.0, banner_y, w, 12.0);
+            cr.rectangle(0.0, icon_height as f64, w, banner_height as f64);
             cr.fill().ok();
             
-            // Banner text (centered)
+            // Text settings
             cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
             cr.set_font_size(8.0);
             
-            // Center text - estimate width based on character count
-            let char_width = 5.0; // pixels per char at font size 8
-            let text_width = text_len * char_width;
-            let text_x = (w - text_width) / 2.0;
-            cr.move_to(text_x, banner_y + 9.0);
-            cr.show_text(&banner_text).ok();
+            // Line 1: callsign (centered)
+            let callsign_x = (w - callsign_for_draw.len() as f64 * 5.0) / 2.0;
+            cr.move_to(callsign_x, icon_height as f64 + 11.0);
+            cr.show_text(&callsign_for_draw).ok();
+            
+            // Line 2: distance (centered)
+            let dist_x = (w - distance_text.len() as f64 * 5.0) / 2.0;
+            cr.move_to(dist_x, icon_height as f64 + 22.0);
+            cr.show_text(&distance_text).ok();
         });
 
         // Create tooltip with station info
