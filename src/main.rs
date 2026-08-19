@@ -33,7 +33,7 @@ use adw::prelude::*;
 use adw;
 
 /// Calculate Maidenhead locator from lat/lon
-fn maidenhead_locator(lat: f64, lon: f64) -> String {
+fn calculate_maidenhead(lat: f64, lon: f64) -> String {
     if lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 {
         return "-----".to_string();
     }
@@ -355,13 +355,18 @@ fn create_ui(
     content_box.set_vexpand(true);
     content_box.set_halign(gtk::Align::Center);
     
-    // --- Status indicators ---
+    // --- Status indicators (clickable buttons) ---
     let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 32);
     status_row.set_halign(gtk::Align::Center);
     status_row.set_hexpand(false);
     status_row.set_margin_top(16);
     status_row.set_margin_bottom(16);
     
+    // MODEM button
+    let modem_status_btn = gtk::Button::new();
+    modem_status_btn.add_css_class("flat");
+    modem_status_btn.add_css_class("status-btn");
+    modem_status_btn.set_tooltip_text(Some("Modem Settings"));
     let modem_status_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let modem_icon = gtk::Image::from_icon_name("network-wireless-symbolic");
     modem_icon.set_pixel_size(28);
@@ -373,7 +378,13 @@ fn create_ui(
     modem_status_box.append(&modem_icon);
     modem_status_box.append(&modem_label);
     modem_status_box.append(&modem_status_label);
+    modem_status_btn.set_child(Some(&modem_status_box));
     
+    // GPS button
+    let gps_status_btn = gtk::Button::new();
+    gps_status_btn.add_css_class("flat");
+    gps_status_btn.add_css_class("status-btn");
+    gps_status_btn.set_tooltip_text(Some("GPS / APRS Settings"));
     let gps_status_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let gps_icon = gtk::Image::from_icon_name("location-services-active-symbolic");
     gps_icon.set_pixel_size(28);
@@ -385,7 +396,13 @@ fn create_ui(
     gps_status_box.append(&gps_icon);
     gps_status_box.append(&gps_led);
     gps_status_box.append(&gps_status_label);
+    gps_status_btn.set_child(Some(&gps_status_box));
     
+    // AUDIO button
+    let audio_status_btn = gtk::Button::new();
+    audio_status_btn.add_css_class("flat");
+    audio_status_btn.add_css_class("status-btn");
+    audio_status_btn.set_tooltip_text(Some("Audio Settings"));
     let audio_status_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let audio_icon = gtk::Image::from_icon_name("audio-volume-medium-symbolic");
     audio_icon.set_pixel_size(28);
@@ -397,10 +414,11 @@ fn create_ui(
     audio_status_box.append(&audio_icon);
     audio_status_box.append(&audio_label);
     audio_status_box.append(&audio_status_label);
+    audio_status_btn.set_child(Some(&audio_status_box));
     
-    status_row.append(&modem_status_box);
-    status_row.append(&gps_status_box);
-    status_row.append(&audio_status_box);
+    status_row.append(&modem_status_btn);
+    status_row.append(&gps_status_btn);
+    status_row.append(&audio_status_btn);
     
     content_box.append(&status_row);
     
@@ -1119,78 +1137,196 @@ fn create_ui(
     carousel_box.append(&indicator);
     
     // =========================================================================
-    // SETTINGS PAGE
+    // SETTINGS PAGE (all settings combined)
     // =========================================================================
     let settings_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     settings_page.set_size_request(330, 700);
     settings_page.set_hexpand(false);
-    
-    let settings_clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    settings_clamp.set_size_request(330, 700);
-    settings_clamp.set_hexpand(false);
-    
-    let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     
     let settings_scroll = gtk::ScrolledWindow::new();
     settings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     settings_scroll.set_hexpand(false);
     settings_scroll.set_vexpand(true);
     
-    let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 24);
+    let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 16);
     settings_box.set_margin_top(12);
     settings_box.set_margin_start(12);
     settings_box.set_margin_end(12);
     settings_box.set_margin_bottom(12);
     
-    // === Squelch section ===
-    let squelch_group = adw::PreferencesGroup::builder()
-        .title("Squelch")
+    // === MODEM Section ===
+    let modem_group = adw::PreferencesGroup::builder()
+        .title("Modem")
         .build();
     
-    let squelch_row = adw::ActionRow::new();
-    squelch_row.set_title("Squelch Level");
+    // Squelch level using SpinRow
+    let radio_sq = Arc::clone(radio);
+    let settings_sq = settings as *const SettingsManager as *mut SettingsManager;
+    let last_sent_sq: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(saved_squelch));
     
-    let squelch_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 8.0, 1.0);
-    squelch_scale.set_value(saved_squelch as f64);
-    squelch_scale.set_draw_value(false);
-    squelch_scale.set_has_origin(true);
-    squelch_scale.set_hexpand(false);
+    let adj = gtk::Adjustment::new(saved_squelch as f64, 0.0, 8.0, 1.0, 0.0, 0.0);
+    let squelch_row = adw::SpinRow::builder()
+        .title("Squelch Level")
+        .subtitle("Signal threshold for audio output")
+        .adjustment(&adj)
+        .build();
+    squelch_row.set_digits(0);
+    squelch_row.set_numeric(true);
+    squelch_row.set_snap_to_ticks(true);
     
-    let squelch_value_label = gtk::Label::new(Some(&saved_squelch.to_string()));
-    squelch_value_label.set_width_request(20);
-    squelch_value_label.add_css_class("squelch-value");
-    
-    let radio_squelch = Arc::clone(radio);
-    let settings_clone = settings as *const SettingsManager as *mut SettingsManager;
-    let last_sent: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(saved_squelch));
-    let squelch_label_clone = squelch_value_label.clone();
-    
-    squelch_scale.connect_value_changed(move |scale| {
-        let level = scale.value().round() as u8;
-        squelch_label_clone.set_text(&format!("{}", level));
-        
-        if level != last_sent.load(std::sync::atomic::Ordering::SeqCst) {
-            unsafe { (*settings_clone).set_squelch(level); }
-            
-            let radio_clone = radio_squelch.clone();
-            let sent = Arc::clone(&last_sent);
+    // Connect to adjustment's value-changed signal
+    let sent_clone = Arc::clone(&last_sent_sq);
+    let r_clone = Arc::clone(&radio_sq);
+    let s_clone = settings_sq;
+    adj.connect_value_changed(move |adj| {
+        let level = adj.value() as u8;
+        if level != sent_clone.load(std::sync::atomic::Ordering::SeqCst) {
+            unsafe { (*s_clone).set_squelch(level); }
+            let r = r_clone.clone();
+            let sent = Arc::clone(&sent_clone);
             std::thread::spawn(move || {
-                if let Ok(r) = radio_clone.lock() { let _ = r.set_squelch(level); }
+                if let Ok(r) = r.lock() { let _ = r.set_squelch(level); }
                 sent.store(level, std::sync::atomic::Ordering::SeqCst);
             });
         }
     });
+    modem_group.add(&squelch_row);
     
-    squelch_row.add_suffix(&squelch_scale);
-    squelch_row.add_suffix(&squelch_value_label);
-    squelch_row.set_activatable_widget(Some(&squelch_scale));
-    squelch_group.add(&squelch_row);
-    settings_box.append(&squelch_group);
+    // TX Power using ToggleGroup
+    let radio_tg = Arc::clone(radio);
+    let settings_tg = settings as *const SettingsManager as *mut SettingsManager;
+    let initial_high = unsafe { (*settings).tx_power_high() };
+    
+    let toggle_group = adw::ToggleGroup::builder()
+        .homogeneous(true)
+        .build();
+    
+    let toggle_low = adw::Toggle::builder()
+        .name("low")
+        .child(&gtk::Label::new(Some("Low")))
+        .build();
+    
+    let toggle_high = adw::Toggle::builder()
+        .name("high")
+        .child(&gtk::Label::new(Some("High")))
+        .build();
+    
+    // IMPORTANT: Add toggles BEFORE setting active_name
+    toggle_group.add(toggle_low);
+    toggle_group.add(toggle_high);
+    
+    // Now set the active toggle by name (after toggles exist)
+    toggle_group.set_active_name(Some(if initial_high { "high" } else { "low" }));
+    
+    let radio_notify = Arc::clone(&radio_tg);
+    let settings_notify = settings_tg;
+    toggle_group.connect_active_name_notify(move |group| {
+        let is_high = group.active_name().as_deref() == Some("high");
+        unsafe { (*settings_notify).set_tx_power_high(is_high); }
+        let r = radio_notify.clone();
+        std::thread::spawn(move || {
+            if let Ok(r) = r.lock() { let _ = r.set_power(is_high); }
+        });
+    });
+    
+    let tx_power_row = adw::ActionRow::builder()
+        .title("TX Power")
+        .build();
+    tx_power_row.add_suffix(&toggle_group);
+    tx_power_row.set_activatable_widget(Some(&toggle_group));
+    modem_group.add(&tx_power_row);
+    
+    settings_box.append(&modem_group);
+    
+    // === AUDIO Section ===
+    let audio_group = adw::PreferencesGroup::builder()
+        .title("Audio")
+        .build();
+    
+    let settings_audio = settings as *const SettingsManager as *mut SettingsManager;
+    
+    let pre_emph_row = adw::SwitchRow::builder()
+        .title("Pre-Emphasis")
+        .subtitle("Boost high frequencies before TX")
+        .active(unsafe { (*settings).pre_emphasis() })
+        .build();
+    pre_emph_row.connect_notify_local(Some("active"), move |row, _| {
+        unsafe { (*settings_audio).set_pre_emphasis(row.is_active()); }
+    });
+    audio_group.add(&pre_emph_row);
+    
+    let settings_deemph = settings as *const SettingsManager as *mut SettingsManager;
+    let de_emph_row = adw::SwitchRow::builder()
+        .title("De-Emphasis")
+        .subtitle("Reduce high frequencies on RX")
+        .active(unsafe { (*settings).de_emphasis() })
+        .build();
+    de_emph_row.connect_notify_local(Some("active"), move |row, _| {
+        unsafe { (*settings_deemph).set_de_emphasis(row.is_active()); }
+    });
+    audio_group.add(&de_emph_row);
+    
+    let settings_hpf = settings as *const SettingsManager as *mut SettingsManager;
+    let hpf_row = adw::SwitchRow::builder()
+        .title("High-Pass Filter")
+        .subtitle("Remove low frequency rumble (300Hz cutoff)")
+        .active(unsafe { (*settings).high_pass_filter() })
+        .build();
+    hpf_row.connect_notify_local(Some("active"), move |row, _| {
+        unsafe { (*settings_hpf).set_high_pass_filter(row.is_active()); }
+    });
+    audio_group.add(&hpf_row);
+    
+    let settings_lpf = settings as *const SettingsManager as *mut SettingsManager;
+    let lpf_row = adw::SwitchRow::builder()
+        .title("Low-Pass Filter")
+        .subtitle("Remove high frequency hiss (3.4kHz cutoff)")
+        .active(unsafe { (*settings).low_pass_filter() })
+        .build();
+    lpf_row.connect_notify_local(Some("active"), move |row, _| {
+        unsafe { (*settings_lpf).set_low_pass_filter(row.is_active()); }
+    });
+    audio_group.add(&lpf_row);
+    
+    let settings_mic = settings as *const SettingsManager as *mut SettingsManager;
+    let mic_gains = vec!["None".to_string(), "Low".to_string(), "Medium".to_string(), "High".to_string()];
+    let mic_model = gtk::StringList::new(&mic_gains.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let current_mic = unsafe { (*settings).mic_gain() };
+    let mic_idx = mic_gains.iter().position(|g| {
+        g.to_lowercase() == current_mic.to_lowercase()
+    }).unwrap_or(0) as u32;
+    
+    let mic_gain_row = adw::ComboRow::builder()
+        .title("Mic Gain")
+        .subtitle("Adjust microphone input level")
+        .selected(mic_idx)
+        .model(&mic_model)
+        .build();
+    mic_gain_row.connect_notify_local(Some("selected"), move |row, _| {
+        let idx = row.selected() as usize;
+        if idx < mic_gains.len() {
+            unsafe { (*settings_mic).set_mic_gain(&mic_gains[idx].to_lowercase()); }
+        }
+    });
+    audio_group.add(&mic_gain_row);
+    
+    settings_box.append(&audio_group);
+    
+    // === About Section ===
+    let about_group = adw::PreferencesGroup::builder()
+        .title("About")
+        .build();
+    
+    let version_row = adw::ActionRow::builder()
+        .title("PocketModem")
+        .subtitle("Version 1.0.0 - KV4P Radio Controller")
+        .build();
+    about_group.add(&version_row);
+    
+    settings_box.append(&about_group);
     
     settings_scroll.set_child(Some(&settings_box));
-    settings_content.append(&settings_scroll);
-    settings_clamp.append(&settings_content);
-    settings_page.append(&settings_clamp);
+    settings_page.append(&settings_scroll);
     
     // =========================================================================
     // ViewStack
@@ -1209,6 +1345,221 @@ fn create_ui(
     settings_btn.connect_toggled(move |btn| {
         if btn.is_active() { stack_for_toggle.set_visible_child_name("settings"); }
         else { stack_for_toggle.set_visible_child_name("main"); }
+    });
+    
+    // =========================================================================
+    // Detail popup windows for MODEM, GPS, AUDIO
+    // =========================================================================
+    
+    // MODEM detail popup
+    let modem_detail_window = gtk::Window::builder()
+        .title("MODEM")
+        .default_width(340)
+        .default_height(300)
+        .decorated(false)
+        .modal(true)
+        .build();
+    
+    let modem_title = gtk::Label::new(Some("MODEM"));
+    modem_title.add_css_class("title-label");
+    
+    let modem_detail_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    modem_detail_box.set_margin_start(12);
+    modem_detail_box.set_margin_end(12);
+    
+    let modem_freq_row = adw::ActionRow::new();
+    modem_freq_row.set_title("Frequency");
+    let modem_freq_value = gtk::Label::new(Some("---"));
+    modem_freq_value.add_css_class("status-text");
+    modem_freq_row.add_suffix(&modem_freq_value);
+    
+    let modem_rssi_row = adw::ActionRow::new();
+    modem_rssi_row.set_title("RSSI");
+    let modem_rssi_value = gtk::Label::new(Some("---"));
+    modem_rssi_value.add_css_class("status-text");
+    modem_rssi_row.add_suffix(&modem_rssi_value);
+    
+    let modem_mode_row = adw::ActionRow::new();
+    modem_mode_row.set_title("Mode");
+    let modem_mode_value = gtk::Label::new(Some("---"));
+    modem_mode_value.add_css_class("status-text");
+    modem_mode_row.add_suffix(&modem_mode_value);
+    
+    let modem_tx_row = adw::ActionRow::new();
+    modem_tx_row.set_title("TX/RX");
+    let modem_tx_value = gtk::Label::new(Some("---"));
+    modem_tx_value.add_css_class("status-text");
+    modem_tx_row.add_suffix(&modem_tx_value);
+    
+    let modem_fw_row = adw::ActionRow::new();
+    modem_fw_row.set_title("Firmware");
+    let modem_fw_value = gtk::Label::new(Some("---"));
+    modem_fw_value.add_css_class("status-text");
+    modem_fw_row.add_suffix(&modem_fw_value);
+    
+    let modem_conn_row = adw::ActionRow::new();
+    modem_conn_row.set_title("Connection");
+    let modem_conn_value = gtk::Label::new(Some("USB"));
+    modem_conn_value.add_css_class("status-text");
+    modem_conn_row.add_suffix(&modem_conn_value);
+    
+    let modem_band_row = adw::ActionRow::new();
+    modem_band_row.set_title("Band");
+    let modem_band_value = gtk::Label::new(Some("---"));
+    modem_band_value.add_css_class("status-text");
+    modem_band_row.add_suffix(&modem_band_value);
+    
+    let modem_detail_group = adw::PreferencesGroup::new();
+    modem_detail_group.add(&modem_freq_row);
+    modem_detail_group.add(&modem_rssi_row);
+    modem_detail_group.add(&modem_mode_row);
+    modem_detail_group.add(&modem_tx_row);
+    modem_detail_group.add(&modem_fw_row);
+    modem_detail_group.add(&modem_conn_row);
+    modem_detail_group.add(&modem_band_row);
+    
+    let modem_close_btn = gtk::Button::with_label("Close");
+    let modem_win = modem_detail_window.clone();
+    modem_close_btn.connect_clicked(move |_| { modem_win.hide(); });
+    
+    modem_detail_box.append(&modem_title);
+    modem_detail_box.append(&modem_detail_group);
+    modem_detail_box.append(&modem_close_btn);
+    modem_detail_window.set_child(Some(&modem_detail_box));
+    
+    // GPS detail popup
+    let gps_detail_window = gtk::Window::builder()
+        .title("GPS")
+        .default_width(340)
+        .default_height(280)
+        .decorated(false)
+        .modal(true)
+        .build();
+    
+    let gps_title = gtk::Label::new(Some("GPS"));
+    gps_title.add_css_class("title-label");
+    
+    let gps_detail_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    gps_detail_box.set_margin_start(12);
+    gps_detail_box.set_margin_end(12);
+    
+    let gps_fix_row = adw::ActionRow::new();
+    gps_fix_row.set_title("Fix Type");
+    let gps_fix_value_detail = gtk::Label::new(Some("No GPS"));
+    gps_fix_value_detail.add_css_class("status-text");
+    gps_fix_row.add_suffix(&gps_fix_value_detail);
+    
+    let gps_sats_detail_row = adw::ActionRow::new();
+    gps_sats_detail_row.set_title("Satellites");
+    let gps_sats_detail_value = gtk::Label::new(Some("--"));
+    gps_sats_detail_value.add_css_class("status-text");
+    gps_sats_detail_row.add_suffix(&gps_sats_detail_value);
+    
+    let gps_coords_detail_row = adw::ActionRow::new();
+    gps_coords_detail_row.set_title("Coordinates");
+    let gps_coords_detail_value = gtk::Label::new(Some("---"));
+    gps_coords_detail_value.add_css_class("status-text");
+    gps_coords_detail_row.add_suffix(&gps_coords_detail_value);
+    
+    let gps_maidenhead_row = adw::ActionRow::new();
+    gps_maidenhead_row.set_title("Maidenhead");
+    let gps_maidenhead_value = gtk::Label::new(Some("---"));
+    gps_maidenhead_value.add_css_class("status-text");
+    gps_maidenhead_row.add_suffix(&gps_maidenhead_value);
+    
+    let gps_alt_detail_row = adw::ActionRow::new();
+    gps_alt_detail_row.set_title("Altitude");
+    let gps_alt_detail_value = gtk::Label::new(Some("---"));
+    gps_alt_detail_value.add_css_class("status-text");
+    gps_alt_detail_row.add_suffix(&gps_alt_detail_value);
+    
+    let gps_speed_detail_row = adw::ActionRow::new();
+    gps_speed_detail_row.set_title("Speed");
+    let gps_speed_detail_value = gtk::Label::new(Some("---"));
+    gps_speed_detail_value.add_css_class("status-text");
+    gps_speed_detail_row.add_suffix(&gps_speed_detail_value);
+    
+    let gps_detail_group = adw::PreferencesGroup::new();
+    gps_detail_group.add(&gps_fix_row);
+    gps_detail_group.add(&gps_sats_detail_row);
+    gps_detail_group.add(&gps_coords_detail_row);
+    gps_detail_group.add(&gps_maidenhead_row);
+    gps_detail_group.add(&gps_alt_detail_row);
+    gps_detail_group.add(&gps_speed_detail_row);
+    
+    let gps_close_btn = gtk::Button::with_label("Close");
+    let gps_win = gps_detail_window.clone();
+    gps_close_btn.connect_clicked(move |_| { gps_win.hide(); });
+    
+    gps_detail_box.append(&gps_title);
+    gps_detail_box.append(&gps_detail_group);
+    gps_detail_box.append(&gps_close_btn);
+    gps_detail_window.set_child(Some(&gps_detail_box));
+    
+    // AUDIO detail popup
+    let audio_detail_window = gtk::Window::builder()
+        .title("AUDIO")
+        .default_width(340)
+        .default_height(180)
+        .decorated(false)
+        .modal(true)
+        .build();
+    
+    let audio_title = gtk::Label::new(Some("AUDIO"));
+    audio_title.add_css_class("title-label");
+    
+    let audio_detail_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    audio_detail_box.set_margin_start(12);
+    audio_detail_box.set_margin_end(12);
+    
+    let audio_codec_row = adw::ActionRow::new();
+    audio_codec_row.set_title("Codec");
+    let audio_codec_value = gtk::Label::new(Some("ADPCM"));
+    audio_codec_value.add_css_class("status-text");
+    audio_codec_row.add_suffix(&audio_codec_value);
+    
+    let audio_buf_row = adw::ActionRow::new();
+    audio_buf_row.set_title("Buffer Size");
+    let audio_buf_value = gtk::Label::new(Some("--"));
+    audio_buf_value.add_css_class("status-text");
+    audio_buf_row.add_suffix(&audio_buf_value);
+    
+    let audio_latency_row = adw::ActionRow::new();
+    audio_latency_row.set_title("Latency");
+    let audio_latency_value = gtk::Label::new(Some("---"));
+    audio_latency_value.add_css_class("status-text");
+    audio_latency_row.add_suffix(&audio_latency_value);
+    
+    let audio_detail_group = adw::PreferencesGroup::new();
+    audio_detail_group.add(&audio_codec_row);
+    audio_detail_group.add(&audio_buf_row);
+    audio_detail_group.add(&audio_latency_row);
+    
+    let audio_close_btn = gtk::Button::with_label("Close");
+    let audio_win = audio_detail_window.clone();
+    audio_close_btn.connect_clicked(move |_| { audio_win.hide(); });
+    
+    audio_detail_box.append(&audio_title);
+    audio_detail_box.append(&audio_detail_group);
+    audio_detail_box.append(&audio_close_btn);
+    audio_detail_window.set_child(Some(&audio_detail_box));
+    
+    // =========================================================================
+    // Status indicator click handlers - show detail popup windows
+    // =========================================================================
+    let modem_window = modem_detail_window.clone();
+    modem_status_btn.connect_clicked(move |_| {
+        modem_window.present();
+    });
+    
+    let gps_window = gps_detail_window.clone();
+    gps_status_btn.connect_clicked(move |_| {
+        gps_window.present();
+    });
+    
+    let audio_window = audio_detail_window.clone();
+    audio_status_btn.connect_clicked(move |_| {
+        audio_window.present();
     });
     
     let toast_overlay = adw::ToastOverlay::new();
@@ -1249,6 +1600,24 @@ fn create_ui(
     let gps_clone = Arc::clone(gps);
     let gps_led_clone = gps_led.clone();
     let ptt_label_update = ptt_label.clone();
+    
+    // Detail window labels
+    let modem_freq_value_clone = modem_freq_value.clone();
+    let modem_rssi_value_clone = modem_rssi_value.clone();
+    let modem_mode_value_clone = modem_mode_value.clone();
+    let modem_tx_value_clone = modem_tx_value.clone();
+    let modem_fw_value_clone = modem_fw_value.clone();
+    let modem_band_value_clone = modem_band_value.clone();
+    
+    let gps_fix_value_detail_clone = gps_fix_value_detail.clone();
+    let gps_sats_detail_value_clone = gps_sats_detail_value.clone();
+    let gps_coords_detail_value_clone = gps_coords_detail_value.clone();
+    let gps_maidenhead_value_clone = gps_maidenhead_value.clone();
+    let gps_alt_detail_value_clone = gps_alt_detail_value.clone();
+    let gps_speed_detail_value_clone = gps_speed_detail_value.clone();
+    
+    let audio_buf_value_clone = audio_buf_value.clone();
+    let audio_latency_value_clone = audio_latency_value.clone();
     
     let aprs_messages_clone2 = Arc::clone(&aprs_messages);
     let aprs_empty_label_clone = aprs_empty_label.clone();
@@ -1304,6 +1673,37 @@ fn create_ui(
                 rssi_sbar_clone.remove_css_class("bar-tx");
                 rssi_sbar_clone.remove_css_class("bar-rx");
             }
+            
+            // Update MODEM detail window
+            modem_freq_value_clone.set_text(&format!("{}.{:03} MHz", 
+                state.frequency / 1000,
+                state.frequency % 1000
+            ));
+            if state.raw_rssi > 0 {
+                let dbm = (state.raw_rssi as f64) * 1.2 - 160.8;
+                modem_rssi_value_clone.set_text(&format!("{} dBm", dbm as i32));
+            } else {
+                modem_rssi_value_clone.set_text("---");
+            }
+            modem_mode_value_clone.set_text(match state.mode {
+                0 => "FM",
+                1 => "NFM",
+                _ => "Unknown"
+            });
+            modem_tx_value_clone.set_text(if state.tx_active { "TX" } else { "RX" });
+            modem_fw_value_clone.set_text(&format!("v{}.{}", 
+                state.firmware_version / 100, state.firmware_version % 100));
+            
+            // Determine band from frequency
+            let freq_mhz = state.frequency as f64 / 1000.0;
+            let band = if freq_mhz >= 136.0 && freq_mhz <= 174.0 {
+                "2m (VHF)"
+            } else if freq_mhz >= 400.0 && freq_mhz <= 480.0 {
+                "70cm (UHF)"
+            } else {
+                "Unknown"
+            };
+            modem_band_value_clone.set_text(band);
         }
         
         // Audio status
@@ -1330,11 +1730,35 @@ fn create_ui(
                 audio_label_clone.remove_css_class("status-icon-red");
                 audio_label_clone.add_css_class("status-icon-gray-filled");
             }
+            
+            // Update AUDIO detail window
+            // ADPCM: 160 samples = 81 bytes at 16kHz = 10ms per block
+            // RX buffer holds multiple blocks for smooth playback
+            const ADPCM_BLOCK_SIZE: usize = 81;  // bytes per 10ms
+            const ADPCM_LATENCY_MS: f64 = 10.0;  // ms per block
+            const RX_BUFFER_BLOCKS: usize = 10;  // typical RX buffer
+            
+            let total_bytes = ADPCM_BLOCK_SIZE * RX_BUFFER_BLOCKS;
+            let total_latency = ADPCM_LATENCY_MS * RX_BUFFER_BLOCKS as f64;
+            
+            audio_buf_value_clone.set_text(&format!("{} bytes", total_bytes));
+            audio_latency_value_clone.set_text(&format!("~{:.0}ms", total_latency));
         }
 
         // GPS status
         if let Ok(g) = gps_clone.lock() {
             let gps_data = g.get_data();
+            
+            // Determine fix type
+            let (fix_type, fix_class) = if !gps_data.gps_enabled {
+                ("No GPS", "status-warning")
+            } else if !gps_data.has_fix {
+                ("No Fix", "status-warning")
+            } else if gps_data.satellites >= 4 {
+                ("3D Fix", "status-success")
+            } else {
+                ("2D Fix", "status-warning")
+            };
             
             if gps_data.has_fix {
                 gps_led_clone.set_text("●");
@@ -1347,10 +1771,45 @@ fn create_ui(
                 gps_led_clone.remove_css_class("gps-led-on");
                 gps_led_clone.add_css_class("gps-led-searching");
             } else {
-                gps_led_clone.set_text("●");
+                gps_led_clone.set_text("○");
                 gps_led_clone.remove_css_class("gps-led-on");
                 gps_led_clone.remove_css_class("gps-led-searching");
                 gps_led_clone.add_css_class("gps-led-off");
+            }
+            
+            gps_fix_value_detail_clone.set_text(fix_type);
+            gps_fix_value_detail_clone.remove_css_class("status-success");
+            gps_fix_value_detail_clone.remove_css_class("status-warning");
+            gps_fix_value_detail_clone.add_css_class(fix_class);
+            
+            // Update satellite count
+            if gps_data.satellites > 0 {
+                gps_sats_detail_value_clone.set_text(&format!("{}", gps_data.satellites));
+            } else {
+                gps_sats_detail_value_clone.set_text("--");
+            }
+            
+            // Update coordinates and Maidenhead
+            if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) {
+                gps_coords_detail_value_clone.set_text(&format!("{:.6}, {:.6}", lat, lon));
+                // Calculate Maidenhead locator
+                let locator = calculate_maidenhead(lat, lon);
+                gps_maidenhead_value_clone.set_text(&locator);
+            } else {
+                gps_coords_detail_value_clone.set_text("---");
+                gps_maidenhead_value_clone.set_text("---");
+            }
+            
+            // Update altitude and speed
+            if let Some(alt) = gps_data.altitude {
+                gps_alt_detail_value_clone.set_text(&format!("{:.0}m", alt));
+            } else {
+                gps_alt_detail_value_clone.set_text("---");
+            }
+            if let Some(speed) = gps_data.speed {
+                gps_speed_detail_value_clone.set_text(&format!("{:.1} km/h", speed * 3.6));
+            } else {
+                gps_speed_detail_value_clone.set_text("---");
             }
         }
         
@@ -1534,6 +1993,14 @@ fn create_ui(
         .status-icon-gray-empty { font-size: 14px; color: #666; }
         .status-icon-gray-filled { font-size: 14px; color: #888; }
         .modem-label, .gps-label, .audio-label { color: #666; font-size: 11px; }
+        .status-btn { background: transparent; border: none; padding: 4px 8px; border-radius: 8px; }
+        .status-btn:hover { background: #333; }
+        .status-btn:active { background: #444; }
+        .status-text { font-size: 14px; color: #888; }
+        .status-success { color: #33D17A; }
+        .status-warning { color: #FFB000; }
+        .status-error { color: #ff4444; }
+        .title-label { font-size: 18px; font-weight: bold; color: #FFB000; padding: 12px 0 0 12px; }
         .signal-text { font-size: 11px; color: #888; font-weight: bold; }
         .signal-value { font-size: 11px; font-weight: bold; }
         .rssi-bar { background: #2a2a2a; border: 1px solid #444; border-radius: 4px; }

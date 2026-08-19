@@ -85,7 +85,7 @@ See `AGENTS.md` for detailed debug notes.
 - [ ] Fix light theme
 - [ ] Use libadwaita feature to show unrecoverable errors
 - [ ] Add flatpack build target
-- [ ] Noise squelch option
+- [ ] Offline maps
 
 ### Development
 

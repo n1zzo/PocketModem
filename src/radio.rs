@@ -110,6 +110,8 @@ pub struct RadioState {
     pub ptt: bool,
     pub connected: bool,
     pub tx_active: bool,
+    pub firmware_version: u16,
+    pub rf_module_type: String,
 }
 
 // ============================================================================
@@ -283,6 +285,12 @@ impl KV4PRadio {
         let (rssi, smeter, squelch, raw_rssi, tx_active) = if let Some(ref s) = dev_state {
             (s.rssi_dbm(), ((s.rssi as i32) * 9 / 255).max(1), s.is_squelched(), s.rssi, s.tx_active())
         } else { (-121.0, 0, false, 0, false) };
+        let version = self.state.inner.lock().unwrap().version.clone();
+        let (fw_ver, rf_type) = if let Some(ref v) = version {
+            (v.firmware_version, format!("{:?}", v.rf_module_type))
+        } else {
+            (0, "Unknown".to_string())
+        };
         RadioState {
             frequency: freq,
             tx_frequency: self.state.tx_frequency.load(Ordering::SeqCst),
@@ -297,6 +305,8 @@ impl KV4PRadio {
             ptt: false,
             connected: self.is_connected(),
             tx_active,
+            firmware_version: fw_ver,
+            rf_module_type: rf_type,
         }
     }
     
