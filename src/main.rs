@@ -13,12 +13,16 @@ mod kiss;
 mod map;
 mod radio;
 mod settings;
+mod utils;
+mod ui;
 
 use aprs::APRSMessage;
 use audio::{AudioConfig, AudioManager};
 use gps::GpsManager;
 use map::MapManager;
 use settings::{SettingsManager, Channel, Duplex, ToneMode, PowerLevel};
+use utils::{calculate_maidenhead, calculate_distance_bearing, calculate_distance_display, escape_markup, bearing_to_compass};
+use ui::{header_bar, main_page, aprs_page, map_page, settings_page, status_button, aprs_message_row, APP_CSS};
 
 use radio::{KV4PRadio, SerialConfig};
 
@@ -32,127 +36,8 @@ use std::thread;
 use adw::prelude::*;
 use adw;
 
-/// Calculate Maidenhead locator from lat/lon
-fn calculate_maidenhead(lat: f64, lon: f64) -> String {
-    if lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 {
-        return "-----".to_string();
-    }
-    
-    let radix: [i32; 6] = [18, 10, 24, 10, 24, 10];
-    let multiplier: i64 = radix.iter().map(|&r| r as i64).product();
-    let half_multiplier = multiplier / 2;
-    
-    let int_lat = ((lat + 90.0) * multiplier as f64).round() as i64 
-                  / (radix[0] * radix[1]) as i64;
-    let int_lon = (((lon + 180.0).rem_euclid(360.0)) * half_multiplier as f64).round() as i64
-                  / (radix[0] * radix[1]) as i64;
-    
-    fn convert(mut val: i64, radix: &[i32; 6]) -> [i32; 6] {
-        let mut result = [0i32; 6];
-        let mut idx = 5;
-        let mut remaining_radix: Vec<i32> = radix.to_vec();
-        
-        while !remaining_radix.is_empty() {
-            let r = remaining_radix.pop().unwrap();
-            let (p, q) = (val / r as i64, val % r as i64);
-            result[idx] = q as i32;
-            val = p;
-            if idx > 0 { idx -= 1; }
-        }
-        result
-    }
-    
-    let lat_digits = convert(int_lat, &radix);
-    let lon_digits = convert(int_lon, &radix);
-    
-    let c1 = (b'A' + (lon_digits[0] % 18) as u8) as char;
-    let c2 = (b'A' + (lat_digits[0] % 18) as u8) as char;
-    let c3 = (b'0' + (lon_digits[1] % 10) as u8) as char;
-    let c4 = (b'0' + (lat_digits[1] % 10) as u8) as char;
-    let c5 = (b'a' + (lon_digits[2] % 24) as u8) as char;
-    let c6 = (b'a' + (lat_digits[2] % 24) as u8) as char;
-    
-    format!("{}{}{}{}{}{}", c1, c2, c3, c4, c5, c6)
-}
-
-/// Calculate distance (km) and bearing (degrees)
-fn calculate_distance_bearing(my_lat: f64, my_lon: f64, target_lat: f64, target_lon: f64) -> Option<(f64, f64)> {
-    if my_lat == 0.0 && my_lon == 0.0 {
-        return None;
-    }
-    
-    let lat1 = my_lat.to_radians();
-    let lat2 = target_lat.to_radians();
-    let delta_lon = (target_lon - my_lon).to_radians();
-    
-    let (sin_lat1, cos_lat1, sin_lat2, cos_lat2) = (lat1.sin(), lat1.cos(), lat2.sin(), lat2.cos());
-    
-    let delta_lat = target_lat - my_lat;
-    let sin_delta_lat = (delta_lat.to_radians() / 2.0).sin();
-    let sin_delta_lon = (delta_lon / 2.0).sin();
-    let a = sin_delta_lat.powi(2) + cos_lat1 * cos_lat2 * sin_delta_lon.powi(2);
-    
-    let c = 2.0 * (a.sqrt().min(1.0)).asin();
-    let distance_km = 6371.0 * c;
-    
-    let y = delta_lon.sin() * cos_lat2;
-    let x = cos_lat1 * sin_lat2 - sin_lat1 * cos_lat2 * delta_lon.cos();
-    let bearing = y.atan2(x).to_degrees().rem_euclid(360.0);
-    
-    Some((distance_km, bearing))
-}
-
-fn calculate_distance_display(my_lat: f64, my_lon: f64, target_lat: f64, target_lon: f64) -> String {
-    if let Some((dist_km, _)) = calculate_distance_bearing(my_lat, my_lon, target_lat, target_lon) {
-        if dist_km < 1.0 {
-            format!("{:.0}m", dist_km * 1000.0)
-        } else if dist_km < 10.0 {
-            format!("{:.1}km", dist_km)
-        } else {
-            format!("{:.0}km", dist_km)
-        }
-    } else {
-        "??".to_string()
-    }
-}
-
-#[cfg(feature = "notifications")]
-fn show_aprs_notification(body: &str, _from: &str) -> Result<(), String> {
-    if !is_initted() {
-        init("pocket-modem").map_err(|e| format!("Failed to init: {:?}", e))?;
-    }
-    
-    let n = Notification::new("APRS", Some(body), None);
-    n.show().map_err(|e| format!("Show failed: {:?}", e))
-}
-
 /// Map margins for easier carousel swiping (in pixels)
 const MAP_MARGIN: i32 = 8;
-
-/// Escape special characters for Pango markup
-fn escape_markup(s: &str) -> String {
-    s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
-     .replace("'", "&apos;")
-}
-
-fn bearing_to_compass(bearing: f64) -> String {
-    let arrow = match (bearing.round() as i32) % 360 {
-        0..=22 | 338..=360 => "↑",
-        23..=67 => "↗",
-        68..=112 => "→",
-        113..=157 => "↘",
-        158..=202 => "↓",
-        203..=247 => "↙",
-        248..=292 => "←",
-        293..=337 => "↖",
-        _ => "?",
-    };
-    
-    format!("{}{:.0}°", arrow, bearing)
-}
 
 const APP_ID: &str = "org.pocketmodem.pocket-modem";
 

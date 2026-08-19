@@ -81,7 +81,9 @@ See `AGENTS.md` for detailed debug notes.
 - [x] Handle channel edit
 - [x] Implement APRS, add toast for new messages
 - [x] Add APRS message log and map views using carousel
-- [ ] Code refactor: move utils function in dedicated file, remove UI sizing constraints, move UI code to dedicated file, deal with unsafes.
+- [x] Code refactor: move utils function in dedicated file, remove UI sizing constraints, move UI code to dedicated file, deal with unsafes.
+- [ ] APRS Tx
+- [ ] Satellites prediction and doppler correction
 - [ ] Fix light theme
 - [ ] Use libadwaita feature to show unrecoverable errors
 - [ ] Add flatpack build target
