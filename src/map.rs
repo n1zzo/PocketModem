@@ -578,8 +578,10 @@ impl MapManager {
             self.marker_layer.remove_marker(&old_marker);
         }
 
-        // Icon size (larger for better visibility)
+        // Icon size + banner height
         let icon_size = 32;
+        let banner_height = 14;
+        let total_height = icon_size + banner_height;
 
         // Get the APRS icon surface
         let icon_surface = self.icon_renderer.get_icon(
@@ -590,7 +592,7 @@ impl MapManager {
         
         // Create a DrawingArea to render the icon
         let drawing_area = gtk::DrawingArea::new();
-        drawing_area.set_size_request(icon_size, icon_size);
+        drawing_area.set_size_request(icon_size, total_height);
         drawing_area.set_hexpand(false);
         drawing_area.set_vexpand(false);
 
@@ -607,6 +609,7 @@ impl MapManager {
 
         let surface_for_closure = surface.clone();
         let callsign_for_draw = callsign_for_debug.clone();
+        let dark_mode = self.dark_mode;
         drawing_area.set_draw_func(move |area, cr, width, height| {
             // Draw the APRS icon
             let scale_x = width as f64 / icon_width;
@@ -620,6 +623,25 @@ impl MapManager {
             
             cr.set_source_surface(&surface_for_closure, offset_x, offset_y);
             cr.paint().ok();
+            
+            // Draw callsign banner below icon
+            let w = width as f64;
+            let h = height as f64;
+            let banner_y = h - 12.0;
+            let banner_text = &callsign_for_draw[..callsign_for_draw.len().min(8)]; // Truncate if long
+            
+            // Banner background
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.7);
+            cr.rectangle(0.0, banner_y, w, 12.0);
+            cr.fill().ok();
+            
+            // Banner text
+            cr.set_source_rgb(1.0, 1.0, 1.0); // White text
+            cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+            cr.set_font_size(9.0);
+            let text_x = (w - banner_text.len() as f64 * 5.5) / 2.0; // Approximate text width
+            cr.move_to(text_x, banner_y + 9.0);
+            cr.show_text(banner_text).ok();
         });
 
         // Create tooltip with station info
