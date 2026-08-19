@@ -605,11 +605,20 @@ impl MapManager {
         
         // Clone data for closures
         let comment_for_tooltip = if msg.comment.is_empty() { String::new() } else { msg.comment.clone() };
-        let callsign_for_debug = msg.from_callsign.clone();
+        let callsign_for_draw = msg.from_callsign.clone();
+        
+        // Calculate distance from user position (in km)
+        let distance_text = if let (Some(user_lat), Some(user_lon)) = (self.user_lat, self.user_lon) {
+            let dist = Self::haversine_distance(user_lat, user_lon, msg.position_lat, msg.position_lon);
+            format!("{:.1}km", dist)
+        } else {
+            String::new()
+        };
 
         let surface_for_closure = surface.clone();
-        let callsign_for_draw = callsign_for_debug.clone();
-        let dark_mode = self.dark_mode;
+        let banner_text = format!("{} {}", callsign_for_draw, distance_text);
+        let text_len = banner_text.len() as f64;
+        
         drawing_area.set_draw_func(move |area, cr, width, height| {
             // Draw the APRS icon
             let scale_x = width as f64 / icon_width;
@@ -624,24 +633,27 @@ impl MapManager {
             cr.set_source_surface(&surface_for_closure, offset_x, offset_y);
             cr.paint().ok();
             
-            // Draw callsign banner below icon
+            // Draw callsign + distance banner below icon
             let w = width as f64;
             let h = height as f64;
             let banner_y = h - 12.0;
-            let banner_text = &callsign_for_draw[..callsign_for_draw.len().min(8)]; // Truncate if long
             
             // Banner background
             cr.set_source_rgba(0.0, 0.0, 0.0, 0.7);
             cr.rectangle(0.0, banner_y, w, 12.0);
             cr.fill().ok();
             
-            // Banner text
-            cr.set_source_rgb(1.0, 1.0, 1.0); // White text
+            // Banner text (centered)
+            cr.set_source_rgb(1.0, 1.0, 1.0);
             cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-            cr.set_font_size(9.0);
-            let text_x = (w - banner_text.len() as f64 * 5.5) / 2.0; // Approximate text width
+            cr.set_font_size(8.0);
+            
+            // Center text - estimate width based on character count
+            let char_width = 5.0; // pixels per char at font size 8
+            let text_width = text_len * char_width;
+            let text_x = (w - text_width) / 2.0;
             cr.move_to(text_x, banner_y + 9.0);
-            cr.show_text(banner_text).ok();
+            cr.show_text(&banner_text).ok();
         });
 
         // Create tooltip with station info
@@ -687,6 +699,17 @@ impl MapManager {
         if let Some(marker) = self.user_marker.take() {
             self.marker_layer.remove_marker(&marker);
         }
+    }
+    
+    /// Calculate distance between two coordinates using Haversine formula (in km)
+    fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+        let r = 6371.0; // Earth radius in km
+        let d_lat = (lat2 - lat1).to_radians();
+        let d_lon = (lon2 - lon1).to_radians();
+        let a = (d_lat / 2.0).sin().powi(2) 
+              + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
+        let c = 2.0 * a.sqrt().asin();
+        r * c
     }
 }
 
