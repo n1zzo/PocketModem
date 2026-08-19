@@ -177,7 +177,7 @@ fn generate_map_style(is_dark: bool) -> String {
       "filter": ["in", "class", "path", "track", "footway", "steps", "cycleway"],
       "paint": {{
         "line-color": "{}",
-        "line-width": 1,
+        "line-width": 0.5,
         "line-dasharray": [1.5, 2],
         "line-cap": "round"
       }}
@@ -190,7 +190,7 @@ fn generate_map_style(is_dark: bool) -> String {
       "filter": ["in", "class", "tertiary", "minor", "service"],
       "paint": {{
         "line-color": "{}",
-        "line-width": 1.5,
+        "line-width": 0.75,
         "line-opacity": 0.9,
         "line-cap": "round"
       }}
@@ -203,7 +203,7 @@ fn generate_map_style(is_dark: bool) -> String {
       "filter": ["==", "class", "secondary"],
       "paint": {{
         "line-color": "{}",
-        "line-width": 2.5,
+        "line-width": 1.25,
         "line-opacity": 0.9,
         "line-cap": "round"
       }}
@@ -216,7 +216,7 @@ fn generate_map_style(is_dark: bool) -> String {
       "filter": ["in", "class", "primary", "trunk", "motorway"],
       "paint": {{
         "line-color": "{}",
-        "line-width": 3,
+        "line-width": 1.5,
         "line-opacity": 0.9,
         "line-cap": "round"
       }}
