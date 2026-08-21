@@ -2253,6 +2253,8 @@ fn create_ui(
     // =========================================================================
     fn show_channel_edit_dialog<F, D>(parent: &gtk::Button, channel: &Channel, on_save: F, on_delete: D)
     where F: FnOnce(Channel) + 'static, D: FnOnce() + 'static {
+        use crate::settings::{Duplex, ToneMode, PowerLevel};
+        
         let dialog = gtk::Dialog::with_buttons(
             Some(&format!("Edit: {}", channel.name)),
             parent.root().and_then(|r| r.downcast::<gtk::Window>().ok()).as_ref(),
@@ -2266,6 +2268,7 @@ fn create_ui(
         content.set_margin_end(12);
         content.set_margin_bottom(12);
         
+        // Name
         let name_row = adw::ActionRow::new();
         name_row.set_title("Name");
         let name_entry = gtk::Entry::new();
@@ -2275,8 +2278,9 @@ fn create_ui(
         name_row.set_activatable_widget(Some(&name_entry));
         content.append(&name_row);
         
+        // Frequency
         let freq_row = adw::ActionRow::new();
-        freq_row.set_title("Frequency (MHz)");
+        freq_row.set_title("RX Frequency (MHz)");
         let freq_entry = gtk::Entry::new();
         freq_entry.set_text(&format!("{:.3}", channel.rx_freq_khz as f64 / 1000.0));
         freq_entry.set_hexpand(true);
@@ -2284,6 +2288,86 @@ fn create_ui(
         freq_row.set_activatable_widget(Some(&freq_entry));
         content.append(&freq_row);
         
+        // Duplex mode
+        let duplex_row = adw::ActionRow::new();
+        duplex_row.set_title("Duplex");
+        let duplex_combo = gtk::DropDown::from_strings(&["Simplex", "+", "-", "Split"]);
+        duplex_combo.set_hexpand(true);
+        let duplex_idx = match channel.duplex {
+            Duplex::Simplex => 0,
+            Duplex::Plus => 1,
+            Duplex::Minus => 2,
+            Duplex::Split => 3,
+        };
+        duplex_combo.set_selected(duplex_idx as u32);
+        duplex_row.add_suffix(&duplex_combo);
+        content.append(&duplex_row);
+        
+        // Offset (shown for + and - duplex)
+        let offset_row = adw::ActionRow::new();
+        offset_row.set_title("Offset (kHz)");
+        let offset_entry = gtk::Entry::new();
+        offset_entry.set_text(&format!("{}", channel.offset_khz));
+        offset_entry.set_hexpand(true);
+        offset_row.add_suffix(&offset_entry);
+        content.append(&offset_row);
+        
+        // TX Frequency (shown for Split duplex)
+        let tx_freq_row = adw::ActionRow::new();
+        tx_freq_row.set_title("TX Frequency (MHz)");
+        let tx_freq_entry = gtk::Entry::new();
+        let tx_freq_val = channel.tx_freq_khz.unwrap_or(channel.rx_freq_khz);
+        tx_freq_entry.set_text(&format!("{:.3}", tx_freq_val as f64 / 1000.0));
+        tx_freq_entry.set_hexpand(true);
+        tx_freq_row.add_suffix(&tx_freq_entry);
+        content.append(&tx_freq_row);
+        
+        // Tone Mode
+        let tone_row = adw::ActionRow::new();
+        tone_row.set_title("Tone Mode");
+        let tone_combo = gtk::DropDown::from_strings(&["None", "Tone", "TSQL"]);
+        tone_combo.set_hexpand(true);
+        let tone_idx = match channel.tone_mode {
+            ToneMode::None => 0,
+            ToneMode::Tone => 1,
+            ToneMode::Tsql => 2,
+        };
+        tone_combo.set_selected(tone_idx as u32);
+        tone_row.add_suffix(&tone_combo);
+        content.append(&tone_row);
+        
+        // RX Tone (for Tone and TSQL)
+        let rtone_row = adw::ActionRow::new();
+        rtone_row.set_title("RX Tone (Hz)");
+        let rtone_entry = gtk::Entry::new();
+        rtone_entry.set_text(&format!("{:.1}", channel.rtone_hz));
+        rtone_entry.set_hexpand(true);
+        rtone_row.add_suffix(&rtone_entry);
+        content.append(&rtone_row);
+        
+        // TX Tone (for TSQL only)
+        let ctone_row = adw::ActionRow::new();
+        ctone_row.set_title("TX Tone (Hz)");
+        let ctone_entry = gtk::Entry::new();
+        ctone_entry.set_text(&format!("{:.1}", channel.ctone_hz));
+        ctone_entry.set_hexpand(true);
+        ctone_row.add_suffix(&ctone_entry);
+        content.append(&ctone_row);
+        
+        // Power Level
+        let power_row = adw::ActionRow::new();
+        power_row.set_title("Power");
+        let power_combo = gtk::DropDown::from_strings(&["High", "Low"]);
+        power_combo.set_hexpand(true);
+        let power_idx = match channel.power {
+            PowerLevel::High => 0,
+            PowerLevel::Low => 1,
+        };
+        power_combo.set_selected(power_idx as u32);
+        power_row.add_suffix(&power_combo);
+        content.append(&power_row);
+        
+        // Delete button
         let delete_btn = gtk::Button::with_label("Delete Channel");
         delete_btn.add_css_class("destructive-action");
         delete_btn.set_margin_top(12);
@@ -2308,15 +2392,61 @@ fn create_ui(
             if response == gtk::ResponseType::Accept {
                 let name = name_entry.text().to_string();
                 let freq_text = freq_entry.text().to_string();
+                let offset_text = offset_entry.text().to_string();
+                let tx_freq_text = tx_freq_entry.text().to_string();
+                let rtone_text = rtone_entry.text().to_string();
+                let ctone_text = ctone_entry.text().to_string();
                 
                 let freq_mhz: f64 = freq_text.parse().unwrap_or(channel_clone.rx_freq_khz as f64 / 1000.0);
                 let rx_freq_khz = (freq_mhz * 1000.0) as u32;
+                
+                let offset_khz: u32 = offset_text.parse().unwrap_or(channel_clone.offset_khz);
+                let tx_freq_mhz: f64 = tx_freq_text.parse().unwrap_or(tx_freq_val as f64 / 1000.0);
+                let tx_freq_khz = (tx_freq_mhz * 1000.0) as u32;
+                
+                let rtone_hz: f32 = rtone_text.parse().unwrap_or(channel_clone.rtone_hz);
+                let ctone_hz: f32 = ctone_text.parse().unwrap_or(channel_clone.ctone_hz);
+                
+                let duplex = match duplex_combo.selected() {
+                    0 => Duplex::Simplex,
+                    1 => Duplex::Plus,
+                    2 => Duplex::Minus,
+                    3 => Duplex::Split,
+                    _ => Duplex::Simplex,
+                };
+                
+                let tone_mode = match tone_combo.selected() {
+                    0 => ToneMode::None,
+                    1 => ToneMode::Tone,
+                    2 => ToneMode::Tsql,
+                    _ => ToneMode::None,
+                };
+                
+                let power = match power_combo.selected() {
+                    0 => PowerLevel::High,
+                    1 => PowerLevel::Low,
+                    _ => PowerLevel::High,
+                };
+                
+                let tx_freq_khz_opt = if duplex == Duplex::Split {
+                    Some(tx_freq_khz)
+                } else {
+                    None
+                };
                 
                 let updated = Channel {
                     location: channel_clone.location,
                     name,
                     rx_freq_khz,
-                    ..channel_clone.clone()
+                    duplex,
+                    offset_khz,
+                    tx_freq_khz: tx_freq_khz_opt,
+                    tone_mode,
+                    rtone_hz,
+                    ctone_hz,
+                    power,
+                    mode: channel_clone.mode.clone(),
+                    comment: channel_clone.comment.clone(),
                 };
                 
                 if let Some(callback) = on_save_opt.borrow_mut().take() { callback(updated); }

@@ -10,34 +10,29 @@ pub fn calculate_maidenhead(lat: f64, lon: f64) -> String {
         return "-----".to_string();
     }
     
-    let radix: [i32; 6] = [18, 10, 24, 10, 24, 10];
+    // Normalize longitude to [0, 360) range
+    let adj_lon = ((lon + 180.0).rem_euclid(360.0));
     
-    let int_lat = ((lat + 90.0) * 10800.0).round() as i64;
-    let int_lon = (((lon + 180.0).rem_euclid(360.0)) * 5400.0).round() as i64;
+    // Field (first pair): 18x18 grid, 20° x 10° each
+    let lon_field = (adj_lon / 20.0).floor() as i32;
+    let lat_field = ((lat + 90.0) / 10.0).floor() as i32;
     
-    fn convert(val: i64, radix: &[i32; 6]) -> [i32; 6] {
-        let mut result = [0i32; 6];
-        let mut idx = 5;
-        let mut remaining_radix: Vec<i32> = radix.to_vec();
-        
-        while !remaining_radix.is_empty() {
-            let r = remaining_radix.pop().unwrap();
-            let (p, q) = (val / r as i64, val % r as i64);
-            result[idx] = q as i32;
-            if idx > 0 { idx -= 1; }
-        }
-        result
-    }
+    // Square (second pair): 10x10 grid, 2° longitude x 1° latitude
+    let lon_in_field = adj_lon - (lon_field as f64 * 20.0);
+    let lat_in_field = (lat + 90.0) - (lat_field as f64 * 10.0);
+    let lon_sq = (lon_in_field / 2.0).floor() as i32;
+    let lat_sq = (lat_in_field / 1.0).floor() as i32;
     
-    let lat_digits = convert(int_lat, &radix);
-    let lon_digits = convert(int_lon, &radix);
+    // Subsquare (third pair): 24x24 grid, 2°/24 longitude x 1°/24 latitude
+    let lon_ss = ((lon_in_field - (lon_sq as f64 * 2.0)) / (2.0 / 24.0)).floor() as i32;
+    let lat_ss = ((lat_in_field - (lat_sq as f64 * 1.0)) / (1.0 / 24.0)).floor() as i32;
     
-    let c1 = (b'A' + (lon_digits[0] % 18) as u8) as char;
-    let c2 = (b'A' + (lat_digits[0] % 18) as u8) as char;
-    let c3 = (b'0' + (lon_digits[1] % 10) as u8) as char;
-    let c4 = (b'0' + (lat_digits[1] % 10) as u8) as char;
-    let c5 = (b'a' + (lon_digits[2] % 24) as u8) as char;
-    let c6 = (b'a' + (lat_digits[2] % 24) as u8) as char;
+    let c1 = (b'A' + (lon_field % 18) as u8) as char;
+    let c2 = (b'A' + (lat_field % 18) as u8) as char;
+    let c3 = (b'0' + (lon_sq % 10) as u8) as char;
+    let c4 = (b'0' + (lat_sq % 10) as u8) as char;
+    let c5 = (b'a' + (lon_ss % 24) as u8) as char;
+    let c6 = (b'a' + (lat_ss % 24) as u8) as char;
     
     format!("{}{}{}{}{}{}", c1, c2, c3, c4, c5, c6)
 }
@@ -122,12 +117,25 @@ mod tests {
 
     #[test]
     fn test_maidenhead() {
-        // Swiss coordinates (HB9) - should be in JN47
-        let locator = calculate_maidenhead(46.8, 8.2);
+        // Zurich, Switzerland area - should be in JN47
+        let locator = calculate_maidenhead(47.4, 8.5);
         assert_eq!(&locator[0..4], "JN47");
+        
+        // Zurich exact area (47.37°N, 8.55°E)
+        let locator = calculate_maidenhead(47.37, 8.55);
+        assert_eq!(&locator[0..4], "JN47");
+        
+        // New York City area (FN30 for -74°)
+        let locator = calculate_maidenhead(40.71, -74.0);
+        assert_eq!(&locator[0..2], "FN");
+        
+        // Tokyo area (PM95)
+        let locator = calculate_maidenhead(35.68, 139.65);
+        assert_eq!(&locator[0..4], "PM95");
         
         // Invalid coords
         assert_eq!(calculate_maidenhead(91.0, 0.0), "-----");
+        assert_eq!(calculate_maidenhead(0.0, 200.0), "-----");
     }
 
     #[test]

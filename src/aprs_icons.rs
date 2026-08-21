@@ -94,19 +94,21 @@ impl APRSIconRenderer {
     }
 
     fn load_png(path: &str) -> Result<ImageSurface, String> {
-        use std::fs::File;
-        use std::io::BufReader;
+        use image::GenericImageView;
         
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        let dec = png::Decoder::new(BufReader::new(file));
-        let mut reader = dec.read_info().map_err(|e| e.to_string())?;
-        let mut buf = vec![0; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+        let img = image::open(path).map_err(|e| e.to_string())?;
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let stride = ((width * 4 + 3) & !3) as i32;
+        let mut data = rgba.into_raw();
         
-        // Store raw RGBA data
+        // Convert RGBX to ARGB32 (BGRA -> RGBA swap needed?)
+        // Image crate returns RGBA, Cairo expects ARGB32
+        for chunk in data.chunks_mut(4) {
+            chunk.swap(0, 2); // Swap R and B
+        }
         
-        let stride = ((info.width * 4 + 3) & !3) as i32;
-        ImageSurface::create_for_data(buf, Format::ARgb32, info.width as i32, info.height as i32, stride)
+        ImageSurface::create_for_data(data, Format::ARgb32, width as i32, height as i32, stride)
             .map_err(|e| e.to_string())
     }
 

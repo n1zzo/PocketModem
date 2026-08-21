@@ -544,9 +544,6 @@ impl MapManager {
         if !self.has_centered_on_user {
             self.map.center_on(lat, lon);
             self.has_centered_on_user = true;
-            eprintln!("[map] Centered on initial user position: {:.4}, {:.4}", lat, lon);
-        } else {
-            eprintln!("[map] Updated user position (not centering): {:.4}, {:.4}", lat, lon);
         }
     }
 
