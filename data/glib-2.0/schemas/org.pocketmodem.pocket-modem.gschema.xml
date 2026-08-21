@@ -106,9 +106,9 @@
     </key>
 
     <key name="aprs-symbol-code" type="s">
-      <default>">"</default>
+      <default>"'"</default>
       <summary>APRS symbol code</summary>
-      <description>APRS symbol code character (e.g., ">" for person, "'" for aircraft)</description>
+      <description>APRS symbol code character (e.g., "'" for person, ">" for car)</description>
     </key>
 
     <key name="aprs-comment" type="s">
@@ -121,6 +121,12 @@
       <default>false</default>
       <summary>APRS TX enabled</summary>
       <description>Enable APRS beacon transmission</description>
+    </key>
+
+    <key name="aprs-beacon-dest" type="s">
+      <default>"APRS"</default>
+      <summary>APRS beacon destination</summary>
+      <description>Destination callsign for APRS beacons (default: APRS)</description>
     </key>
 
   </schema>

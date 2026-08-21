@@ -260,6 +260,7 @@ pub struct AppSettings {
     pub aprs_symbol_code: char,
     pub aprs_comment: String,
     pub aprs_tx_enabled: bool,
+    pub aprs_beacon_dest: String,  // Destination for beacon (default: "APRS")
 }
 
 impl Default for AppSettings {
@@ -285,6 +286,7 @@ impl Default for AppSettings {
             aprs_symbol_code: '>',  // walking person (primary table)
             aprs_comment: String::new(),
             aprs_tx_enabled: false,
+            aprs_beacon_dest: "APRS".to_string(),
         }
     }
 }
@@ -340,6 +342,7 @@ impl SettingsManager {
         let aprs_symbol_code = self.settings.string("aprs-symbol-code").to_string();
         let aprs_comment = self.settings.string("aprs-comment").to_string();
         let aprs_tx_enabled = self.settings.boolean("aprs-tx-enabled");
+        let aprs_beacon_dest = self.settings.string("aprs-beacon-dest").to_string();
 
         AppSettings {
             frequency: self.settings.int("frequency") as u32,
@@ -359,9 +362,10 @@ impl SettingsManager {
             aprs_callsign,
             aprs_ssid,
             aprs_symbol_table: aprs_symbol_table.chars().next().unwrap_or('/'),
-            aprs_symbol_code: aprs_symbol_code.chars().next().unwrap_or('\''),
+            aprs_symbol_code: aprs_symbol_code.chars().next().unwrap_or('\''),  
             aprs_comment,
             aprs_tx_enabled,
+            aprs_beacon_dest: if aprs_beacon_dest.is_empty() { "APRS".to_string() } else { aprs_beacon_dest },
         }
     }
 
@@ -494,6 +498,11 @@ impl SettingsManager {
         self.settings.set_boolean("aprs-tx-enabled", enabled).ok();
     }
     
+    pub fn set_aprs_beacon_dest(&mut self, dest: &str) {
+        self.cached.aprs_beacon_dest = dest.to_uppercase();
+        self.settings.set_string("aprs-beacon-dest", &self.cached.aprs_beacon_dest).ok();
+    }
+    
     /// Get the full APRS callsign with SSID (e.g., "KD4LCD-9")
     pub fn aprs_full_callsign(&self) -> String {
         if self.cached.aprs_ssid > 0 {
@@ -527,6 +536,7 @@ impl SettingsManager {
     pub fn aprs_symbol_code(&self) -> char { self.cached.aprs_symbol_code }
     pub fn aprs_comment(&self) -> &str { &self.cached.aprs_comment }
     pub fn aprs_tx_enabled(&self) -> bool { self.cached.aprs_tx_enabled }
+    pub fn aprs_beacon_dest(&self) -> &str { &self.cached.aprs_beacon_dest }
 
     pub fn channels(&self) -> &[Channel] {
         &self.cached.channels

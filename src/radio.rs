@@ -548,6 +548,20 @@ impl KV4PRadio {
         symbol: AprsSymbol,
         comment: &str,
     ) -> Result<String, String> {
+        self.send_aprs_beacon_with_dest("APRS", callsign, lat, lon, alt, symbol, comment)
+    }
+    
+    /// Send APRS beacon with custom destination
+    pub fn send_aprs_beacon_with_dest(
+        &self,
+        destination: &str,
+        callsign: &str,
+        lat: f64,
+        lon: f64,
+        _alt: Option<f64>,
+        symbol: AprsSymbol,
+        comment: &str,
+    ) -> Result<String, String> {
         if !self.running.load(Ordering::SeqCst) {
             return Err("Radio not connected".to_string());
         }
@@ -558,16 +572,14 @@ impl KV4PRadio {
         state.flags |= HostStateFlags::TX_ALLOWED.bits() | HostStateFlags::PTT_REQUESTED.bits();
         self.queue_command(RadioCommand::SendState(state))?;
         
-
-        
         // Build APRS position report
         let aprs_payload = aprs::build_position_report(lat, lon, symbol, comment);
         eprintln!("[radio] APRS beacon payload: {}", aprs_payload);
         
         // Build AX.25 UI frame with ARISS digipath
         let ax25_frame = build_ax25_ui_frame(
-            "APRS",      // Destination
-            callsign,    // Source callsign
+            destination,  // Destination
+            callsign,     // Source callsign
             &["ARISS".to_string()],  // Digipeater path (direct to ISS)
             aprs_payload.as_bytes(),
         );

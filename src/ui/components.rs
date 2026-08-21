@@ -243,8 +243,7 @@ pub fn aprs_message_row(msg: &APRSMessage, my_lat: f64, my_lon: f64) -> gtk::Box
     to_label.add_css_class("aprs-to-callsign");
     
     let time_label = gtk::Label::new(None);
-    let time_str = if msg.timestamp > 0 {
-        let t = msg.timestamp;
+    let time_str = if let Some(t) = msg.timestamp {
         format!("{:02}:{:02}", (t / 3600) % 24, (t / 60) % 60)
     } else {
         "--:--".to_string()

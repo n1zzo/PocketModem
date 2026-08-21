@@ -828,9 +828,8 @@ fn create_ui(
         to_label.add_css_class("aprs-to-callsign");
         
         let time_label = gtk::Label::new(None);
-        let time_str = if msg.timestamp > 0 {
-            let t = msg.timestamp;
-            format!("{:02}:{:02}", (t / 3600) % 24, (t / 60) % 60)
+        let time_str = if let Some(ts) = msg.timestamp {
+            format!("{:02}:{:02}", (ts / 3600) % 24, (ts / 60) % 60)
         } else { "--:--".to_string() };
         time_label.set_text(&time_str);
         time_label.add_css_class("aprs-timestamp");
@@ -864,11 +863,30 @@ fn create_ui(
                     content.add_css_class("aprs-comment");
                 }
             }
-            aprs::APRSType::Message => {
+            aprs::APRSType::Message | aprs::APRSType::MessageAck => {
                 let body = msg.msg_body.as_deref().unwrap_or("");
-                content.set_markup(&format!("<span color='#888888'>Message to {}:</span>\n{}", 
-                    msg.to_callsign_msg.as_deref().unwrap_or(&msg.to_callsign), escape_markup(body)));
-                content.add_css_class("aprs-message-body");
+                let to = msg.to_callsign_msg.as_deref().unwrap_or(&msg.to_callsign);
+                
+                if msg.is_sent {
+                    // This is a message we sent
+                    let ack_indicator = if msg.is_acknowledged {
+                        " <span color='#33D17A'>✓</span>"  // Green checkmark for ACK
+                    } else {
+                        " <span color='#F5A623'>⏳</span>"  // Yellow clock for pending
+                    };
+                    content.set_markup(&format!(
+                        "<span color='#888888'>To {}:</span>{}<span color='#FFFFFF'>{}</span>",
+                        escape_markup(to), ack_indicator, escape_markup(body)
+                    ));
+                    content.add_css_class("aprs-message-body");
+                } else {
+                    // Received message
+                    content.set_markup(&format!(
+                        "<span color='#888888'>From {}:</span>\n<span color='#CCE5FF'>{}</span>",
+                        escape_markup(&msg.from_callsign), escape_markup(body)
+                    ));
+                    content.add_css_class("aprs-message-body");
+                }
             }
             _ => {
                 content.set_text(&msg.comment);
@@ -1344,6 +1362,22 @@ fn create_ui(
     aprs_comment_row.add_suffix(&aprs_comment_entry);
     aprs_comment_row.set_activatable_widget(Some(&aprs_comment_entry));
     
+    // Beacon destination input
+    let settings_aprs_dest = settings as *const SettingsManager as *mut SettingsManager;
+    let aprs_dest_entry = gtk::Entry::new();
+    aprs_dest_entry.set_placeholder_text(Some("APRS"));
+    aprs_dest_entry.set_hexpand(true);
+    aprs_dest_entry.set_max_length(9);
+    let current_dest = unsafe { (*settings).aprs_beacon_dest().to_string() };
+    aprs_dest_entry.set_text(&current_dest);
+    
+    let aprs_dest_row = adw::ActionRow::builder()
+        .title("Beacon Destination")
+        .subtitle("Destination callsign (default: APRS)")
+        .build();
+    aprs_dest_row.add_suffix(&aprs_dest_entry);
+    aprs_dest_row.set_activatable_widget(Some(&aprs_dest_entry));
+    
     // TX enable switch
     let settings_tx = settings as *const SettingsManager as *mut SettingsManager;
     let current_tx_enabled = unsafe { (*settings).aprs_tx_enabled() };
@@ -1357,6 +1391,7 @@ fn create_ui(
     aprs_group.add(&aprs_ssid_spin);
     aprs_group.add(&aprs_symbol_row);
     aprs_group.add(&aprs_comment_row);
+    aprs_group.add(&aprs_dest_row);
     aprs_group.add(&aprs_tx_row);
     
     settings_box.append(&aprs_group);
@@ -1395,6 +1430,14 @@ fn create_ui(
     aprs_comment_entry.connect_changed(move |entry| {
         let text = entry.text().to_string();
         unsafe { (*settings_aprs_4).set_aprs_comment(&text); }
+    });
+    
+    let settings_aprs_4b = settings as *const SettingsManager as *mut SettingsManager;
+    aprs_dest_entry.connect_changed(move |entry| {
+        let text = entry.text().to_string().trim().to_uppercase();
+        if !text.is_empty() {
+            unsafe { (*settings_aprs_4b).set_aprs_beacon_dest(&text); }
+        }
     });
     
     let settings_aprs_5 = settings as *const SettingsManager as *mut SettingsManager;
@@ -1683,15 +1726,19 @@ fn create_ui(
     let beacon_status_clone = beacon_status.clone();
     let toast_overlay_clone = toast_overlay.clone();
     let beacon_state_clone = Arc::clone(&beacon_state);
+    let aprs_messages_for_beacon = Arc::clone(&aprs_messages);
+    let aprs_list_for_beacon = aprs_list_box.clone();
+    let aprs_empty_for_beacon = aprs_empty_label.clone();
+    let gps_for_aprs = Arc::clone(gps);
     
     beacon_btn.connect_clicked(move |btn| {
         btn.set_sensitive(false);
         beacon_status_clone.set_text("Checking GPS...");
         
         // Read settings fresh at click time
-        let (call, symbol_table, symbol_code, comment, tx_enabled) = unsafe {
+        let (call, symbol_table, symbol_code, comment, tx_enabled, beacon_dest) = unsafe {
             let s = &*settings_beacon;
-            (s.aprs_full_callsign(), s.aprs_symbol_table(), s.aprs_symbol_code(), s.aprs_comment().to_string(), s.aprs_tx_enabled())
+            (s.aprs_full_callsign(), s.aprs_symbol_table(), s.aprs_symbol_code(), s.aprs_comment().to_string(), s.aprs_tx_enabled(), s.aprs_beacon_dest().to_string())
         };
         
         // Check TX enabled
@@ -1745,6 +1792,7 @@ fn create_ui(
         let symbol = aprs::AprsSymbol::new(symbol_table, symbol_code);
         let call_for_tx = call;
         let comment_for_tx = comment;
+        let beacon_dest = beacon_dest;
         
         *beacon_state_clone.lock().unwrap() = BeaconState::Transmitting;
         beacon_status_clone.set_text(BeaconState::Transmitting.message());
@@ -1765,15 +1813,15 @@ fn create_ui(
         // Send beacon on main thread (it's fast - just serial write)
         let result = {
             if let Ok(r) = radio_for_tx.lock() {
-                r.send_aprs_beacon(&call_for_tx, lat, lon, None, symbol, &comment_for_tx)
+                r.send_aprs_beacon_with_dest(&beacon_dest, &call_for_tx, lat, lon, None, symbol, &comment_for_tx)
             } else {
                 Err("Could not lock radio".to_string())
             }
         };
         
         match result {
-            Ok(msg) => {
-                eprintln!("[pocket-modem] Beacon sent: {}", msg);
+            Ok(_msg) => {
+                eprintln!("[pocket-modem] Beacon sent");
                 *state_for_callback.lock().unwrap() = BeaconState::Success;
                 status_for_callback.set_text(BeaconState::Success.message());
                 status_for_callback.add_css_class("status-success");
@@ -1782,6 +1830,37 @@ fn create_ui(
                 
                 let toast = adw::Toast::new("Beacon transmitted");
                 toast_for_success.add_toast(toast);
+                
+                // Add beacon to APRS messages list
+                let mut beacon_msg = aprs::APRSMessage::new();
+                beacon_msg.msg_type = aprs::APRSType::Position;
+                beacon_msg.from_callsign = call_for_tx.clone();
+                beacon_msg.to_callsign = beacon_dest.clone();
+                beacon_msg.position_lat = lat;
+                beacon_msg.position_lon = lon;
+                beacon_msg.is_sent = true;
+                beacon_msg.symbol_table_id = Some(symbol_table);
+                beacon_msg.symbol_code = Some(symbol_code);
+                beacon_msg.comment = comment_for_tx.clone();
+                
+                // Note: Don't add to Vec here - on_aprs callback will add it when received
+                // Only add to UI list for immediate visual feedback
+                let beacon_for_ui = beacon_msg;
+                
+                // Add to UI list
+                let (my_lat, my_lon) = {
+                    if let Ok(gps_guard) = gps_for_aprs.lock() {
+                        let gps_data = gps_guard.data.lock().unwrap();
+                        if let (Some(lat), Some(lon)) = (gps_data.latitude, gps_data.longitude) { (lat, lon) }
+                        else { (0.0, 0.0) }
+                    } else { (0.0, 0.0) }
+                };
+                add_aprs_message_to_list(
+                    &beacon_for_ui,
+                    &aprs_list_for_beacon,
+                    &aprs_empty_for_beacon,
+                    my_lat, my_lon
+                );
             }
             Err(e) => {
                 eprintln!("[pocket-modem] Beacon failed: {}", e);
