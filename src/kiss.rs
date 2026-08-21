@@ -441,3 +441,79 @@ pub fn build_tx_audio_packet(opus_data: &[u8]) -> Vec<u8> {
     build_kv4p_packet(HostCommand::TxAudio, opus_data)
 }
 
+// ============================================================================
+// AX.25 Frame Building for APRS TX
+// ============================================================================
+
+/// Encode a 6-character callsign + SSID into 7-byte AX.25 format
+/// Each character is stored in bits 1-7 (shifted right by 1)
+/// Byte 7 contains SSID in lower 4 bits and control bits in upper bits
+fn encode_callsign(callsign: &str) -> [u8; 7] {
+    let mut result = [0x20u8; 7];  // Default to space (0x20 shifted)
+    
+    // Handle callsign with optional SSID
+    let (call_part, ssid) = if let Some(dash_idx) = callsign.find('-') {
+        (&callsign[..dash_idx], callsign[dash_idx + 1..].parse::<u8>().unwrap_or(0))
+    } else {
+        (callsign, 0)
+    };
+    
+    // Copy up to 6 characters
+    for (i, byte) in call_part.bytes().take(6).enumerate() {
+        // Convert to uppercase and shift into bits 1-7
+        let upper = byte.to_ascii_uppercase();
+        result[i] = upper << 1;
+    }
+    
+    // Byte 7: SSID in lower 4 bits
+    let ssid = ssid & 0x0F;
+    result[6] = (ssid << 1) | 0x60;  // 0x60 = ' ' character flags
+    
+    result
+}
+
+/// Build an AX.25 UI frame with digipeater path
+/// 
+/// Format: dest(7) + src(7) + digipeaters(n×7) + ctrl(1) + pid(1) + payload
+/// The final address byte has bit 0 set to indicate last address
+pub fn build_ax25_ui_frame(
+    dest: &str,           // e.g., "APRS"
+    src: &str,            // e.g., "KD4LCD-9"
+    digipath: &[String],  // e.g., ["ARISS"]
+    payload: &[u8],       // APRS text bytes
+) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(7 + 7 + digipath.len() * 7 + 2 + payload.len());
+    
+    // Destination (last address flag set)
+    let mut dest_bytes = encode_callsign(dest);
+    dest_bytes[6] |= 0x01;  // Set last address bit
+    frame.extend_from_slice(&dest_bytes);
+    
+    // Source (last address flag set if no digipeaters)
+    let mut src_bytes = encode_callsign(src);
+    if digipath.is_empty() {
+        src_bytes[6] |= 0x01;  // Set last address bit
+    }
+    frame.extend_from_slice(&src_bytes);
+    
+    // Digipeaters (each with last-address flag appropriately set)
+    for (i, digi) in digipath.iter().enumerate() {
+        let mut digi_bytes = encode_callsign(digi);
+        if i == digipath.len() - 1 {
+            digi_bytes[6] |= 0x01;  // Set last address bit on final digi
+        }
+        frame.extend_from_slice(&digi_bytes);
+    }
+    
+    // Control byte: 0x03 = UI frame
+    frame.push(0x03);
+    
+    // PID byte: 0xF0 = no layer 3 protocol (APRS)
+    frame.push(0xF0);
+    
+    // Payload (APRS data)
+    frame.extend_from_slice(payload);
+    
+    frame
+}
+

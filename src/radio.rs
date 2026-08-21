@@ -10,9 +10,9 @@
 //! Thread safety: KV4PRadio implements Send but NOT Sync. All public methods that
 //! need to be called from multiple threads should use the command queue pattern.
 
-use crate::aprs::{self, APRSMessage};
+use crate::aprs::{self, APRSMessage, AprsSymbol};
 use crate::kiss::{
-    build_kv4p_packet, build_tx_audio_packet, Ax25Frame, DeviceCommand, 
+    build_kv4p_packet, build_tx_audio_packet, build_ax25_ui_frame, Ax25Frame, DeviceCommand, 
     DeviceState, HostCommand, HostDesiredState, HostStateFlags, PacketParser, 
     RfModuleType, VersionInfo,
 };
@@ -520,6 +520,93 @@ impl KV4PRadio {
         }
         let frame = build_kv4p_packet(HostCommand::TxAudio, data);
         self.queue_command(RadioCommand::SendFrame(frame))
+    }
+    
+    /// Send APRS beacon with current GPS position
+    /// 
+    /// # Arguments
+    /// * `callsign` - Full APRS callsign with SSID (e.g., "KD4LCD-9")
+    /// * `lat` - Latitude in decimal degrees
+    /// * `lon` - Longitude in decimal degrees
+    /// * `alt` - Optional altitude in meters
+    /// * `symbol` - APRS symbol (table ID and code)
+    /// * `comment` - Optional comment text
+    /// 
+    /// # Returns
+    /// `Ok(packet_desc)` on success, `Err(msg)` on failure
+    /// 
+    /// # Notes
+    /// - Uses ARISS digipath (direct to ISS, no terrestrial path)
+    /// - GPS fix must be verified before calling this function
+    /// - TX uses current channel frequency (145.825 MHz for ISS)
+    pub fn send_aprs_beacon(
+        &self,
+        callsign: &str,
+        lat: f64,
+        lon: f64,
+        alt: Option<f64>,
+        symbol: AprsSymbol,
+        comment: &str,
+    ) -> Result<String, String> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err("Radio not connected".to_string());
+        }
+        
+        // FIRST: Send DesiredState with TX_ALLOWED and PTT_REQUESTED flags
+        // The firmware requires both flags for AX.25 transmission
+        let mut state = self.build_desired_state(false);
+        state.flags |= HostStateFlags::TX_ALLOWED.bits() | HostStateFlags::PTT_REQUESTED.bits();
+        self.queue_command(RadioCommand::SendState(state))?;
+        
+
+        
+        // Build APRS position report
+        let aprs_payload = aprs::build_position_report(lat, lon, symbol, comment);
+        eprintln!("[radio] APRS beacon payload: {}", aprs_payload);
+        
+        // Build AX.25 UI frame with ARISS digipath
+        let ax25_frame = build_ax25_ui_frame(
+            "APRS",      // Destination
+            callsign,    // Source callsign
+            &["ARISS".to_string()],  // Digipeater path (direct to ISS)
+            aprs_payload.as_bytes(),
+        );
+        
+        // Log the AX.25 frame for debugging
+        let hex_dump: String = ax25_frame.iter()
+            .map(|b| format!("{:02X} ", b))
+            .collect();
+        eprintln!("[radio] AX.25 frame ({} bytes): {}", ax25_frame.len(), hex_dump);
+        
+        // Send via KISS DATA frame (command 0x00)
+        // The firmware will handle AFSK modulation and TX
+        let kiss_frame = {
+            use crate::kiss::{KISS_FEND, KISS_FESC, KISS_TFEND, KISS_TFESC};
+            
+            // Build KISS frame: FEND + cmd(0x00) + escaped_data + FEND
+            let mut frame = vec![KISS_FEND, 0x00];  // 0x00 = TX DATA
+            
+            for &b in &ax25_frame {
+                if b == KISS_FEND {
+                    frame.push(KISS_FESC);
+                    frame.push(KISS_TFEND);
+                } else if b == KISS_FESC {
+                    frame.push(KISS_FESC);
+                    frame.push(KISS_TFESC);
+                } else {
+                    frame.push(b);
+                }
+            }
+            frame.push(KISS_FEND);
+            frame
+        };
+        
+        self.queue_command(RadioCommand::SendFrame(kiss_frame))?;
+        
+        eprintln!("[radio] APRS beacon queued: {} at {:.6}, {:.6}", 
+                  callsign, lat, lon);
+        
+        Ok(format!("Beacon sent: {} at {:.6}, {:.6}", callsign, lat, lon))
     }
 
     // ========================================================================

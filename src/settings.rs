@@ -11,7 +11,7 @@ use std::path::Path;
 use gio::prelude::SettingsExt;
 
 /// Current schema version - increment when adding new settings
-const CURRENT_SCHEMA_VERSION: u32 = 2;
+const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Default values for settings
 pub mod defaults {
@@ -253,6 +253,13 @@ pub struct AppSettings {
     pub tile_source: TileSource,
     pub offline_tiles_path: Option<String>,
     pub schema_version: u32,
+    // APRS TX Configuration
+    pub aprs_callsign: String,
+    pub aprs_ssid: u8,
+    pub aprs_symbol_table: char,
+    pub aprs_symbol_code: char,
+    pub aprs_comment: String,
+    pub aprs_tx_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -271,6 +278,13 @@ impl Default for AppSettings {
             tile_source: TileSource::default(),
             offline_tiles_path: None,
             schema_version: CURRENT_SCHEMA_VERSION,
+            // APRS TX defaults - no prefilled values, empty by default
+            aprs_callsign: String::new(),
+            aprs_ssid: 0,
+            aprs_symbol_table: '/',
+            aprs_symbol_code: '>',  // walking person (primary table)
+            aprs_comment: String::new(),
+            aprs_tx_enabled: false,
         }
     }
 }
@@ -318,6 +332,14 @@ impl SettingsManager {
         } else {
             None
         };
+        
+        // Load APRS settings
+        let aprs_callsign = self.settings.string("aprs-callsign").to_string();
+        let aprs_ssid = self.settings.int("aprs-ssid") as u8;
+        let aprs_symbol_table = self.settings.string("aprs-symbol-table").to_string();
+        let aprs_symbol_code = self.settings.string("aprs-symbol-code").to_string();
+        let aprs_comment = self.settings.string("aprs-comment").to_string();
+        let aprs_tx_enabled = self.settings.boolean("aprs-tx-enabled");
 
         AppSettings {
             frequency: self.settings.int("frequency") as u32,
@@ -333,6 +355,13 @@ impl SettingsManager {
             tile_source,
             offline_tiles_path,
             schema_version: self.settings.int("schema-version") as u32,
+            // APRS TX settings
+            aprs_callsign,
+            aprs_ssid,
+            aprs_symbol_table: aprs_symbol_table.chars().next().unwrap_or('/'),
+            aprs_symbol_code: aprs_symbol_code.chars().next().unwrap_or('\''),
+            aprs_comment,
+            aprs_tx_enabled,
         }
     }
 
@@ -430,6 +459,49 @@ impl SettingsManager {
             self.settings.set_string("offline-tiles-path", "").ok();
         }
     }
+    
+    // ========================================================================
+    // APRS TX Settings
+    // ========================================================================
+    
+    pub fn set_aprs_callsign(&mut self, callsign: &str) {
+        self.cached.aprs_callsign = callsign.to_uppercase();
+        self.settings.set_string("aprs-callsign", &self.cached.aprs_callsign).ok();
+    }
+    
+    pub fn set_aprs_ssid(&mut self, ssid: u8) {
+        self.cached.aprs_ssid = ssid;
+        self.settings.set_int("aprs-ssid", ssid as i32).ok();
+    }
+    
+    pub fn set_aprs_symbol_table(&mut self, table: char) {
+        self.cached.aprs_symbol_table = table;
+        self.settings.set_string("aprs-symbol-table", &table.to_string()).ok();
+    }
+    
+    pub fn set_aprs_symbol_code(&mut self, code: char) {
+        self.cached.aprs_symbol_code = code;
+        self.settings.set_string("aprs-symbol-code", &code.to_string()).ok();
+    }
+    
+    pub fn set_aprs_comment(&mut self, comment: &str) {
+        self.cached.aprs_comment = comment.to_string();
+        self.settings.set_string("aprs-comment", &self.cached.aprs_comment).ok();
+    }
+    
+    pub fn set_aprs_tx_enabled(&mut self, enabled: bool) {
+        self.cached.aprs_tx_enabled = enabled;
+        self.settings.set_boolean("aprs-tx-enabled", enabled).ok();
+    }
+    
+    /// Get the full APRS callsign with SSID (e.g., "KD4LCD-9")
+    pub fn aprs_full_callsign(&self) -> String {
+        if self.cached.aprs_ssid > 0 {
+            format!("{}-{}", self.cached.aprs_callsign, self.cached.aprs_ssid)
+        } else {
+            self.cached.aprs_callsign.clone()
+        }
+    }
 
     // ========================================================================
     // Getters
@@ -447,6 +519,14 @@ impl SettingsManager {
     pub fn schema_version(&self) -> u32 { self.cached.schema_version }
     pub fn tile_source(&self) -> TileSource { self.cached.tile_source }
     pub fn offline_tiles_path(&self) -> Option<&str> { self.cached.offline_tiles_path.as_deref() }
+    
+    // APRS TX getters
+    pub fn aprs_callsign(&self) -> &str { &self.cached.aprs_callsign }
+    pub fn aprs_ssid(&self) -> u8 { self.cached.aprs_ssid }
+    pub fn aprs_symbol_table(&self) -> char { self.cached.aprs_symbol_table }
+    pub fn aprs_symbol_code(&self) -> char { self.cached.aprs_symbol_code }
+    pub fn aprs_comment(&self) -> &str { &self.cached.aprs_comment }
+    pub fn aprs_tx_enabled(&self) -> bool { self.cached.aprs_tx_enabled }
 
     pub fn channels(&self) -> &[Channel] {
         &self.cached.channels

@@ -567,6 +567,86 @@ pub fn ssid(callsign: &str) -> i32 {
     }
 }
 
+/// APRS symbol configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AprsSymbol {
+    pub table_id: char,
+    pub code: char,
+}
+
+impl AprsSymbol {
+    // Person symbol in primary table is '>' (greater than sign)
+    // Aircraft is "'" (apostrophe)
+    pub fn default_person() -> Self {
+        Self { table_id: '/', code: '>' }
+    }
+    
+    pub fn new(table_id: char, code: char) -> Self {
+        Self { table_id, code }
+    }
+}
+
+/// Build APRS position report string
+/// 
+/// Format: !DDMM.mmN/DDDMM.mmW[comment]
+/// Uses '!' without timestamp (most common ISS format)
+/// 
+/// # Arguments
+/// * `lat` - Latitude in decimal degrees (negative for south)
+/// * `lon` - Longitude in decimal degrees (negative for west)
+/// * `symbol` - APRS symbol (table ID and code)
+/// * `comment` - Optional comment text
+pub fn build_position_report(
+    lat: f64,
+    lon: f64,
+    symbol: AprsSymbol,
+    comment: &str,
+) -> String {
+    // Clamp values to valid APRS ranges
+    let lat = lat.clamp(-90.0, 90.0);
+    let lon = lon.clamp(-180.0, 180.0);
+    
+    // Convert decimal degrees to APRS DDMM.MM format
+    let (lat_deg, lat_min) = if lat >= 0.0 {
+        let deg = lat.floor() as u32;
+        let min = (lat - deg as f64) * 60.0;
+        (deg, min)
+    } else {
+        let deg = (-lat).floor() as u32;
+        let min = ((-lat) - deg as f64) * 60.0;
+        (-(deg as i32) as u32, min)
+    };
+    
+    let (lon_deg, lon_min) = if lon >= 0.0 {
+        let deg = lon.floor() as u32;
+        let min = (lon - deg as f64) * 60.0;
+        (deg, min)
+    } else {
+        let deg = (-lon).floor() as u32;
+        let min = ((-lon) - deg as f64) * 60.0;
+        (-(deg as i32) as u32, min)
+    };
+    
+    let ns = if lat >= 0.0 { 'N' } else { 'S' };
+    let ew = if lon >= 0.0 { 'E' } else { 'W' };
+    
+    // Format: !DDMM.MMN/DDDMM.MMW'
+    // Symbol code follows E/W direction
+    let report = format!(
+        "!{:02}{:05.2}{}/{:03}{:05.2}{}{}",
+        lat_deg, lat_min, ns,
+        lon_deg, lon_min, ew,
+        symbol.code
+    );
+    
+    // Append comment if present
+    if comment.is_empty() {
+        report
+    } else {
+        format!("{} {}", report, comment)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,4 +673,50 @@ mod tests {
         assert!((lat - 49.2867).abs() < 0.001);
         assert!((lon - (-123.1148)).abs() < 0.001);
     }
+    
+    #[test]
+    fn test_build_position_report() {
+        // Test with known ISS position (ARISS satellite pass over Europe)
+        let report = build_position_report(
+            48.8584,  // Paris
+            2.2945,   // Paris
+            AprsSymbol::default_person(),
+            "ISS",
+        );
+        
+        // Should produce !4825.14N/00217.67W/' ISS
+        assert!(report.starts_with("!"));
+        assert!(report.contains("N/"));
+        assert!(report.contains("W/"));
+        assert!(report.ends_with("' ISS"));
+        
+        // Test without comment
+        let report_no_comment = build_position_report(
+            45.0, 30.0,
+            AprsSymbol::new('/', 'O'),  // balloon
+            "",
+        );
+        assert!(report_no_comment.ends_with("O"));
+    }
+    
+    #[test]
+    fn test_encode_callsign_kiss() {
+        // Test via the public API - build_ax25_ui_frame
+        let frame = build_ax25_ui_frame(
+            "APRS",
+            "KD4LCD-9",
+            &["ARISS".to_string()],
+            b"!4825.14N/00217.67W/'",
+        );
+        
+        // Frame should be: APRS(7) + KD4LCD-9(7) + ARISS(7) + ctrl(1) + pid(1) + payload
+        // Total: 23 + payload
+        assert!(frame.len() > 23);
+        assert_eq!(frame[14], 0x03);  // Control byte
+        assert_eq!(frame[15], 0xF0);  // PID byte
+    }
 }
+
+// Import for tests
+#[cfg(test)]
+use crate::kiss::build_ax25_ui_frame;

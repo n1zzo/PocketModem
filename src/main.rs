@@ -21,17 +21,15 @@ use audio::{AudioConfig, AudioManager};
 use gps::GpsManager;
 use map::MapManager;
 use settings::{SettingsManager, Channel, Duplex, ToneMode, PowerLevel};
-use utils::{calculate_maidenhead, calculate_distance_bearing, calculate_distance_display, escape_markup, bearing_to_compass};
-use ui::{header_bar, main_page, aprs_page, map_page, settings_page, status_button, aprs_message_row, APP_CSS};
+use utils::{calculate_maidenhead, calculate_distance_bearing, escape_markup, bearing_to_compass};
 
 use radio::{KV4PRadio, SerialConfig};
 
 #[cfg(feature = "notifications")]
-use libnotify::{init, is_initted, Notification};
+use libnotify::init;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::thread;
 
 use adw::prelude::*;
 use adw;
@@ -895,6 +893,75 @@ fn create_ui(
     aprs_header.set_margin_top(16);
     aprs_header.set_margin_bottom(8);
     
+    // Beacon status FSM
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BeaconState {
+        NeedsConfig,     // No callsign configured
+        NeedsTxEnabled,  // Callsign set but TX disabled
+        NeedsGpsFix,     // TX enabled but no GPS fix
+        Ready,           // Ready to beacon
+        Transmitting,    // Currently transmitting
+        Success,         // Last beacon succeeded
+        Failed,          // Last beacon failed
+    }
+    
+    impl BeaconState {
+        fn message(&self) -> &'static str {
+            match self {
+                BeaconState::NeedsConfig  => "Enter callsign in Settings",
+                BeaconState::NeedsTxEnabled => "Enable APRS TX in Settings",
+                BeaconState::NeedsGpsFix  => "Waiting for GPS fix...",
+                BeaconState::Ready        => "Ready",
+                BeaconState::Transmitting => "Transmitting...",
+                BeaconState::Success      => "Beacon sent!",
+                BeaconState::Failed       => "TX failed - retry",
+            }
+        }
+    }
+    
+    let beacon_state: Arc<Mutex<BeaconState>> = Arc::new(Mutex::new(BeaconState::NeedsConfig));
+    
+    // Beacon button (wider than PTT, 2/3 height)
+    let beacon_btn = gtk::Button::new();
+    beacon_btn.set_tooltip_text(Some("Send APRS beacon"));
+    beacon_btn.set_size_request(280, 67);
+    beacon_btn.set_hexpand(false);
+    beacon_btn.add_css_class("beacon-button");
+    
+    let beacon_inner = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    beacon_inner.set_halign(gtk::Align::Center);
+    beacon_inner.set_valign(gtk::Align::Center);
+    beacon_inner.set_hexpand(true);
+    
+    let beacon_icon = gtk::Image::from_icon_name("radio-symbolic");
+    beacon_icon.set_pixel_size(24);
+    beacon_icon.add_css_class("beacon-icon");
+    
+    let beacon_label = gtk::Label::new(Some("Beacon"));
+    beacon_label.add_css_class("beacon-label");
+    
+    beacon_inner.append(&beacon_icon);
+    beacon_inner.append(&beacon_label);
+    beacon_btn.set_child(Some(&beacon_inner));
+    
+    // Beacon status (above button)
+    let beacon_status = gtk::Label::new(Some(BeaconState::NeedsConfig.message()));
+    beacon_status.add_css_class("beacon-status");
+    beacon_status.set_margin_bottom(8);
+    beacon_status.set_halign(gtk::Align::Center);
+    
+    // Beacon container (status above, button below) - matches PTT layout
+    let beacon_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    beacon_container.set_halign(gtk::Align::Center);
+    beacon_container.set_valign(gtk::Align::End);
+    beacon_container.set_vexpand(false);
+    beacon_container.set_margin_start(20);
+    beacon_container.set_margin_end(20);
+    beacon_container.set_margin_top(8);
+    beacon_container.set_margin_bottom(16);
+    beacon_container.append(&beacon_status);
+    beacon_container.append(&beacon_btn);
+    
     let aprs_scroll = gtk::ScrolledWindow::new();
     aprs_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     aprs_scroll.set_hexpand(false);
@@ -904,6 +971,7 @@ fn create_ui(
     
     aprs_page.append(&aprs_header);
     aprs_page.append(&aprs_scroll);
+    aprs_page.append(&beacon_container);
     
     // APRS container - fixed 340px
     let aprs_clamp = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1032,12 +1100,15 @@ fn create_ui(
     settings_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     settings_scroll.set_hexpand(false);
     settings_scroll.set_vexpand(true);
+    settings_scroll.set_min_content_height(600);
     
     let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    settings_box.set_vexpand(false);
+    settings_box.set_valign(gtk::Align::Start);  // Don't stretch, just take needed space
     settings_box.set_margin_top(12);
     settings_box.set_margin_start(12);
     settings_box.set_margin_end(12);
-    settings_box.set_margin_bottom(12);
+    settings_box.set_margin_bottom(200);  // Extra bottom margin for scrolling
     
     // === MODEM Section ===
     let modem_group = adw::PreferencesGroup::builder()
@@ -1197,7 +1268,140 @@ fn create_ui(
     
     settings_box.append(&audio_group);
     
+    // === APRS TX Section ===
+    let aprs_group = adw::PreferencesGroup::builder()
+        .title("APRS TX")
+        .build();
+    
+    // Callsign input
+    let settings_aprs_call = settings as *const SettingsManager as *mut SettingsManager;
+    let aprs_call_entry = gtk::Entry::new();
+    aprs_call_entry.set_placeholder_text(Some("KD4LCD"));
+    aprs_call_entry.set_hexpand(true);
+    aprs_call_entry.set_max_width_chars(8);
+    let current_call = unsafe { (*settings).aprs_callsign().to_string() };
+    if !current_call.is_empty() {
+        aprs_call_entry.set_text(&current_call);
+    }
+    
+    let aprs_call_row = adw::ActionRow::builder()
+        .title("Callsign")
+        .subtitle("Your amateur radio callsign")
+        .build();
+    aprs_call_row.add_suffix(&aprs_call_entry);
+    aprs_call_row.set_activatable_widget(Some(&aprs_call_entry));
+    
+    let settings_ssid = settings as *const SettingsManager as *mut SettingsManager;
+    let ssid_adj = gtk::Adjustment::new(0.0, 0.0, 15.0, 1.0, 0.0, 0.0);
+    let current_ssid = unsafe { (*settings).aprs_ssid() };
+    ssid_adj.set_value(current_ssid as f64);
+    let aprs_ssid_spin = adw::SpinRow::builder()
+        .title("SSID")
+        .subtitle("Secondary station identifier (0-15)")
+        .adjustment(&ssid_adj)
+        .build();
+    
+    // Symbol picker (ComboRow)
+    let aprs_symbols = vec![
+        ("Car 🚗", '/', '>'),  // Primary table: car
+        ("Person 👤", '\\', '['),  // Alternate table: person
+        ("Aircraft ✈️", '\\', '\''),  // Alternate table: aircraft  
+        ("Balloon 🎈", '/', 'O'),
+        ("House 🏠", '/', '*'),
+        ("Bike 🚴", '/', 'b'),
+        ("Sailboat ⛵", '/', 'S'),
+        ("RV 🚐", '/', 'R'),
+    ];
+    let symbol_labels: Vec<String> = aprs_symbols.iter().map(|(l, _, _)| l.to_string()).collect();
+    let symbol_model = gtk::StringList::new(&symbol_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    
+    // Find current symbol index
+    let current_symbol_table = unsafe { (*settings).aprs_symbol_table() };
+    let current_symbol_code = unsafe { (*settings).aprs_symbol_code() };
+    let current_symbol_idx = aprs_symbols.iter().position(|(_, t, c)| *t == current_symbol_table && *c == current_symbol_code).unwrap_or(0) as u32;
+    
+    let aprs_symbol_row = adw::ComboRow::builder()
+        .title("Symbol")
+        .subtitle("APRS symbol for your station")
+        .selected(current_symbol_idx)
+        .model(&symbol_model)
+        .build();
+    
+    // Comment input
+    let settings_aprs_comment = settings as *const SettingsManager as *mut SettingsManager;
+    let aprs_comment_entry = gtk::Entry::new();
+    aprs_comment_entry.set_placeholder_text(Some("PocketModem on KV4P"));
+    aprs_comment_entry.set_hexpand(true);
+    let current_comment = unsafe { (*settings).aprs_comment().to_string() };
+    if !current_comment.is_empty() {
+        aprs_comment_entry.set_text(&current_comment);
+    }
+    
+    let aprs_comment_row = adw::ActionRow::builder()
+        .title("Comment")
+        .subtitle("Optional beacon comment")
+        .build();
+    aprs_comment_row.add_suffix(&aprs_comment_entry);
+    aprs_comment_row.set_activatable_widget(Some(&aprs_comment_entry));
+    
+    // TX enable switch
+    let settings_tx = settings as *const SettingsManager as *mut SettingsManager;
+    let current_tx_enabled = unsafe { (*settings).aprs_tx_enabled() };
+    let aprs_tx_row = adw::SwitchRow::builder()
+        .title("Enable APRS TX")
+        .subtitle("Allow beacon transmission")
+        .active(current_tx_enabled)
+        .build();
+    
+    aprs_group.add(&aprs_call_row);
+    aprs_group.add(&aprs_ssid_spin);
+    aprs_group.add(&aprs_symbol_row);
+    aprs_group.add(&aprs_comment_row);
+    aprs_group.add(&aprs_tx_row);
+    
+    settings_box.append(&aprs_group);
+    
     // === About Section ===
+    
+    // APRS settings handlers
+    let aprs_call_for_handler = aprs_call_entry.clone();
+    let settings_aprs_1 = settings as *const SettingsManager as *mut SettingsManager;
+    aprs_call_entry.connect_changed(move |entry| {
+        let text = entry.text().to_string().trim().to_uppercase();
+        unsafe { (*settings_aprs_1).set_aprs_callsign(&text); }
+    });
+    
+    let settings_aprs_2 = settings as *const SettingsManager as *mut SettingsManager;
+    ssid_adj.connect_value_changed(move |adj| {
+        let ssid = adj.value() as u8;
+        unsafe { (*settings_aprs_2).set_aprs_ssid(ssid); }
+    });
+    
+    let settings_aprs_3 = settings as *const SettingsManager as *mut SettingsManager;
+    let aprs_symbols_clone = aprs_symbols.clone();
+    aprs_symbol_row.connect_notify_local(Some("selected"), move |row, _| {
+        let idx = row.selected() as usize;
+        if idx < aprs_symbols_clone.len() {
+            let (_, table, code) = &aprs_symbols_clone[idx];
+            unsafe {
+                (*settings_aprs_3).set_aprs_symbol_table(*table);
+                (*settings_aprs_3).set_aprs_symbol_code(*code);
+            }
+        }
+    });
+    
+    let aprs_comment_for_handler = aprs_comment_entry.clone();
+    let settings_aprs_4 = settings as *const SettingsManager as *mut SettingsManager;
+    aprs_comment_entry.connect_changed(move |entry| {
+        let text = entry.text().to_string();
+        unsafe { (*settings_aprs_4).set_aprs_comment(&text); }
+    });
+    
+    let settings_aprs_5 = settings as *const SettingsManager as *mut SettingsManager;
+    aprs_tx_row.connect_notify_local(Some("active"), move |row, _| {
+        unsafe { (*settings_aprs_5).set_aprs_tx_enabled(row.is_active()); }
+    });
+    
     let about_group = adw::PreferencesGroup::builder()
         .title("About")
         .build();
@@ -1469,6 +1673,127 @@ fn create_ui(
         });
     }
     
+    // =========================================================================
+    // APRS Beacon TX Button Handler
+    // =========================================================================
+    let settings_beacon = settings as *const SettingsManager as *mut SettingsManager;
+    let gps_for_beacon = Arc::clone(gps);
+    let radio_for_beacon = Arc::clone(radio);
+    let beacon_btn_clone = beacon_btn.clone();
+    let beacon_status_clone = beacon_status.clone();
+    let toast_overlay_clone = toast_overlay.clone();
+    let beacon_state_clone = Arc::clone(&beacon_state);
+    
+    beacon_btn.connect_clicked(move |btn| {
+        btn.set_sensitive(false);
+        beacon_status_clone.set_text("Checking GPS...");
+        
+        // Read settings fresh at click time
+        let (call, symbol_table, symbol_code, comment, tx_enabled) = unsafe {
+            let s = &*settings_beacon;
+            (s.aprs_full_callsign(), s.aprs_symbol_table(), s.aprs_symbol_code(), s.aprs_comment().to_string(), s.aprs_tx_enabled())
+        };
+        
+        // Check TX enabled
+        if !tx_enabled {
+            *beacon_state_clone.lock().unwrap() = BeaconState::NeedsTxEnabled;
+            beacon_status_clone.set_text(BeaconState::NeedsTxEnabled.message());
+            beacon_status_clone.add_css_class("status-warning");
+            beacon_status_clone.remove_css_class("status-success");
+            btn.set_sensitive(true);
+            
+            let toast = adw::Toast::new("Enable APRS TX in Settings");
+            toast_overlay_clone.add_toast(toast);
+            return;
+        }
+        
+        // Check GPS fix
+        let (lat, lon, has_fix) = {
+            if let Ok(g) = gps_for_beacon.lock() {
+                let data = g.get_data();
+                (data.latitude, data.longitude, data.has_fix)
+            } else { (None, None, false) }
+        };
+        
+        // Check GPS fix
+        if !has_fix || lat.is_none() || lon.is_none() {
+            *beacon_state_clone.lock().unwrap() = BeaconState::NeedsGpsFix;
+            beacon_status_clone.set_text(BeaconState::NeedsGpsFix.message());
+            beacon_status_clone.add_css_class("status-warning");
+            beacon_status_clone.remove_css_class("status-success");
+            btn.set_sensitive(true);
+            
+            let toast = adw::Toast::new("GPS fix required for APRS beacon");
+            toast_overlay_clone.add_toast(toast);
+            return;
+        }
+        
+        // Check callsign
+        if call.is_empty() || call == "-0" {
+            *beacon_state_clone.lock().unwrap() = BeaconState::NeedsConfig;
+            beacon_status_clone.set_text(BeaconState::NeedsConfig.message());
+            beacon_status_clone.add_css_class("status-warning");
+            beacon_status_clone.remove_css_class("status-success");
+            btn.set_sensitive(true);
+            
+            let toast = adw::Toast::new("Configure your callsign in Settings");
+            toast_overlay_clone.add_toast(toast);
+            return;
+        }
+        
+        // Use fresh-read settings values
+        let symbol = aprs::AprsSymbol::new(symbol_table, symbol_code);
+        let call_for_tx = call;
+        let comment_for_tx = comment;
+        
+        *beacon_state_clone.lock().unwrap() = BeaconState::Transmitting;
+        beacon_status_clone.set_text(BeaconState::Transmitting.message());
+        beacon_status_clone.remove_css_class("status-warning");
+        beacon_status_clone.remove_css_class("status-success");
+        
+        // Copy all needed values before spawning thread (cannot pass raw pointers)
+        let lat = lat.unwrap();
+        let lon = lon.unwrap();
+        
+        // Clone UI widgets for use in the callback
+        let status_for_callback = beacon_status_clone.clone();
+        let btn_for_callback = btn.clone();
+        let toast_for_success = toast_overlay_clone.clone();
+        let radio_for_tx = Arc::clone(&radio_for_beacon);
+        let state_for_callback = Arc::clone(&beacon_state_clone);
+        
+        // Send beacon on main thread (it's fast - just serial write)
+        let result = {
+            if let Ok(r) = radio_for_tx.lock() {
+                r.send_aprs_beacon(&call_for_tx, lat, lon, None, symbol, &comment_for_tx)
+            } else {
+                Err("Could not lock radio".to_string())
+            }
+        };
+        
+        match result {
+            Ok(msg) => {
+                eprintln!("[pocket-modem] Beacon sent: {}", msg);
+                *state_for_callback.lock().unwrap() = BeaconState::Success;
+                status_for_callback.set_text(BeaconState::Success.message());
+                status_for_callback.add_css_class("status-success");
+                status_for_callback.remove_css_class("status-warning");
+                btn_for_callback.set_sensitive(true);
+                
+                let toast = adw::Toast::new("Beacon transmitted");
+                toast_for_success.add_toast(toast);
+            }
+            Err(e) => {
+                eprintln!("[pocket-modem] Beacon failed: {}", e);
+                *state_for_callback.lock().unwrap() = BeaconState::Failed;
+                status_for_callback.set_text(BeaconState::Failed.message());
+                status_for_callback.add_css_class("status-error");
+                status_for_callback.remove_css_class("status-success");
+                btn_for_callback.set_sensitive(true);
+            }
+        }
+    });
+    
     #[cfg(feature = "notifications")]
     { if let Err(e) = init("pocket-modem") { eprintln!("[pocket-modem] Notifications init failed: {:?}", e); } }
     
@@ -1508,6 +1833,13 @@ fn create_ui(
     let aprs_empty_label_clone = aprs_empty_label.clone();
     let aprs_list_box_clone = aprs_list_box.clone();
     let aprs_last_displayed_clone = Arc::clone(&aprs_last_displayed);
+    
+    // Beacon UI elements for update loop
+    let beacon_state_update = Arc::clone(&beacon_state);
+    let beacon_status_update = beacon_status.clone();
+    let beacon_btn_update = beacon_btn.clone();
+    let settings_update = settings as *const SettingsManager as *mut SettingsManager;
+    let gps_update = Arc::clone(gps);
     
     let map_manager_clone = Arc::clone(&map_manager);
     let window_clone = window.clone();
@@ -1780,6 +2112,60 @@ fn create_ui(
         
         ptt_label_update.set_text("PTT");
         
+        // Update beacon state machine based on current settings and GPS
+        let (callsign, tx_enabled) = unsafe {
+            let call = (*settings_update).aprs_full_callsign();
+            let enabled = (*settings_update).aprs_tx_enabled();
+            (call, enabled)
+        };
+        let (has_gps_fix, _, _) = {
+            if let Ok(g) = gps_update.lock() {
+                let data = g.get_data();
+                (data.has_fix, data.latitude, data.longitude)
+            } else { (false, None, None) }
+        };
+        
+        // Compute new state
+        let new_state = if callsign.is_empty() || callsign == "-0" {
+            BeaconState::NeedsConfig
+        } else if !tx_enabled {
+            BeaconState::NeedsTxEnabled
+        } else if !has_gps_fix {
+            BeaconState::NeedsGpsFix
+        } else {
+            BeaconState::Ready
+        };
+        
+        // Update state if changed
+        {
+            let mut state = beacon_state_update.lock().unwrap();
+            if *state != new_state {
+                *state = new_state;
+                beacon_status_update.set_text(new_state.message());
+                beacon_status_update.remove_css_class("status-warning");
+                beacon_status_update.remove_css_class("status-success");
+                beacon_status_update.remove_css_class("status-error");
+                
+                match new_state {
+                    BeaconState::NeedsConfig | BeaconState::NeedsTxEnabled | BeaconState::NeedsGpsFix => {
+                        beacon_status_update.add_css_class("status-warning");
+                        beacon_btn_update.set_sensitive(false);
+                    }
+                    BeaconState::Ready | BeaconState::Transmitting => {
+                        beacon_btn_update.set_sensitive(true);
+                    }
+                    BeaconState::Success => {
+                        beacon_status_update.add_css_class("status-success");
+                        beacon_btn_update.set_sensitive(true);
+                    }
+                    BeaconState::Failed => {
+                        beacon_status_update.add_css_class("status-error");
+                        beacon_btn_update.set_sensitive(true);
+                    }
+                }
+            }
+        }
+        
         glib::ControlFlow::Continue
     });
     
@@ -1923,6 +2309,17 @@ fn create_ui(
         .map-recenter-btn { background: rgba(30, 30, 30, 0.8); border-radius: 20px; min-width: 40px; min-height: 40px; }
         .map-recenter-btn:hover { background: rgba(50, 50, 50, 0.9); }
         .map-recenter-btn:active { background: rgba(70, 70, 70, 0.9); }
+        .beacon-button { background: #333; border: 2px solid #555; border-radius: 12px; }
+        .beacon-button:hover { background: #444; border-color: #FFB000; }
+        .beacon-button:active { background: #444; border-color: #FFB000; }
+        .beacon-button:disabled { opacity: 0.5; }
+        .beacon-button:disabled .beacon-icon { color: #666; }
+        .beacon-button:disabled .beacon-label { color: #666; }
+        .beacon-icon { color: #888; }
+        .beacon-button:active .beacon-icon { color: #FFB000; }
+        .beacon-label { font-size: 14px; font-weight: bold; color: #888; }
+        .beacon-button:active .beacon-label { color: #FFB000; }
+        .beacon-status { font-size: 12px; color: #666; min-height: 20px; }
     "#);
     
     gtk::style_context_add_provider_for_display(

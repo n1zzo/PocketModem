@@ -4,7 +4,7 @@
 
     <!-- Schema version for migrations -->
     <key name="schema-version" type="i">
-      <default>2</default>
+      <default>3</default>
       <summary>Schema version for settings migrations</summary>
       <description>Incremented when settings schema changes to trigger migration</description>
     </key>
@@ -84,6 +84,43 @@
       <default>""</default>
       <summary>Path to offline MBTiles file</summary>
       <description>Path to MBTiles archive for offline map tiles</description>
+    </key>
+
+    <!-- APRS TX Settings -->
+    <key name="aprs-callsign" type="s">
+      <default>""</default>
+      <summary>APRS callsign</summary>
+      <description>Amateur radio callsign for APRS transmissions (e.g., "KD4LCD")</description>
+    </key>
+
+    <key name="aprs-ssid" type="i">
+      <default>0</default>
+      <summary>APRS SSID</summary>
+      <description>Secondary station identifier for APRS (0-15)</description>
+    </key>
+
+    <key name="aprs-symbol-table" type="s">
+      <default>"/"</default>
+      <summary>APRS symbol table</summary>
+      <description>APRS symbol table ID: "/" (primary) or "\\" (alternate)</description>
+    </key>
+
+    <key name="aprs-symbol-code" type="s">
+      <default>">"</default>
+      <summary>APRS symbol code</summary>
+      <description>APRS symbol code character (e.g., ">" for person, "'" for aircraft)</description>
+    </key>
+
+    <key name="aprs-comment" type="s">
+      <default>""</default>
+      <summary>APRS beacon comment</summary>
+      <description>Optional comment to include in APRS beacon transmissions</description>
+    </key>
+
+    <key name="aprs-tx-enabled" type="b">
+      <default>false</default>
+      <summary>APRS TX enabled</summary>
+      <description>Enable APRS beacon transmission</description>
     </key>
 
   </schema>
