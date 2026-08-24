@@ -448,18 +448,39 @@ pub fn build_tx_audio_packet(opus_data: &[u8]) -> Vec<u8> {
 /// Encode a 6-character callsign + SSID into 7-byte AX.25 format
 /// Each character is stored in bits 1-7 (shifted right by 1)
 /// Byte 7 contains SSID in lower 4 bits and control bits in upper bits
+/// 
+/// For callsigns like "WIDE2-1", the SSID digit is included in bytes 0-5,
+/// with the SSID value in byte 6
 fn encode_callsign(callsign: &str) -> [u8; 7] {
     let mut result = [0x20u8; 7];  // Default to space (0x20 shifted)
     
     // Handle callsign with optional SSID
-    let (call_part, ssid) = if let Some(dash_idx) = callsign.find('-') {
-        (&callsign[..dash_idx], callsign[dash_idx + 1..].parse::<u8>().unwrap_or(0))
+    let ssid = if let Some(dash_idx) = callsign.find('-') {
+        callsign[dash_idx + 1..].parse::<u8>().unwrap_or(0)
     } else {
-        (callsign, 0)
+        0
+    };
+    
+    // Build callsign string including SSID digit for single-digit SSIDs
+    // This ensures "WIDE2-1" encodes as "WIDE21" (6 chars) with SSID=1
+    let call_part = if let Some(dash_idx) = callsign.find('-') {
+        &callsign[..dash_idx]
+    } else {
+        callsign
+    };
+    
+    // For digipeater paths like "WIDE2-1", the SSID digit can be included in the
+    // callsign if the base is short enough (e.g., WIDE1 → WIDE11 = 6 chars OK).
+    // But for 6-char callsigns like "IU2KIN", we CANNOT append - must use SSID field.
+    // Rule: only append if base call length <= 5, so total <= 6.
+    let ssid_char = if ssid > 0 && ssid < 10 && call_part.len() <= 5 {
+        format!("{}{}", call_part, ssid)
+    } else {
+        call_part.to_string()
     };
     
     // Copy up to 6 characters
-    for (i, byte) in call_part.bytes().take(6).enumerate() {
+    for (i, byte) in ssid_char.bytes().take(6).enumerate() {
         // Convert to uppercase and shift into bits 1-7
         let upper = byte.to_ascii_uppercase();
         result[i] = upper << 1;
@@ -489,10 +510,10 @@ pub fn build_ax25_ui_frame(
     dest_bytes[6] |= 0x01;  // Set last address bit
     frame.extend_from_slice(&dest_bytes);
     
-    // Source (last address flag set if no digipeaters)
+    // Source (last address flag: only set if NO digipeaters)
     let mut src_bytes = encode_callsign(src);
     if digipath.is_empty() {
-        src_bytes[6] |= 0x01;  // Set last address bit
+        src_bytes[6] |= 0x01;  // Set last address bit only when no digipeaters
     }
     frame.extend_from_slice(&src_bytes);
     
@@ -512,6 +533,50 @@ pub fn build_ax25_ui_frame(
     frame.push(0xF0);
     
     // Payload (APRS data)
+    frame.extend_from_slice(payload);
+    
+    frame
+}
+
+/// Build an AX.25 UI frame for ACK messages with Yaesu-compatible destination
+/// 
+/// Build an AX.25 UI frame for ACK messages
+/// Uses standard APRS destination for interoperability with all radios
+pub fn build_ax25_ack_frame(
+    src: &str,            // Source callsign (e.g., "IU2KIN-5")
+    digipath: &[String],  // Digipeater path (empty for direct ACK)
+    payload: &[u8],       // ACK payload bytes (e.g., ":IU2KIN-7 :ackXXX\r")
+) -> Vec<u8> {
+    // Standard APRS destination
+    let mut aprs_dest = encode_callsign("APRS");
+    aprs_dest[6] |= 0x01;  // Set last address bit on destination
+    
+    let mut frame = Vec::with_capacity(7 + 7 + digipath.len() * 7 + 2 + payload.len());
+    frame.extend_from_slice(&aprs_dest);
+    
+    // Source (last address flag NOT set when there are digipeaters - matches reference)
+    let mut src_bytes = encode_callsign(src);
+    if digipath.is_empty() {
+        src_bytes[6] |= 0x01;
+    }
+    frame.extend_from_slice(&src_bytes);
+    
+    // Digipeaters - standard encoding (encode_callsign produces correct byte7)
+    for (i, digi) in digipath.iter().enumerate() {
+        let mut digi_bytes = encode_callsign(digi);
+        if i == digipath.len() - 1 {
+            digi_bytes[6] |= 0x01;  // Last address flag on final digi
+        }
+        frame.extend_from_slice(&digi_bytes);
+    }
+    
+    // Control byte: 0x03 = UI frame
+    frame.push(0x03);
+    
+    // PID byte: 0xF0 = no layer 3 protocol (APRS)
+    frame.push(0xF0);
+    
+    // Payload
     frame.extend_from_slice(payload);
     
     frame

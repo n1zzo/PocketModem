@@ -380,6 +380,9 @@ impl MapManager {
         // Set default position
         viewport.set_zoom_level(DEFAULT_ZOOM);
         
+        // Center on default location to trigger tile downloads
+        map.center_on(DEFAULT_LAT, DEFAULT_LON);
+        
         eprintln!("[map] Created libshumate Map with VectorRenderer");
 
         // Create marker layer

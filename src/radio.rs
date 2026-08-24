@@ -12,7 +12,7 @@
 
 use crate::aprs::{self, APRSMessage, AprsSymbol};
 use crate::kiss::{
-    build_kv4p_packet, build_tx_audio_packet, build_ax25_ui_frame, Ax25Frame, DeviceCommand, 
+    build_kv4p_packet, build_tx_audio_packet, build_ax25_ui_frame, build_ax25_ack_frame, Ax25Frame, DeviceCommand, 
     DeviceState, HostCommand, HostDesiredState, HostStateFlags, PacketParser, 
     RfModuleType, VersionInfo,
 };
@@ -568,7 +568,8 @@ impl KV4PRadio {
         
         // FIRST: Send DesiredState with TX_ALLOWED and PTT_REQUESTED flags
         // The firmware requires both flags for AX.25 transmission
-        let mut state = self.build_desired_state(false);
+        // Must include RADIO_CONFIG_VALID so firmware accepts the transmission
+        let mut state = self.build_desired_state(true);
         state.flags |= HostStateFlags::TX_ALLOWED.bits() | HostStateFlags::PTT_REQUESTED.bits();
         self.queue_command(RadioCommand::SendState(state))?;
         
@@ -620,7 +621,142 @@ impl KV4PRadio {
         
         Ok(format!("Beacon sent: {} at {:.6}, {:.6}", callsign, lat, lon))
     }
-
+    
+    /// Send an APRS text message to a specific station
+    ///
+    /// Format: :RECIPIENT  :Message text{msg_id
+    ///
+    /// Messages require acknowledgment (ACK) from the recipient.
+    /// Without digipeaters, messages will only reach stations within direct range.
+    pub fn send_aprs_message(
+        &self,
+        callsign: &str,
+        recipient: &str,
+        message: &str,
+        msg_id: &str,
+    ) -> Result<String, String> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err("Radio not connected".to_string());
+        }
+        
+        // FIRST: Send DesiredState with TX_ALLOWED and PTT_REQUESTED flags
+        // Must include RADIO_CONFIG_VALID so firmware accepts the transmission
+        let mut state = self.build_desired_state(true);
+        state.flags |= HostStateFlags::TX_ALLOWED.bits() | HostStateFlags::PTT_REQUESTED.bits();
+        self.queue_command(RadioCommand::SendState(state))?;
+        
+        // Build APRS message payload with optional message ID for ACK tracking
+        let aprs_payload = aprs::build_message_payload_with_id(recipient, message, msg_id);
+        eprintln!("[radio] APRS message payload: {} (ID: {})", aprs_payload, msg_id);
+        
+        // Build AX.25 UI frame (no digipeaters for direct messages)
+        let ax25_frame = build_ax25_ui_frame(
+            "APRS",     // Destination (APRS is the standard UI destination)
+            callsign,   // Source callsign
+            &[],        // No digipeaters (direct transmission)
+            aprs_payload.as_bytes(),
+        );
+        
+        // Log the AX.25 frame for debugging
+        let hex_dump: String = ax25_frame.iter()
+            .map(|b| format!("{:02X} ", b))
+            .collect();
+        eprintln!("[radio] AX.25 message frame ({} bytes): {}", ax25_frame.len(), hex_dump);
+        
+        // Send via KISS DATA frame (command 0x00)
+        let kiss_frame = {
+            use crate::kiss::{KISS_FEND, KISS_FESC, KISS_TFEND, KISS_TFESC};
+            
+            let mut frame = vec![KISS_FEND, 0x00];
+            
+            for &b in &ax25_frame {
+                if b == KISS_FEND {
+                    frame.push(KISS_FESC);
+                    frame.push(KISS_TFEND);
+                } else if b == KISS_FESC {
+                    frame.push(KISS_FESC);
+                    frame.push(KISS_TFESC);
+                } else {
+                    frame.push(b);
+                }
+            }
+            frame.push(KISS_FEND);
+            frame
+        };
+        
+        self.queue_command(RadioCommand::SendFrame(kiss_frame))?;
+        
+        eprintln!("[radio] APRS message queued: {} -> {}: {}", 
+                  callsign, recipient, message);
+        
+        Ok(format!("Message sent to {}", recipient))
+    }
+    
+    /// Send an APRS acknowledgment for a received message
+    ///
+    /// Format: :SENDER:ackMSGID
+    pub fn send_aprs_ack(
+        &self,
+        callsign: &str,
+        original_sender: &str,
+        msg_id: &str,
+    ) -> Result<String, String> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err("Radio not connected".to_string());
+        }
+        
+        // FIRST: Send DesiredState with TX_ALLOWED and PTT_REQUESTED flags
+        // Must include RADIO_CONFIG_VALID so firmware accepts the transmission
+        let mut state = self.build_desired_state(true);
+        state.flags |= HostStateFlags::TX_ALLOWED.bits() | HostStateFlags::PTT_REQUESTED.bits();
+        self.queue_command(RadioCommand::SendState(state))?;
+        
+        // Wait for radio TX to complete and switch to RX (4s)
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        
+        // Build ACK payload
+        let ack_payload = aprs::build_ack_payload(original_sender, msg_id);  // original_sender is who we reply TO
+        eprintln!("[radio] SENT ACK - payload: {:?} (from: {}, to: {}, msg_id: {})", ack_payload, callsign, original_sender, msg_id);
+        
+        // Build AX.25 UI frame using Yaesu-compatible format
+        // The FT-1D expects ACK destination to be "APY01D" not "APRS"
+        // NO digipeaters for direct ACK - matches Yaesu reference ACK format
+        let ax25_frame = build_ax25_ack_frame(
+            callsign,
+            &[],  // No digipeaters - direct transmission only
+            ack_payload.as_bytes(),
+        );
+        eprintln!("[radio] SENT ACK AX.25 frame ({} bytes): {:?}", ax25_frame.len(), ax25_frame);
+        
+        // Send via KISS DATA frame
+        let kiss_frame = {
+            use crate::kiss::{KISS_FEND, KISS_FESC, KISS_TFEND, KISS_TFESC};
+            
+            let mut frame = vec![KISS_FEND, 0x00];
+            
+            for &b in &ax25_frame {
+                if b == KISS_FEND {
+                    frame.push(KISS_FESC);
+                    frame.push(KISS_TFEND);
+                } else if b == KISS_FESC {
+                    frame.push(KISS_FESC);
+                    frame.push(KISS_TFESC);
+                } else {
+                    frame.push(b);
+                }
+            }
+            frame.push(KISS_FEND);
+            frame
+        };
+        
+        self.queue_command(RadioCommand::SendFrame(kiss_frame))?;
+        
+        eprintln!("[radio] APRS ACK queued: {} -> {} ack{}", 
+                  callsign, original_sender, msg_id);
+        
+        Ok(format!("ACK sent to {}", original_sender))
+    }
+    
     // ========================================================================
     // Connection Management
     // ========================================================================
@@ -913,13 +1049,9 @@ fn io_thread_main(
                 Ok(n) => {
                     let packets = parser.lock().unwrap().feed(&buf[..n]);
                     for pkt in &packets {
-                        // Log KISS DATA frames (AX.25/APRS)
-                        if pkt.command == 0x00 && !pkt.payload.is_empty() {
-                            eprintln!("[radio] APRS: {}",
-                                      pkt.payload.iter()
-                                          .map(|b| format!("{:02X}", b))
-                                          .collect::<Vec<_>>()
-                                          .join(" "));
+                        // Debug: log non-audio/non-state packets
+                        if pkt.command != 0x0C && pkt.command != 0x07 && pkt.command != 0x0B {
+                            eprintln!("[radio] Packet: cmd=0x{:02X}, len={}", pkt.command, pkt.payload.len());
                         }
                         
                         // WindowUpdate (0x09): increment flow control window

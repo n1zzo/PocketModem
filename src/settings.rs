@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use gio::prelude::SettingsExt;
+use crate::aprs::{DirectMessage, DirectMessageStatus, MessageThread};
 
 /// Current schema version - increment when adding new settings
 const CURRENT_SCHEMA_VERSION: u32 = 3;
@@ -189,32 +190,23 @@ pub struct Channel {
     /// Receive frequency in kHz
     pub rx_freq_khz: u32,
     /// Duplex mode (simplex, +offset, -offset, split)
-    #[serde(default)]
     pub duplex: Duplex,
     /// TX offset in kHz (used for +/- duplex)
-    #[serde(default)]
     pub offset_khz: u32,
     /// TX frequency in kHz (used for split duplex)
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
     pub tx_freq_khz: Option<u32>,
     /// Tone mode
-    #[serde(default)]
     pub tone_mode: ToneMode,
     /// RX tone frequency in Hz (CTCSS)
-    #[serde(default)]
     pub rtone_hz: f32,
     /// TX tone frequency in Hz (CTCSS)
-    #[serde(default)]
     pub ctone_hz: f32,
     /// Mode: "FM" or "NFM"
-    #[serde(default)]
     pub mode: String,
     /// Power level
-    #[serde(default)]
     pub power: PowerLevel,
     /// Optional comment/notes
-    #[serde(default)]
     pub comment: String,
 }
 
@@ -261,6 +253,10 @@ pub struct AppSettings {
     pub aprs_comment: String,
     pub aprs_tx_enabled: bool,
     pub aprs_beacon_dest: String,  // Destination for beacon (default: "APRS")
+    // APRS Messages Storage
+    pub aprs_messages: Vec<DirectMessage>,
+    // Sequential message ID counter (for message numbering)
+    aprs_message_counter: u32,
 }
 
 impl Default for AppSettings {
@@ -287,6 +283,8 @@ impl Default for AppSettings {
             aprs_comment: String::new(),
             aprs_tx_enabled: false,
             aprs_beacon_dest: "APRS".to_string(),
+            aprs_messages: Vec::new(),
+            aprs_message_counter: 0,
         }
     }
 }
@@ -299,6 +297,7 @@ impl Default for AppSettings {
 pub struct SettingsManager {
     settings: gio::Settings,
     cached: AppSettings,
+    _thread_safe: std::marker::PhantomData<*const ()>,
 }
 
 impl SettingsManager {
@@ -308,6 +307,7 @@ impl SettingsManager {
         let mut manager = SettingsManager {
             settings,
             cached: AppSettings::default(),
+            _thread_safe: std::marker::PhantomData,
         };
         
         // Run migrations if needed
@@ -315,6 +315,11 @@ impl SettingsManager {
         
         // Load current values
         manager.cached = manager.load();
+        
+        // Initialize APRS message counter from stored messages to avoid ID collision
+        manager.cached.aprs_message_counter = manager.get_max_aprs_id();
+        eprintln!("[settings] APRS message counter initialized to {}", manager.cached.aprs_message_counter);
+        
         manager
     }
 
@@ -338,8 +343,8 @@ impl SettingsManager {
         // Load APRS settings
         let aprs_callsign = self.settings.string("aprs-callsign").to_string();
         let aprs_ssid = self.settings.int("aprs-ssid") as u8;
-        let aprs_symbol_table = self.settings.string("aprs-symbol-table").to_string();
-        let aprs_symbol_code = self.settings.string("aprs-symbol-code").to_string();
+        let aprs_symbol_table = self.settings.string("aprs-symbol-table").chars().next().unwrap_or('/');
+        let aprs_symbol_code = self.settings.string("aprs-symbol-code").chars().next().unwrap_or('\'');
         let aprs_comment = self.settings.string("aprs-comment").to_string();
         let aprs_tx_enabled = self.settings.boolean("aprs-tx-enabled");
         let aprs_beacon_dest = self.settings.string("aprs-beacon-dest").to_string();
@@ -361,14 +366,18 @@ impl SettingsManager {
             // APRS TX settings
             aprs_callsign,
             aprs_ssid,
-            aprs_symbol_table: aprs_symbol_table.chars().next().unwrap_or('/'),
-            aprs_symbol_code: aprs_symbol_code.chars().next().unwrap_or('\''),  
+            aprs_symbol_table,
+            aprs_symbol_code,
             aprs_comment,
             aprs_tx_enabled,
             aprs_beacon_dest: if aprs_beacon_dest.is_empty() { "APRS".to_string() } else { aprs_beacon_dest },
+            // APRS Messages
+            aprs_messages: self.load_aprs_messages_from_settings(),
+            // Message counter - will be set from stored messages
+            aprs_message_counter: 0,
         }
     }
-
+    
     /// Save all settings to GSettings
     pub fn save(&self) {
         self.settings.set_int("frequency", self.cached.frequency as i32).ok();
@@ -394,6 +403,7 @@ impl SettingsManager {
         self.cached = AppSettings::default();
         self.save();
         self.save_channels();
+        self.save_aprs_messages();
     }
 
     // ========================================================================
@@ -511,7 +521,172 @@ impl SettingsManager {
             self.cached.aprs_callsign.clone()
         }
     }
-
+    
+    // ========================================================================
+    // APRS Messages Storage
+    // ========================================================================
+    
+    /// Add a new APRS direct message
+    pub fn add_aprs_message(&mut self, mut msg: DirectMessage) {
+        // Set the from_callsign to our callsign if not already set
+        if msg.from_callsign.is_empty() {
+            msg.from_callsign = self.aprs_full_callsign();
+        }
+        self.cached.aprs_messages.push(msg);
+        self.save_aprs_messages();
+    }
+    
+    /// Update the status of an APRS message by ID
+    pub fn update_aprs_message_status(&mut self, msg_id: &str, status: DirectMessageStatus) -> bool {
+        if let Some(msg) = self.cached.aprs_messages.iter_mut().find(|m| m.id == msg_id) {
+            msg.status = status;
+            self.save_aprs_messages();
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Get all APRS messages
+    pub fn aprs_messages(&self) -> &[DirectMessage] {
+        &self.cached.aprs_messages
+    }
+    
+    /// Get messages for a specific thread (recipient)
+    pub fn aprs_messages_for_thread(&self, thread_id: &str) -> Vec<&DirectMessage> {
+        // Match messages where the other party is the given thread_id
+        // Either they messaged us (from_callsign == thread_id) or we messaged them (to_callsign == thread_id)
+        self.cached.aprs_messages.iter()
+            .filter(|m| m.from_callsign == thread_id || m.to_callsign == thread_id)
+            .collect()
+    }
+    
+    /// Build message threads from stored messages
+    pub fn aprs_threads(&self) -> Vec<MessageThread> {
+        MessageThread::build_threads(&self.cached.aprs_messages)
+    }
+    
+    /// Get a message by ID
+    pub fn get_aprs_message(&self, msg_id: &str) -> Option<&DirectMessage> {
+        self.cached.aprs_messages.iter().find(|m| m.id == msg_id)
+    }
+    
+    /// Get a mutable message by ID
+    pub fn get_aprs_message_mut(&mut self, msg_id: &str) -> Option<&mut DirectMessage> {
+        self.cached.aprs_messages.iter_mut().find(|m| m.id == msg_id)
+    }
+    
+    /// Increment retry count for a message
+    pub fn increment_aprs_message_retries(&mut self, msg_id: &str) -> bool {
+        if let Some(msg) = self.cached.aprs_messages.iter_mut().find(|m| m.id == msg_id) {
+            msg.retries += 1;
+            self.save_aprs_messages();
+            true
+        } else {
+            false
+        }
+    }
+    
+    pub fn update_message_last_retry(&mut self, msg_id: &str, timestamp: u64) -> bool {
+        if let Some(msg) = self.cached.aprs_messages.iter_mut().find(|m| m.id == msg_id) {
+            msg.last_retry_timestamp = timestamp;
+            self.save_aprs_messages();
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Mark ACK as sent for a received message
+    pub fn mark_message_ack_sent(&mut self, msg_id: &str) -> bool {
+        if let Some(msg) = self.cached.aprs_messages.iter_mut().find(|m| m.id == msg_id) {
+            msg.mark_ack_sent();
+            self.save_aprs_messages();
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Generate a new unique message ID using UUID v4
+    /// Generate a sequential numeric message ID for outgoing messages
+    /// Format: 001, 002, 003, etc. (zero-padded to 3 digits, wraps at 999)
+    pub fn generate_aprs_message_id(&mut self) -> String {
+        self.cached.aprs_message_counter = (self.cached.aprs_message_counter % 999) + 1;
+        format!("{:03}", self.cached.aprs_message_counter)
+    }
+    
+    /// Generate a unique UUID for internal message tracking
+    pub fn generate_message_uuid(&self) -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+    
+    /// Calculate storage size of APRS messages in bytes
+    pub fn aprs_messages_storage_size(&self) -> usize {
+        serde_json::to_string(&self.cached.aprs_messages)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+    
+    /// Get the maximum APRS message ID from stored messages
+    /// Used to initialize counter to avoid ID collision after restart
+    /// Load APRS messages from GSettings
+    fn load_aprs_messages_from_settings(&self) -> Vec<DirectMessage> {
+        let messages_json = self.settings.string("aprs-messages");
+        serde_json::from_str(&messages_json).unwrap_or_default()
+    }
+    
+    /// Get the maximum APRS message ID from stored messages
+    /// Used to initialize counter to avoid ID collision after restart
+    fn get_max_aprs_id(&self) -> u32 {
+        let messages = self.load_aprs_messages_from_settings();
+        let mut max_id = 0u32;
+        for msg in messages {
+            // Parse APRS ID (e.g., "001" -> 1)
+            if let Ok(id) = msg.aprs_id.parse::<u32>() {
+                if id > max_id {
+                    max_id = id;
+                }
+            }
+        }
+        max_id
+    }
+    
+    /// Format storage size for display
+    pub fn aprs_messages_storage_size_display(&self) -> String {
+        let bytes = self.aprs_messages_storage_size();
+        if bytes < 1024 {
+            format!("{} B", bytes)
+        } else if bytes < 1024 * 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        }
+    }
+    
+    /// Save APRS messages to GSettings
+    pub fn save_aprs_messages(&self) {
+        let messages_json = serde_json::to_string(&self.cached.aprs_messages)
+            .unwrap_or_else(|_| "[]".to_string());
+        self.settings.set_string("aprs-messages", &messages_json).ok();
+    }
+    
+    /// Initialize APRS settings with defaults (for first-time setup)
+    pub fn initialize_aprs_settings(&mut self) {
+        // Set sensible defaults for APRS if not already set
+        if self.cached.aprs_callsign.is_empty() {
+            // Leave empty - user needs to configure their callsign
+            eprintln!("[settings] APRS callsign not set, user should configure in settings");
+        }
+    }
+    
+    /// Clear all APRS messages
+    pub fn clear_aprs_messages(&mut self) {
+        self.cached.aprs_messages.clear();
+        self.settings.set_string("aprs-messages", "[]").ok();
+        eprintln!("[settings] APRS messages cleared");
+    }
+    
     // ========================================================================
     // Getters
     // ========================================================================
@@ -726,6 +901,10 @@ impl SettingsManager {
 }
 
 // ============================================================================
+// Thread safety
+unsafe impl Send for SettingsManager {}
+unsafe impl Sync for SettingsManager {}
+
 // Helper Functions
 // ============================================================================
 

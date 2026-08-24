@@ -16,7 +16,7 @@ mod settings;
 mod utils;
 mod ui;
 
-use aprs::APRSMessage;
+use aprs::{APRSMessage, APRSType, DirectMessage, DirectMessageStatus};
 use audio::{AudioConfig, AudioManager};
 use gps::GpsManager;
 use map::MapManager;
@@ -38,6 +38,10 @@ use adw;
 const MAP_MARGIN: i32 = 8;
 
 const APP_ID: &str = "org.pocketmodem.pocket-modem";
+
+// Signal that chat UI needs refresh
+static CHAT_REFRESH_SIGNAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static THREAD_REFRESH_SIGNAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn main() {
     let settings = SettingsManager::new();
@@ -104,11 +108,12 @@ fn main() {
     let gps_manager_activate = Arc::clone(&gps_manager);
     let audio_activate = Arc::clone(&audio_manager);
     
-    app.connect_activate(move |app| {
-        create_ui(app, &radio_clone, &audio_activate, &gps_manager_activate, &settings);
-    });
-
+    let radio_for_ui = Arc::clone(&radio);
     let radio_for_shutdown = Arc::clone(&radio);
+    app.connect_activate(move |app| {
+        create_ui(app, &radio_for_ui, &audio_activate, &gps_manager_activate, &settings);
+    });
+    
     let gps_for_shutdown = Arc::clone(&gps_manager);
     app.connect_shutdown(move |_| {
         eprintln!("[pocket-modem] App shutting down...");
@@ -796,6 +801,9 @@ fn create_ui(
     let aprs_messages_clone = Arc::clone(&aprs_messages);
     let aprs_last_displayed: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     
+    // Reference to settings for APRS message management
+    let settings_for_aprs = settings as *const SettingsManager as *mut SettingsManager;
+    
     let aprs_list_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     aprs_list_box.set_margin_start(16);
     aprs_list_box.set_margin_end(16);
@@ -807,6 +815,132 @@ fn create_ui(
     aprs_empty_label.add_css_class("aprs-empty-text");
     aprs_empty_label.set_visible(true);
     aprs_list_box.append(&aprs_empty_label);
+    
+    // Function to add a thread row button that opens chat
+    let aprs_list_for_thread = aprs_list_box.clone();
+    let aprs_empty_for_thread = aprs_empty_label.clone();
+    let radio_for_thread = Arc::clone(radio);
+    let settings_for_thread = settings as *const SettingsManager as *mut SettingsManager;
+    
+    // Build threads from stored messages and display as buttons
+    fn build_and_display_threads(
+        stored_msgs: &[DirectMessage],
+        list_box: &gtk::Box,
+        empty_label: &gtk::Label,
+        radio: &Arc<Mutex<KV4PRadio>>,
+        settings: *mut SettingsManager,
+    ) {
+        eprintln!("[pocket-modem] build_and_display_threads called with {} messages", stored_msgs.len());
+        
+        // Group messages by thread_id (other party's callsign)
+        use std::collections::HashMap;
+        let mut threads: HashMap<String, Vec<&DirectMessage>> = HashMap::new();
+        
+        for msg in stored_msgs {
+            // Use thread_id which stores the "other" party's callsign
+            let thread_key = if msg.thread_id.is_empty() {
+                // Fallback: use from_callsign if thread_id is empty
+                msg.from_callsign.clone()
+            } else {
+                msg.thread_id.clone()
+            };
+    
+            if !thread_key.is_empty() {
+                threads.entry(thread_key).or_default().push(msg);
+            }
+        }
+        
+        if threads.is_empty() {
+            return;
+        }
+        
+        empty_label.set_visible(false);
+        
+        for (other_call, messages) in threads {
+            // Sort messages by timestamp
+            let mut sorted = messages.clone();
+            sorted.sort_by_key(|m| m.timestamp);
+            let last_msg = sorted.last();
+            let msg_count = sorted.len();
+            
+            // Create a button that acts as the thread row
+            let thread_btn = gtk::Button::new();
+            thread_btn.add_css_class("flat");
+            thread_btn.set_hexpand(true);
+            thread_btn.set_size_request(-1, 60);
+            
+            // Inner content box
+            let thread_content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            thread_content.set_margin_start(12);
+            thread_content.set_margin_end(12);
+            thread_content.set_margin_top(8);
+            thread_content.set_margin_bottom(8);
+            thread_content.set_hexpand(true);
+            
+            // Callsign label
+            let call_label = gtk::Label::new(None);
+            call_label.set_markup(&format!("<span color='#FFB000' weight='bold'>{}</span>", escape_markup(&other_call)));
+            call_label.set_size_request(100, -1);
+            thread_content.append(&call_label);
+            
+            // Message count
+            let count_label = gtk::Label::new(None);
+            count_label.set_text(&format!("{} msg{}", msg_count, if msg_count != 1 { "s" } else { "" }));
+            count_label.add_css_class("dimmed");
+            thread_content.append(&count_label);
+            
+            // Last message preview
+            if let Some(last) = last_msg {
+                let preview = if last.body.len() > 30 { 
+                    format!("{}...", &last.body[..27])
+                } else {
+                    last.body.clone()
+                };
+                let preview_label = gtk::Label::new(Some(&preview));
+                preview_label.set_hexpand(true);
+                preview_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                thread_content.append(&preview_label);
+            }
+            
+            // Arrow indicator
+            let arrow = gtk::Label::new(Some("→"));
+            arrow.add_css_class("dimmed");
+            thread_content.append(&arrow);
+            
+            thread_btn.set_child(Some(&thread_content));
+            
+            // Click handler
+            let other_clone = other_call.clone();
+            let radio_clone = Arc::clone(radio);
+            let settings_clone = settings;
+            thread_btn.connect_clicked(move |_| {
+                eprintln!("[pocket-modem] Opening chat for thread: {}", other_clone);
+                show_aprs_chat_screen(
+                    None,
+                    &other_clone,
+                    settings_clone,
+                    &radio_clone,
+                    Box::new(|| {}),
+                );
+            });
+            
+            list_box.append(&thread_btn);
+        }
+    }
+    
+    // Load and display threads
+    {
+        let stored_msgs = unsafe { (*settings_for_aprs).aprs_messages() };
+        if !stored_msgs.is_empty() {
+            build_and_display_threads(
+                stored_msgs,
+                &aprs_list_box,
+                &aprs_empty_label,
+                radio,
+                settings_for_aprs,
+            );
+        }
+    }
     
     fn add_aprs_message_to_list(msg: &APRSMessage, list_box: &gtk::Box, empty_label: &gtk::Label, my_lat: f64, my_lon: f64) {
         empty_label.set_visible(false);
@@ -904,12 +1038,131 @@ fn create_ui(
     aprs_page.set_size_request(330, 700);
     aprs_page.set_hexpand(false);
     
+    // APRS Header with + button for new message
+    let aprs_header_container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    aprs_header_container.set_margin_start(16);
+    aprs_header_container.set_margin_end(16);
+    aprs_header_container.set_margin_top(16);
+    aprs_header_container.set_margin_bottom(8);
+    
     let aprs_header = gtk::Label::new(Some("<b>APRS Messages</b>"));
     aprs_header.set_markup("<b>APRS Messages</b>");
     aprs_header.set_halign(gtk::Align::Start);
-    aprs_header.set_margin_start(16);
-    aprs_header.set_margin_top(16);
-    aprs_header.set_margin_bottom(8);
+    aprs_header.set_valign(gtk::Align::Center);
+    aprs_header.set_hexpand(true);
+    
+    // + button for new direct message
+    let aprs_new_msg_btn = gtk::Button::new();
+    aprs_new_msg_btn.set_icon_name("list-add-symbolic");
+    aprs_new_msg_btn.add_css_class("flat");
+    aprs_new_msg_btn.set_tooltip_text(Some("New direct message"));
+    aprs_new_msg_btn.set_valign(gtk::Align::Center);
+    
+    aprs_header_container.append(&aprs_header);
+    aprs_header_container.append(&aprs_new_msg_btn);
+    
+    // New message button handler
+    let app_clone = app.clone();
+    let radio_for_chat = Arc::clone(radio);
+    let settings_for_chat = settings as *const SettingsManager as *mut SettingsManager;
+    aprs_new_msg_btn.connect_clicked(move |_| {
+        // Show dialog to get recipient callsign
+        let dialog = gtk::Dialog::with_buttons(
+            Some("New Direct Message"),
+            app_clone.active_window().as_ref(),
+            gtk::DialogFlags::MODAL,
+            &[("Cancel", gtk::ResponseType::Cancel), ("Next", gtk::ResponseType::Accept)],
+        );
+        
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_start(20);
+        content.set_margin_end(20);
+        content.set_margin_top(20);
+        content.set_margin_bottom(20);
+        
+        let label = gtk::Label::new(Some("Enter recipient callsign:"));
+        label.set_halign(gtk::Align::Start);
+        content.append(&label);
+        
+        let entry = gtk::Entry::new();
+        entry.set_placeholder_text(Some("e.g., KD4LCD-7 (UPPERCASE)"));
+        entry.set_input_purpose(gtk::InputPurpose::Alpha);
+        entry.set_hexpand(true);
+        entry.set_css_classes(&["monospace"]);
+        // Note: uppercase hint shown in placeholder; conversion happens on Next/Activate
+        
+        // Create clones BEFORE using entry by reference
+        let entry_next = entry.clone();
+        let entry_enter = entry.clone();
+        let entry_response = entry.clone();
+        
+        // Now append entry
+        content.append(&entry);
+        
+        // Add button row
+        let button_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        button_box.set_halign(gtk::Align::End);
+        
+        let cancel_btn = gtk::Button::with_label("Cancel");
+        let next_btn = gtk::Button::with_label("Next");
+        next_btn.add_css_class("suggested-action");
+        
+        button_box.append(&cancel_btn);
+        button_box.append(&next_btn);
+        content.append(&button_box);
+        
+        dialog.set_child(Some(&content));
+        
+        // Next button - emit Accept response
+        let dialog_next = dialog.clone();
+        next_btn.connect_clicked(move |_| {
+            let t = entry_next.text().to_string().trim().to_uppercase();
+            if !t.is_empty() {
+                dialog_next.response(gtk::ResponseType::Accept);
+            }
+        });
+        
+        // Cancel button - emit Cancel response
+        let dialog_cancel = dialog.clone();
+        cancel_btn.connect_clicked(move |_| {
+            dialog_cancel.response(gtk::ResponseType::Cancel);
+        });
+        
+        // Enter key - same as Next (emit Accept response)
+        let dialog_enter = dialog.clone();
+        let entry_for_enter = entry_enter.clone();
+        entry_enter.connect_activate(move |_| {
+            let t = entry_for_enter.text().to_string().trim().to_uppercase();
+            if !t.is_empty() {
+                dialog_enter.response(gtk::ResponseType::Accept);
+            }
+        });
+        
+        // Handle dialog close - only open chat if Next was clicked (response = Accept)
+        // Read the text at response time, not when handler is set up
+        let entry_for_response = entry_response.clone();
+        // Clone before move - Fn closure can't capture by reference
+        let radio_for_dialog = radio_for_chat.clone();
+        dialog.connect_response(move |d, response| {
+            let recipient = entry_for_response.text().to_string().trim().to_uppercase();
+            eprintln!("[pocket-modem] Dialog response: {:?}, recipient: '{}'", response, recipient);
+            // Always close the dialog on any response
+            d.close();
+            // Only open chat if Next was clicked (Accept) and we have a recipient
+            if response == gtk::ResponseType::Accept && !recipient.is_empty() {
+                eprintln!("[pocket-modem] Opening chat window for {}", recipient);
+                show_aprs_chat_screen(
+                    None,
+                    &recipient,
+                    settings_for_chat,
+                    &radio_for_dialog,
+                    Box::new(|| {}),
+                );
+            }
+        });
+        
+        dialog.show();
+    });
     
     // Beacon status FSM
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -987,7 +1240,7 @@ fn create_ui(
     aprs_scroll.set_min_content_height(200);
     aprs_scroll.set_child(Some(&aprs_list_box));
     
-    aprs_page.append(&aprs_header);
+    aprs_page.append(&aprs_header_container);
     aprs_page.append(&aprs_scroll);
     aprs_page.append(&beacon_container);
     
@@ -1294,9 +1547,11 @@ fn create_ui(
     // Callsign input
     let settings_aprs_call = settings as *const SettingsManager as *mut SettingsManager;
     let aprs_call_entry = gtk::Entry::new();
-    aprs_call_entry.set_placeholder_text(Some("KD4LCD"));
+    aprs_call_entry.set_placeholder_text(Some("KD4LCD (UPPERCASE)"));
     aprs_call_entry.set_hexpand(true);
     aprs_call_entry.set_max_width_chars(8);
+    aprs_call_entry.set_css_classes(&["monospace"]);
+    // Note: uppercase hint shown in placeholder; conversion happens on settings save
     let current_call = unsafe { (*settings).aprs_callsign().to_string() };
     if !current_call.is_empty() {
         aprs_call_entry.set_text(&current_call);
@@ -1341,9 +1596,11 @@ fn create_ui(
     let aprs_symbol_row = adw::ComboRow::builder()
         .title("Symbol")
         .subtitle("APRS symbol for your station")
-        .selected(current_symbol_idx)
         .model(&symbol_model)
         .build();
+    
+    // Set selection after build (builder's selected() doesn't always work)
+    aprs_symbol_row.set_selected(current_symbol_idx);
     
     // Comment input
     let settings_aprs_comment = settings as *const SettingsManager as *mut SettingsManager;
@@ -1396,10 +1653,70 @@ fn create_ui(
     
     settings_box.append(&aprs_group);
     
+    // === APRS Messages Section ===
+    let aprs_data_group = adw::PreferencesGroup::builder()
+        .title("APRS Messages")
+        .build();
+    
+    // Storage size row
+    let aprs_storage_row = adw::ActionRow::builder()
+        .title("Storage used")
+        .subtitle("--")
+        .build();
+    
+    // Initialize APRS settings button
+    let aprs_init_row = adw::ActionRow::builder()
+        .title("Initialize APRS settings")
+        .subtitle("Reset APRS configuration to defaults")
+        .build();
+    let aprs_init_btn = gtk::Button::new();
+    aprs_init_btn.set_label("Initialize");
+    aprs_init_btn.add_css_class("flat");
+    aprs_init_row.add_suffix(&aprs_init_btn);
+    aprs_init_row.set_activatable_widget(Some(&aprs_init_btn));
+    
+    // Clear APRS data button
+    let aprs_clear_row = adw::ActionRow::builder()
+        .title("Clear APRS data")
+        .subtitle("Delete all stored messages")
+        .build();
+    let aprs_clear_btn = gtk::Button::new();
+    aprs_clear_btn.set_label("Clear");
+    aprs_clear_btn.add_css_class("destructive-action");
+    aprs_clear_row.add_suffix(&aprs_clear_btn);
+    aprs_clear_row.set_activatable_widget(Some(&aprs_clear_btn));
+    
+    aprs_data_group.add(&aprs_storage_row);
+    aprs_data_group.add(&aprs_init_row);
+    aprs_data_group.add(&aprs_clear_row);
+    
+    settings_box.append(&aprs_data_group);
+    
+    // Initialize APRS settings handler
+    let aprs_init_settings = settings as *const SettingsManager as *mut SettingsManager;
+    aprs_init_btn.connect_clicked(move |_| {
+        unsafe {
+            (*aprs_init_settings).initialize_aprs_settings();
+            eprintln!("[pocket-modem] APRS settings initialized");
+        }
+    });
+    
+    // Clear APRS data handler - clone the row for updating display
+    let aprs_clear_settings = settings as *const SettingsManager as *mut SettingsManager;
+    let aprs_storage_for_clear = aprs_storage_row.clone();
+    aprs_clear_btn.connect_clicked(move |_| {
+        unsafe {
+            (*aprs_clear_settings).clear_aprs_messages();
+            // Update storage display
+            let size = (*aprs_clear_settings).aprs_messages_storage_size_display();
+            aprs_storage_for_clear.set_subtitle(&size);
+            eprintln!("[pocket-modem] APRS messages cleared");
+        }
+    });
+    
     // === About Section ===
     
-    // APRS settings handlers
-    let aprs_call_for_handler = aprs_call_entry.clone();
+    // APRS callsign handler (uppercase conversion done in display handler)
     let settings_aprs_1 = settings as *const SettingsManager as *mut SettingsManager;
     aprs_call_entry.connect_changed(move |entry| {
         let text = entry.text().to_string().trim().to_uppercase();
@@ -1702,17 +2019,85 @@ fn create_ui(
     toast_overlay.set_valign(gtk::Align::Start);
     toast_overlay.set_child(Some(&stack));
     
+    // Clone for use in various handlers
+    let toast_overlay_clone = toast_overlay.clone();
+    
     // =========================================================================
-    // APRS callback
+    // APRS callback - process incoming APRS frames
     // =========================================================================
+    // Store received ACKs and messages for later processing
+    let received_acks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_messages: Arc<Mutex<Vec<(String, String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    // Get our callsign before callback (owned string, no lifetime issues)
+    let our_callsign = settings.aprs_full_callsign();
     {
         let r = radio.lock().unwrap();
         let aprs_msgs = Arc::clone(&aprs_messages);
+        let radio_aprs = Arc::clone(radio);
+        let acks_received = Arc::clone(&received_acks);
+        let msgs_received = Arc::clone(&received_messages);
+        let my_call = our_callsign.clone();
         
         r.on_aprs(move |msg| {
+            // Debug: print full received frame
+            eprintln!("[pocket-modem] RECEIVED FRAME - type: {:?}, from: {}, to: {}, body: {:?}", 
+                      msg.msg_type, msg.from_callsign, msg.to_callsign, msg.msg_body);
+            
+            // Add to display list
             let mut msgs = aprs_msgs.lock().unwrap();
             msgs.push(msg.clone());
             if msgs.len() > 100 { msgs.remove(0); }
+            
+            // Store received messages for chat threads
+            if msg.msg_type == APRSType::Message {
+                if let Some(ref body) = msg.msg_body {
+                    if !body.is_empty() {
+                        // Store: (from, body, thread_id, msg_id)
+                        msgs_received.lock().unwrap().push((
+                            msg.from_callsign.clone(),
+                            body.clone(),
+                            msg.from_callsign.clone(),  // thread_id is the sender (other party)
+                            msg.msg_id.clone().unwrap_or_default()  // APRS message ID
+                        ));
+                    }
+                }
+                
+                // Send ACK for messages addressed to us with a message ID
+                if let Some(ref msg_id) = msg.msg_id {
+                    if msg.to_callsign == my_call {
+                        let sender = msg.from_callsign.clone();
+                        let ack_id = msg_id.clone();
+                        let ack_call = my_call.clone();
+                        let from_for_storage = msg.from_callsign.clone();
+                        let body_for_storage = msg.msg_body.clone();
+                        let settings_ack = Arc::clone(&acks_received);
+                        
+                        let radio_ack = Arc::clone(&radio_aprs);
+                        std::thread::spawn(move || {
+                            if let Ok(r) = radio_ack.lock() {
+                                if let Err(e) = r.send_aprs_ack(&ack_call, &sender, &ack_id) {
+                                    eprintln!("[pocket-modem] Failed to send ACK: {}", e);
+                                } else {
+                                    eprintln!("[pocket-modem] ACK sent for message {} to {}", ack_id, sender);
+                                    // Signal that we sent an ACK - this will trigger message storage with ack_sent=true
+                                    settings_ack.lock().unwrap().push(format!("ACK_SENT:{}", ack_id));
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            
+            // Log ACKs and queue for processing
+            if msg.msg_type == APRSType::MessageAck {
+                if let Some(body) = &msg.msg_body {
+                    eprintln!("[pocket-modem] RECEIVED ACK - from: {}, to_callsign: {}, body: {:?}", msg.from_callsign, msg.to_callsign, body);
+                    if let Some(ack_id) = aprs::parse_message_ack(body) {
+                        eprintln!("[pocket-modem] Received ACK parsed ID: {}", ack_id);
+                        acks_received.lock().unwrap().push(ack_id);
+                    }
+                }
+            }
         });
     }
     
@@ -1724,7 +2109,7 @@ fn create_ui(
     let radio_for_beacon = Arc::clone(radio);
     let beacon_btn_clone = beacon_btn.clone();
     let beacon_status_clone = beacon_status.clone();
-    let toast_overlay_clone = toast_overlay.clone();
+    let toast_overlay_for_beacon = toast_overlay.clone();
     let beacon_state_clone = Arc::clone(&beacon_state);
     let aprs_messages_for_beacon = Arc::clone(&aprs_messages);
     let aprs_list_for_beacon = aprs_list_box.clone();
@@ -1750,7 +2135,7 @@ fn create_ui(
             btn.set_sensitive(true);
             
             let toast = adw::Toast::new("Enable APRS TX in Settings");
-            toast_overlay_clone.add_toast(toast);
+            toast_overlay_for_beacon.add_toast(toast);
             return;
         }
         
@@ -1771,7 +2156,7 @@ fn create_ui(
             btn.set_sensitive(true);
             
             let toast = adw::Toast::new("GPS fix required for APRS beacon");
-            toast_overlay_clone.add_toast(toast);
+            toast_overlay_for_beacon.add_toast(toast);
             return;
         }
         
@@ -1784,7 +2169,7 @@ fn create_ui(
             btn.set_sensitive(true);
             
             let toast = adw::Toast::new("Configure your callsign in Settings");
-            toast_overlay_clone.add_toast(toast);
+            toast_overlay_for_beacon.add_toast(toast);
             return;
         }
         
@@ -1919,6 +2304,9 @@ fn create_ui(
     let beacon_btn_update = beacon_btn.clone();
     let settings_update = settings as *const SettingsManager as *mut SettingsManager;
     let gps_update = Arc::clone(gps);
+    
+    // APRS storage label for update loop
+    let aprs_storage_row_clone = aprs_storage_row.clone();
     
     let map_manager_clone = Arc::clone(&map_manager);
     let window_clone = window.clone();
@@ -2191,6 +2579,188 @@ fn create_ui(
         
         ptt_label_update.set_text("PTT");
         
+        // Update APRS storage size display (every 10 ticks = ~1 second)
+        static APRS_STORAGE_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let storage_tick = APRS_STORAGE_TICK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if storage_tick % 10 == 0 {
+            let size = unsafe { (*settings_update).aprs_messages_storage_size_display() };
+            aprs_storage_row_clone.set_subtitle(&size);
+        }
+        
+        // APRS message retry logic (every 10 seconds = 100 ticks)
+        static APRS_RETRY_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let retry_tick = APRS_RETRY_TICK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if retry_tick % 100 == 0 {
+            // Process received ACKs
+            let acks_to_process: Vec<String> = {
+                let mut acks = received_acks.lock().unwrap();
+                std::mem::take(&mut *acks)
+            };
+            for ack_id in acks_to_process {
+                unsafe {
+                    let messages = (*settings_update).aprs_messages();
+                    for m in messages {
+                        if m.aprs_id == ack_id {
+                            if (*settings_update).update_aprs_message_status(&m.id, aprs::DirectMessageStatus::Acknowledged) {
+                                eprintln!("[pocket-modem] Message {} acknowledged (ACK {})", m.id, ack_id);
+                                // Signal chat UI to refresh
+                                CHAT_REFRESH_SIGNAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Process ACK_SENT signals - mark messages as having ACK sent
+            let acks_sent: Vec<String> = {
+                let mut acks = received_acks.lock().unwrap();
+                acks.drain(..).filter(|s| s.starts_with("ACK_SENT:")).collect()
+            };
+            for ack_sent in acks_sent {
+                if let Some(ack_id) = ack_sent.strip_prefix("ACK_SENT:") {
+                    eprintln!("[pocket-modem] Processing ACK_SENT for message ID: {}", ack_id);
+                    // Find the most recent message from the sender and mark ACK as sent
+                    unsafe {
+                        let messages = (*settings_update).aprs_messages();
+                        // Find messages matching the APRS ID (if any were stored with one)
+                        let mut found = false;
+                        for m in messages.iter().rev() {
+                            if m.msg_id.as_ref() == Some(&ack_id.to_string()) {
+                                if (*settings_update).mark_message_ack_sent(&m.id) {
+                                    eprintln!("[pocket-modem] Marked ACK sent for message {}", m.id);
+                                    CHAT_REFRESH_SIGNAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    found = true;
+                                }
+                                break;
+                            }
+                        }
+                        // Also check by checking for message with matching aprs_id in body
+                        if !found {
+                            for m in messages.iter().rev() {
+                                // Check if this is a received message that needs ack_sent
+                                if m.aprs_id.is_empty() && !m.from_callsign.is_empty() {
+                                    if (*settings_update).mark_message_ack_sent(&m.id) {
+                                        eprintln!("[pocket-modem] Marked ACK sent for recent message {}", m.id);
+                                        CHAT_REFRESH_SIGNAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Process received messages and add to chat threads
+            let msgs_to_process: Vec<(String, String, String, String)> = {
+                let mut msgs = received_messages.lock().unwrap();
+                std::mem::take(&mut *msgs)
+            };
+            for (from, body, thread_id, msg_id) in msgs_to_process {
+                let my_call = unsafe { (*settings_update).aprs_full_callsign() };
+                let uuid = unsafe { (*settings_update).generate_message_uuid() };
+                let dm = aprs::DirectMessage::new_received(
+                    &my_call,    // to (us)
+                    &body,
+                    &uuid,       // internal ID
+                    &from,       // from (sender)
+                    "",          // no APRS ID
+                    &msg_id,     // APRS message ID for ACK tracking
+                );
+                eprintln!("[pocket-modem] Storing received message from {}: {} (id: {})", from, body, msg_id);
+                unsafe { (*settings_update).add_aprs_message(dm); }
+                // Signal chat UI and thread list to refresh
+                CHAT_REFRESH_SIGNAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                THREAD_REFRESH_SIGNAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            
+            // Check if thread list needs refresh
+            static LAST_THREAD_SIGNAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let current_signal = THREAD_REFRESH_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+            let last_signal = LAST_THREAD_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+            if current_signal != last_signal {
+                LAST_THREAD_SIGNAL.store(current_signal, std::sync::atomic::Ordering::SeqCst);
+                let stored_msgs = unsafe { (*settings_update).aprs_messages() };
+                if !stored_msgs.is_empty() {
+                    // Clear and rebuild thread list
+                    while let Some(child) = aprs_list_box_clone.first_child() {
+                        aprs_list_box_clone.remove(&child);
+                    }
+                    aprs_list_box_clone.append(&aprs_empty_label_clone);
+                    aprs_empty_label_clone.set_visible(true);
+                    build_and_display_threads(
+                        stored_msgs,
+                        &aprs_list_box_clone,
+                        &aprs_empty_label_clone,
+                        &radio_update,
+                        settings_update,
+                    );
+                }
+            }
+            
+            // Check for pending messages that need retry (5 second interval)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            
+            // Get messages that need retry (with 10s minimum between retries)
+            let retry_candidates: Vec<(String, String, String, String, String, u64)> = unsafe {
+                (*settings_update).aprs_messages()
+                    .iter()
+                    .filter(|m| {
+                        if m.status != aprs::DirectMessageStatus::Sent || m.retries >= 3 {
+                            return false;
+                        }
+                        // If last_retry_timestamp is 0, message was just stored - use message timestamp
+                        // Otherwise, check if 10s has passed since last retry
+                        let reference_time = if m.last_retry_timestamp == 0 { m.timestamp } else { m.last_retry_timestamp };
+                        now >= reference_time + 10
+                    })
+                    .map(|m| (m.id.clone(), m.aprs_id.clone(), m.to_callsign.clone(), m.body.clone(), m.from_callsign.clone(), m.last_retry_timestamp))
+                    .collect()
+            };
+            
+            for (msg_id, aprs_id, to, body, _from, _last_ts) in retry_candidates {
+                let callsign = unsafe { (*settings_update).aprs_full_callsign() };
+                if !callsign.is_empty() {
+                    let current_retries = unsafe { (*settings_update).get_aprs_message(&msg_id).map(|m| m.retries).unwrap_or(0) };
+                    eprintln!("[pocket-modem] Retrying message {} [{}] to {} (attempt {})", 
+                              msg_id, aprs_id, to, current_retries + 1);
+                    
+                    // Increment retry count and update timestamp
+                    unsafe { (*settings_update).increment_aprs_message_retries(&msg_id); };
+                    unsafe { (*settings_update).update_message_last_retry(&msg_id, now); };
+                    
+                    // Retry sending
+                    let radio_retry = radio_update.clone();
+                    let aprs_id_clone = aprs_id.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(r) = radio_retry.lock() {
+                            if let Err(e) = r.send_aprs_message(&callsign, &to, &body, &aprs_id_clone) {
+                                eprintln!("[pocket-modem] Retry failed: {}", e);
+                            }
+                        }
+                    });
+                }
+            }
+            
+            // Mark messages that exceeded max retries as failed
+            unsafe {
+                let messages = (*settings_update).aprs_messages();
+                for m in messages {
+                    if m.status == aprs::DirectMessageStatus::Sent && m.retries >= 3 {
+                        (*settings_update).update_aprs_message_status(
+                            &m.id,
+                            aprs::DirectMessageStatus::Failed
+                        );
+                        eprintln!("[pocket-modem] Message {} marked as failed after max retries", m.id);
+                    }
+                }
+            }
+        }
+        
         // Update beacon state machine based on current settings and GPS
         let (callsign, tx_enabled) = unsafe {
             let call = (*settings_update).aprs_full_callsign();
@@ -2247,6 +2817,343 @@ fn create_ui(
         
         glib::ControlFlow::Continue
     });
+    
+    // =========================================================================
+    // APRS Direct Message Chat Screen
+    // =========================================================================
+    fn show_aprs_chat_screen(
+        _parent: Option<&gtk::Widget>,
+        recipient: &str,
+        settings: *mut SettingsManager,
+        radio: &Arc<Mutex<KV4PRadio>>,
+        _on_message_sent: Box<dyn Fn() + Send + 'static>,
+    ) {
+        eprintln!("[pocket-modem] Opening chat for: {}", recipient);
+        
+        // Safety check
+        if settings.is_null() {
+            eprintln!("[pocket-modem] FATAL: settings is null!");
+            return;
+        }
+        
+        // Use a Dialog as a proper child window
+        let chat_window = gtk::Dialog::builder()
+            .title(&format!("Chat: {}", recipient))
+            .modal(true)
+            .build();
+        chat_window.set_default_size(340, 500);
+        eprintln!("[pocket-modem] Chat window created");
+        
+        // Get the content area and add our content
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        
+        // Title bar
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.set_margin_bottom(8);
+        
+        let title = gtk::Label::new(Some(&format!("📱 Chat: {}", recipient)));
+        title.set_hexpand(true);
+        header.append(&title);
+        
+        // Close button - emit close response
+        let chat_win_close = chat_window.clone();
+        let close_btn = gtk::Button::with_label("✕");
+        close_btn.add_css_class("flat");
+        close_btn.connect_clicked(move |_| { 
+            chat_win_close.response(gtk::ResponseType::Close);
+        });
+        header.append(&close_btn);
+        header.set_halign(gtk::Align::Fill);
+        content.append(&header);
+        
+        // Messages scroll area
+        let messages_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        messages_box.add_css_class("aprs-list");
+        
+        let messages_scroll = gtk::ScrolledWindow::new();
+        messages_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        messages_scroll.set_hexpand(true);
+        messages_scroll.set_vexpand(true);
+        messages_scroll.set_child(Some(&messages_box));
+        content.append(&messages_scroll);
+        
+        // Load existing messages for this thread
+        let existing_messages: Vec<DirectMessage> = if settings.is_null() {
+            Vec::new()
+        } else {
+            unsafe { (*settings).aprs_messages_for_thread(recipient).into_iter().cloned().collect() }
+        };
+        
+        // Display existing messages
+        for msg in &existing_messages {
+            add_direct_message_bubble(&messages_box, msg);
+        }
+        
+        // Scroll to bottom after adding messages
+        let adj = messages_scroll.vadjustment();
+        adj.set_value(adj.upper().max(adj.page_size()));
+        
+        // Input area
+        let input_container = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        input_container.set_margin_top(8);
+        
+        let message_entry = gtk::Entry::new();
+        message_entry.set_placeholder_text(Some("Type a message..."));
+        message_entry.set_hexpand(true);
+        message_entry.set_input_purpose(gtk::InputPurpose::FreeForm);
+        message_entry.set_size_request(200, -1);
+        // Grab focus when window appears
+        message_entry.grab_focus();
+        input_container.append(&message_entry);
+        
+        let send_btn = gtk::Button::with_label("Send");
+        send_btn.add_css_class("suggested-action");
+        input_container.append(&send_btn);
+        content.append(&input_container);
+        
+        // For Dialog, use content_area instead of set_child
+        let chat_window_for_content = chat_window.clone();
+        let chat_content = chat_window_for_content.content_area();
+        chat_content.set_margin_start(12);
+        chat_content.set_margin_end(12);
+        chat_content.set_margin_top(12);
+        chat_content.set_margin_bottom(12);
+        while let Some(child) = chat_content.first_child() {
+            chat_content.remove(&child);
+        }
+        chat_content.append(&content);
+        eprintln!("[pocket-modem] Chat: setting content, presenting window");
+        
+        // Connect dialog response before showing
+        let chat_win_resp = chat_window.clone();
+        chat_window.connect_response(move |_, response| {
+            eprintln!("[pocket-modem] Chat: dialog response {:?}", response);
+            if response == gtk::ResponseType::Close {
+                chat_win_resp.close();
+            }
+        });
+        
+        chat_window.show();
+        eprintln!("[pocket-modem] Chat: window should be visible now");
+        
+        // Periodic refresh of message status
+        let settings_refresh = settings;
+        let messages_box_refresh = messages_box.clone();
+        let recipient_refresh = recipient.to_string();
+        let scroll_refresh = messages_scroll.clone();
+        let mut last_refresh_signal = CHAT_REFRESH_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+        
+        glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            let current_signal = CHAT_REFRESH_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+            if current_signal != last_refresh_signal {
+                last_refresh_signal = current_signal;
+                // Refresh messages for this thread
+                let thread_messages = unsafe { (*settings_refresh).aprs_messages_for_thread(&recipient_refresh) };
+                // Clear and rebuild messages box
+                while let Some(child) = messages_box_refresh.first_child() {
+                    messages_box_refresh.remove(&child);
+                }
+                for msg in thread_messages {
+                    add_direct_message_bubble(&messages_box_refresh, msg);
+                }
+                // Scroll to bottom
+                let adj = scroll_refresh.vadjustment();
+                adj.set_value(adj.upper().max(adj.page_size()));
+            }
+            glib::ControlFlow::Continue
+        });
+        
+        // Send message handler - clone resources for each closure
+        let entry_btn = message_entry.clone();
+        let scroll_btn = messages_scroll.clone();
+        let messages_btn = messages_box.clone();
+        let settings_btn = settings;
+        let recipient_btn = recipient.to_string();
+        let radio_btn = Arc::clone(radio);
+        
+        send_btn.connect_clicked(move |_| {
+            let text = entry_btn.text().to_string();
+            if text.trim().is_empty() { return; }
+            
+            if settings_btn.is_null() {
+                eprintln!("[pocket-modem] Chat: settings is null");
+                return;
+            }
+            
+            let callsign = unsafe { (*settings_btn).aprs_full_callsign() };
+            if callsign.is_empty() {
+                eprintln!("[pocket-modem] Cannot send: no callsign configured");
+                return;
+            }
+            
+            // Generate UUID for internal tracking, APRS ID for RF
+            let uuid = unsafe { (*settings_btn).generate_message_uuid() };
+            let aprs_id = unsafe { (*settings_btn).generate_aprs_message_id() };
+            // thread_id is the other party (recipient for sent messages)
+            let mut dm = DirectMessage::new_with_thread(&recipient_btn, &recipient_btn, &text, &uuid, &callsign, &aprs_id);
+            
+            // Send over RF with message ID for ACK tracking
+            if let Ok(r) = radio_btn.lock() {
+                if let Err(e) = r.send_aprs_message(&callsign, &recipient_btn, &text, &aprs_id) {
+                    eprintln!("[pocket-modem] Failed to send APRS message: {}", e);
+                } else {
+                    eprintln!("[pocket-modem] APRS message sent to {} [{}]: {}", recipient_btn, aprs_id, text);
+                }
+            }
+            
+            dm.mark_sent();
+            // Set initial retry timestamp (first retry at 10s)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            dm.last_retry_timestamp = now;
+            unsafe { (*settings_btn).add_aprs_message(dm.clone()); }
+            eprintln!("[pocket-modem] Message stored: id={}, aprs_id={}, to={}, status={:?}", 
+                      dm.id, dm.aprs_id, dm.to_callsign, dm.status);
+            add_direct_message_bubble(&messages_btn, &dm);
+            entry_btn.set_text("");
+            let adj = scroll_btn.vadjustment();
+            adj.set_value(adj.upper() - adj.page_size());
+        });
+        
+        // Enter key handler
+        let entry_enter = message_entry.clone();
+        let scroll_enter = messages_scroll.clone();
+        let messages_enter = messages_box.clone();
+        let settings_enter = settings;
+        let recipient_enter = recipient.to_string();
+        let radio_enter = Arc::clone(radio);
+        
+        message_entry.connect_activate(move |_| {
+            let text = entry_enter.text().to_string();
+            if text.trim().is_empty() { return; }
+            
+            if settings_enter.is_null() {
+                eprintln!("[pocket-modem] Chat: settings is null");
+                return;
+            }
+            
+            let callsign = unsafe { (*settings_enter).aprs_full_callsign() };
+            if callsign.is_empty() {
+                eprintln!("[pocket-modem] Cannot send: no callsign configured");
+                return;
+            }
+            
+            // Generate UUID for internal tracking, APRS ID for RF
+            let uuid = unsafe { (*settings_enter).generate_message_uuid() };
+            let aprs_id = unsafe { (*settings_enter).generate_aprs_message_id() };
+            // thread_id is the other party (recipient for sent messages)
+            let mut dm = DirectMessage::new_with_thread(&recipient_enter, &recipient_enter, &text, &uuid, &callsign, &aprs_id);
+            
+            // Send over RF with message ID for ACK tracking
+            if let Ok(r) = radio_enter.lock() {
+                if let Err(e) = r.send_aprs_message(&callsign, &recipient_enter, &text, &aprs_id) {
+                    eprintln!("[pocket-modem] Failed to send APRS message: {}", e);
+                } else {
+                    eprintln!("[pocket-modem] APRS message sent to {} [{}]: {}", recipient_enter, aprs_id, text);
+                }
+            }
+            
+            dm.mark_sent();
+            // Set initial retry timestamp (first retry at 10s)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            dm.last_retry_timestamp = now;
+            unsafe { (*settings_enter).add_aprs_message(dm.clone()); }
+            eprintln!("[pocket-modem] Message stored: id={}, aprs_id={}, to={}, status={:?}", 
+                      dm.id, dm.aprs_id, dm.to_callsign, dm.status);
+            add_direct_message_bubble(&messages_enter, &dm);
+            entry_enter.set_text("");
+            let adj = scroll_enter.vadjustment();
+            adj.set_value(adj.upper() - adj.page_size());
+        });
+    }
+    
+    /// Add a message bubble to the chat UI
+    fn add_direct_message_bubble(messages_box: &gtk::Box, msg: &DirectMessage) {
+        use crate::aprs::{get_message_status_icon, get_message_status_color};
+        
+        let bubble = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        bubble.set_margin_top(4);
+        bubble.set_margin_bottom(4);
+        
+        let is_sent = !msg.from_callsign.is_empty() && 
+            msg.from_callsign != msg.to_callsign && 
+            msg.from_callsign != "";
+        
+        // Create message content
+        let content_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        content_box.set_margin_start(8);
+        content_box.set_margin_end(8);
+        content_box.set_margin_top(4);
+        content_box.set_margin_bottom(4);
+        
+        let body_label = gtk::Label::new(None);
+        if is_sent {
+            body_label.set_markup(&format!(
+                "<span color='#CCE5FF'>{}</span>",
+                escape_markup(&msg.body)
+            ));
+        } else {
+            body_label.set_markup(&format!(
+                "<span color='#FFFFFF'>{}</span>",
+                escape_markup(&msg.body)
+            ));
+        }
+        body_label.set_halign(gtk::Align::Start);
+        body_label.set_wrap(true);
+        body_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        body_label.set_size_request(250, -1);
+        
+        let status_label = gtk::Label::new(None);
+        
+        // Received messages use flag icons; sent messages use status icons + retry count
+        let (status_text, status_color) = if is_sent {
+            let icon = get_message_status_icon(msg.status);
+            let color = get_message_status_color(msg.status);
+            let retry_text = if msg.retries > 0 {
+                format!("{} <sup>{}</sup>", icon, msg.retries)
+            } else {
+                icon.to_string()
+            };
+            (retry_text, color.to_string())
+        } else {
+            // Received messages: single flag if received, double flag if we sent ACK
+            if msg.ack_sent {
+                ("🚩🚩".to_string(), "#33D17A".to_string())   // Green double flag - ACK sent
+            } else {
+                ("🚩".to_string(), "#888888".to_string())      // Gray single flag - received
+            }
+        };
+        status_label.set_markup(&format!(
+            "<span color='{}'>{}</span>",
+            status_color, status_text
+        ));
+        
+        content_box.append(&body_label);
+        
+        bubble.append(&content_box);
+        bubble.append(&status_label);
+        
+        // Align based on sent/received
+        if is_sent {
+            bubble.set_halign(gtk::Align::End);
+        } else {
+            bubble.set_halign(gtk::Align::Start);
+        }
+        
+        bubble.add_css_class("aprs-message-row");
+        
+        messages_box.append(&bubble);
+        messages_box.show();
+    }
     
     // =========================================================================
     // Channel Edit Dialog

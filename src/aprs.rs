@@ -13,6 +13,7 @@
 //! - Digipeater path parsing
 
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // APRS Type Definitions
@@ -170,7 +171,7 @@ impl APRSMessage {
     }
     
     /// Create a new message marked as sent by us
-    pub fn new_sent(to: &str, body: &str, msg_id: &str) -> Self {
+    pub fn new_sent(to: &str, body: &str, _aprs_id: &str) -> Self {
         Self {
             msg_type: APRSType::Message,
             from_callsign: String::new(),  // Will be set by caller
@@ -182,7 +183,7 @@ impl APRSMessage {
             timestamp_is_utc: true,
             to_callsign_msg: Some(to.to_string()),
             msg_body: Some(body.to_string()),
-            msg_id: Some(msg_id.to_string()),
+            msg_id: Some(_aprs_id.to_string()),
             is_sent: true,
             is_acknowledged: false,
             ..Default::default()
@@ -192,6 +193,224 @@ impl APRSMessage {
     /// Check if message is pending (sent but not acknowledged)
     pub fn is_pending(&self) -> bool {
         self.is_sent && !self.is_acknowledged
+    }
+    
+    /// Create an APRS message for display from a DirectMessage
+    pub fn from_direct_message(dm: &DirectMessage) -> Self {
+        let mut msg = APRSMessage::new();
+        msg.msg_type = APRSType::Message;
+        msg.from_callsign = dm.from_callsign.clone();
+        msg.to_callsign = dm.to_callsign.clone();
+        msg.timestamp = Some(dm.timestamp);
+        msg.to_callsign_msg = Some(dm.to_callsign.clone());
+        msg.msg_body = Some(dm.body.clone());
+        msg.msg_id = Some(dm.id.clone());
+        msg.is_sent = !dm.from_callsign.is_empty() && dm.from_callsign != dm.to_callsign;
+        msg.is_acknowledged = dm.status == DirectMessageStatus::Acknowledged;
+        msg
+    }
+}
+
+/// Status for direct messages
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectMessageStatus {
+    Pending,      // Queued for transmission
+    Sent,         // Transmitted, waiting for ACK
+    Acknowledged, // ACK received ✓✓
+    Failed,       // Max retries exceeded, red !
+}
+
+impl Default for DirectMessageStatus {
+    fn default() -> Self { Self::Pending }
+}
+
+/// A direct APRS message (for TX and RX)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectMessage {
+    pub id: String,           // Unique internal ID (UUID)
+    pub aprs_id: String,      // APRS message ID (001, 002, etc.) for ACK matching
+    pub msg_id: Option<String>, // APRS message ID from received message (for ACK tracking)
+    pub thread_id: String,    // Other party's callsign (for grouping)
+    pub from_callsign: String,
+    pub to_callsign: String,
+    pub body: String,
+    pub timestamp: u64,       // Unix timestamp
+    pub status: DirectMessageStatus,
+    pub retries: u8,          // Number of TX attempts
+    pub last_retry_timestamp: u64,  // Timestamp of last retry attempt
+    pub ack_sent: bool,       // True if we sent an ACK for this received message
+}
+
+impl DirectMessage {
+    /// Create a new direct message.
+    /// - to: recipient callsign
+    /// - body: message text
+    /// - id: unique message ID for tracking (internal UUID)
+    /// - from: sender callsign (us)
+    /// - aprs_id: APRS message ID (001, 002, etc.) for ACK matching
+    pub fn new(to: &str, body: &str, id: &str, from: &str, aprs_id: &str) -> Self {
+        // thread_id is the "other" party in the conversation
+        // If from == our callsign, we're sending, so other is "to"
+        // Otherwise we're receiving, so other is "from"
+        let thread_id = if from.is_empty() || from == to {
+            to.to_string()
+        } else {
+            // Use the one that is NOT us (we don't know our callsign here, 
+            // so we use the simpler logic: other is always the recipient for sent msgs)
+            to.to_string()
+        };
+        Self {
+            id: id.to_string(),
+            aprs_id: aprs_id.to_string(),
+            msg_id: None,
+            thread_id,
+            from_callsign: from.to_string(),
+            to_callsign: to.to_string(),
+            body: body.to_string(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            status: DirectMessageStatus::Pending,
+            retries: 0,
+            last_retry_timestamp: 0,
+            ack_sent: false,
+        }
+    }
+    
+    /// Create with explicit thread_id (other party)
+    /// - aprs_id: APRS message ID for ACK matching
+    pub fn new_with_thread(other_party: &str, to: &str, body: &str, id: &str, from: &str, aprs_id: &str) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            id: id.to_string(),
+            aprs_id: aprs_id.to_string(),
+            msg_id: None,
+            thread_id: other_party.to_string(),
+            from_callsign: from.to_string(),
+            to_callsign: to.to_string(),
+            body: body.to_string(),
+            timestamp: now,
+            status: DirectMessageStatus::Pending,
+            retries: 0,
+            last_retry_timestamp: 0,
+            ack_sent: false,
+        }
+    }
+    
+    /// Create a received message with the APRS message ID for ACK tracking
+    pub fn new_received(to: &str, body: &str, id: &str, from: &str, aprs_id: &str, msg_id: &str) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            id: id.to_string(),
+            aprs_id: aprs_id.to_string(),
+            msg_id: if msg_id.is_empty() { None } else { Some(msg_id.to_string()) },
+            thread_id: from.to_string(),
+            from_callsign: from.to_string(),
+            to_callsign: to.to_string(),
+            body: body.to_string(),
+            timestamp: now,
+            status: DirectMessageStatus::Pending,
+            retries: 0,
+            last_retry_timestamp: 0,
+            ack_sent: false,
+        }
+    }
+    
+    /// Check if this message matches an ACK by APRS ID
+    pub fn matches_ack(&self, ack_id: &str) -> bool {
+        self.aprs_id == ack_id && self.status == DirectMessageStatus::Sent
+    }
+    
+    /// Mark message as sent (transition from Pending to Sent)
+    pub fn mark_sent(&mut self) {
+        if self.status == DirectMessageStatus::Pending {
+            self.status = DirectMessageStatus::Sent;
+        }
+    }
+    
+    /// Mark message as acknowledged
+    pub fn mark_acknowledged(&mut self) {
+        self.status = DirectMessageStatus::Acknowledged;
+    }
+    
+    /// Mark ACK as sent for a received message
+    pub fn mark_ack_sent(&mut self) {
+        self.ack_sent = true;
+    }
+    
+    /// Mark message as failed (max retries exceeded)
+    pub fn mark_failed(&mut self) {
+        self.status = DirectMessageStatus::Failed;
+    }
+    
+    /// Increment retry count
+    pub fn increment_retries(&mut self) {
+        self.retries += 1;
+    }
+}
+
+/// A conversation thread (one per unique recipient)
+#[derive(Debug, Clone)]
+pub struct MessageThread {
+    pub id: String,           // Other party's callsign (thread_id)
+    pub display_name: String, // Display name for UI
+    pub messages: Vec<DirectMessage>,
+    pub last_updated: u64,
+    pub unread_count: u32,
+}
+
+impl MessageThread {
+    pub fn new(thread_id: &str) -> Self {
+        Self {
+            id: thread_id.to_string(),
+            display_name: thread_id.to_string(),
+            messages: Vec::new(),
+            last_updated: 0,
+            unread_count: 0,
+        }
+    }
+    
+    /// Add a message to this thread
+    pub fn add_message(&mut self, msg: DirectMessage) {
+        self.last_updated = msg.timestamp;
+        // If received message and not from us, increment unread
+        if msg.from_callsign != msg.to_callsign && msg.from_callsign != "" {
+            self.unread_count += 1;
+        }
+        self.messages.push(msg);
+    }
+    
+    /// Build threads from a list of messages
+    pub fn build_threads(messages: &[DirectMessage]) -> Vec<MessageThread> {
+        let mut thread_map: std::collections::HashMap<String, MessageThread> = std::collections::HashMap::new();
+        
+        for msg in messages {
+            let entry = thread_map.entry(msg.thread_id.clone())
+                .or_insert_with(|| MessageThread::new(&msg.thread_id));
+            
+            // Clone the message for storage
+            let mut msg_clone = msg.clone();
+            entry.last_updated = entry.last_updated.max(msg.timestamp);
+            
+            // Count unread (received messages not from us)
+            if msg_clone.from_callsign != "" && msg_clone.from_callsign != msg_clone.to_callsign {
+                entry.unread_count += 1;
+            }
+            
+            entry.messages.push(msg_clone);
+        }
+        
+        // Convert to vector and sort by last_updated
+        let mut threads: Vec<MessageThread> = thread_map.into_values().collect();
+        threads.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
+        threads
     }
 }
 
@@ -925,8 +1144,10 @@ fn decode_message(msg: &mut APRSMessage, payload: &[u8]) {
         let addr_bytes: Vec<u8> = data[..colon_idx].iter().map(|&b| b & 0x7F).collect();
         let addr = String::from_utf8_lossy(&addr_bytes).trim().to_string();
 
+        // For direct messages, the message body addressee IS the real destination
+        // AX.25 destination would be "APRS" (UI frame), not the actual recipient
+        msg.to_callsign = addr.clone();
         msg.to_callsign_msg = Some(addr.clone());
-        msg.to_callsign = addr;
 
         if colon_idx + 1 < data.len() {
             let body = &data[colon_idx + 1..];
@@ -938,9 +1159,22 @@ fn decode_message(msg: &mut APRSMessage, payload: &[u8]) {
                 // Acknowledgment
                 msg.msg_type = APRSType::MessageAck;
                 msg.msg_body = Some(body_str.clone());
+                eprintln!("[aprs] ACK detected - body_str: {:?}, bytes: {:?}", body_str, body);
                 // Extract message ID if present
                 if let Some(msg_id) = extract_message_id(&body_str) {
                     msg.msg_id = Some(msg_id);
+                }
+            } else if body_str.starts_with(":") && body_str.contains(":ack") {
+                // ACK with addressee prefix like ":CALLSIGN:ackID"
+                msg.msg_type = APRSType::MessageAck;
+                msg.msg_body = Some(body_str.clone());
+                eprintln!("[aprs] ACK (with prefix) detected - body_str: {:?}", body_str);
+                // Extract message ID
+                if let Some(colon_idx) = body_str.find(":ack") {
+                    let id = &body_str[colon_idx + 4..].trim();
+                    if !id.is_empty() {
+                        msg.msg_id = Some(id.to_string());
+                    }
                 }
             } else if body_str.starts_with("rej") {
                 // Rejection
@@ -965,14 +1199,24 @@ fn decode_message(msg: &mut APRSMessage, payload: &[u8]) {
 
 /// Extract message ID from acknowledgment body
 fn extract_message_id(body: &str) -> Option<String> {
-    // ackXXXX format
-    if body.len() >= 5 {
-        let id = body[3..].trim();
-        if !id.is_empty() {
-            return Some(id.to_string());
-        }
+    // Handle both "ackXXX" and ":CALLSIGN:ackXXX" formats
+    let body = body.trim();
+    
+    // If starts with ':', skip to 'ack'
+    let id_start = if let Some(pos) = body.find(":ack") {
+        pos + 4
+    } else if body.starts_with("ack") {
+        3
+    } else {
+        return None;
+    };
+    
+    let id = body[id_start..].trim();
+    if !id.is_empty() {
+        Some(id.to_string())
+    } else {
+        None
     }
-    None
 }
 
 // ============================================================================
@@ -1245,11 +1489,25 @@ pub fn build_position_report(
 pub fn build_message_payload(
     to_callsign: &str,
     body: &str,
+) -> String {
+    // For messages without ID (basic format)
+    let to_padded = format!("{:<9}", to_callsign);
+    format!(":{}:{}", to_padded, body)
+}
+
+pub fn build_message_payload_with_id(
+    to_callsign: &str,
+    body: &str,
     msg_id: &str,
 ) -> String {
-    // Pad to_callsign to 9 characters (APRS standard)
+    // Standard APRS message format: :CALLSIGN:body{ID
+    // The msg_id is appended after the message with a { prefix
     let to_padded = format!("{:<9}", to_callsign);
-    format!(":{}:{} {{{}", to_padded, body, msg_id)
+    if msg_id.is_empty() {
+        format!(":{}:{}", to_padded, body)
+    } else {
+        format!(":{}:{} {{{}", to_padded, body, msg_id)
+    }
 }
 
 /// Check if a received message is an ACK for a sent message
@@ -1267,6 +1525,96 @@ pub fn parse_message_ack(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Generate a unique message ID using UUID v4
+pub fn generate_message_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Parse an APRS message recipient from a message frame
+/// Returns the "to" callsign for a message (the addressee)
+pub fn parse_message_recipient(payload: &[u8]) -> Option<String> {
+    if payload.is_empty() || payload[0] != b':' {
+        return None;
+    }
+    
+    let data = &payload[1..];
+    if let Some(colon_idx) = data.iter().position(|&b| b == b':') {
+        let addr_bytes: Vec<u8> = data[..colon_idx].iter().map(|&b| b & 0x7F).collect();
+        Some(String::from_utf8_lossy(&addr_bytes).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Check if an APRS message is addressed to a specific callsign
+pub fn is_message_for_callsign(payload: &[u8], my_callsign: &str) -> bool {
+    if let Some(recipient) = parse_message_recipient(payload) {
+        let recipient_base = base_callsign(&recipient);
+        let my_base = base_callsign(my_callsign);
+        recipient_base.eq_ignore_ascii_case(&my_base)
+    } else {
+        false
+    }
+}
+
+/// Get the message ID from a received APRS message
+pub fn get_message_id_from_payload(payload: &[u8]) -> Option<String> {
+    let body = String::from_utf8_lossy(payload);
+    if let Some(braces_idx) = body.find('{') {
+        Some(body[braces_idx + 1..].trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Build an ACK packet for a received message
+/// Returns the ACK text payload for sending back to the sender
+pub fn build_ack_payload(recipient: &str, msg_id: &str) -> String {
+    // ACK format: :CALLSIGN :ackID\r (with addressee prefix, matching Yaesu format)
+    // e.g., ":IU2KIN-7 :ack009\r" - space before ack is standard APRS format
+    let padded_id = format!("{:03}", msg_id.parse::<u32>().unwrap_or(0));
+    let padded_recipient = format!("{:<9}", recipient.trim());
+    format!(":{}:ack{}\r", padded_recipient, padded_id)
+}
+
+/// Format a message thread for display in the APRS messages list
+pub fn format_thread_preview(thread: &MessageThread) -> String {
+    if let Some(last_msg) = thread.messages.last() {
+        let sender = if last_msg.from_callsign.is_empty() || last_msg.from_callsign == last_msg.to_callsign {
+            "Me".to_string()
+        } else {
+            base_callsign(&last_msg.from_callsign)
+        };
+        let preview = if last_msg.body.len() > 30 {
+            format!("{}...", &last_msg.body[..30])
+        } else {
+            last_msg.body.clone()
+        };
+        format!("{}: {}", sender, preview)
+    } else {
+        String::new()
+    }
+}
+
+/// Get status icon for a direct message
+pub fn get_message_status_icon(status: DirectMessageStatus) -> &'static str {
+    match status {
+        DirectMessageStatus::Pending => "⏳",    // Hourglass - queued
+        DirectMessageStatus::Sent => "✓",        // Single check - transmitted, waiting ACK
+        DirectMessageStatus::Acknowledged => "✓✓", // Double check - ACK received
+        DirectMessageStatus::Failed => "❗",      // Exclamation - failed
+    }
+}
+
+/// Get status color for a direct message
+pub fn get_message_status_color(status: DirectMessageStatus) -> &'static str {
+    match status {
+        DirectMessageStatus::Pending | DirectMessageStatus::Sent => "#F5A623", // Yellow/amber
+        DirectMessageStatus::Acknowledged => "#33D17A",  // Green
+        DirectMessageStatus::Failed => "#ff4444",       // Red
+    }
 }
 
 // ============================================================================

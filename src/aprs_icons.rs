@@ -99,16 +99,20 @@ impl APRSIconRenderer {
         let img = image::open(path).map_err(|e| e.to_string())?;
         let rgba = img.to_rgba8();
         let (width, height) = rgba.dimensions();
-        let stride = ((width * 4 + 3) & !3) as i32;
-        let mut data = rgba.into_raw();
         
-        // Convert RGBX to ARGB32 (BGRA -> RGBA swap needed?)
-        // Image crate returns RGBA, Cairo expects ARGB32
-        for chunk in data.chunks_mut(4) {
-            chunk.swap(0, 2); // Swap R and B
+        // Cairo Format::ARgb32 on little-endian stores pixels as [B, G, R, A] in memory
+        // PNG stores [R, G, B, A], so we need to reorder to [B, G, R, A]
+        let mut bgra_data: Vec<u8> = Vec::with_capacity(width as usize * height as usize * 4);
+        
+        for pixel in rgba.pixels() {
+            // PNG RGBA: [R, G, B, A] -> Cairo BGRA: [B, G, R, A]
+            bgra_data.push(pixel[2]);  // B
+            bgra_data.push(pixel[1]);  // G
+            bgra_data.push(pixel[0]);  // R
+            bgra_data.push(pixel[3]);  // A
         }
         
-        ImageSurface::create_for_data(data, Format::ARgb32, width as i32, height as i32, stride)
+        ImageSurface::create_for_data(bgra_data, Format::ARgb32, width as i32, height as i32, width as i32 * 4)
             .map_err(|e| e.to_string())
     }
 

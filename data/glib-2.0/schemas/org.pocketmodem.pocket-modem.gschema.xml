@@ -129,5 +129,12 @@
       <description>Destination callsign for APRS beacons (default: APRS)</description>
     </key>
 
+
+    <!-- APRS Messages -->
+    <key name="aprs-messages" type="s">
+      <default>"[]"</default>
+      <summary>Stored APRS direct messages</summary>
+      <description>JSON array of DirectMessage objects for APRS direct messaging</description>
+    </key>
   </schema>
 </schemalist>
