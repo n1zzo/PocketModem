@@ -711,9 +711,6 @@ impl KV4PRadio {
         state.flags |= HostStateFlags::TX_ALLOWED.bits() | HostStateFlags::PTT_REQUESTED.bits();
         self.queue_command(RadioCommand::SendState(state))?;
         
-        // Wait for radio TX to complete and switch to RX (4s)
-        std::thread::sleep(std::time::Duration::from_secs(4));
-        
         // Build ACK payload
         let ack_payload = aprs::build_ack_payload(original_sender, msg_id);  // original_sender is who we reply TO
         eprintln!("[radio] SENT ACK - payload: {:?} (from: {}, to: {}, msg_id: {})", ack_payload, callsign, original_sender, msg_id);
