@@ -43,6 +43,17 @@ const APP_ID: &str = "org.pocketmodem.pocket-modem";
 static CHAT_REFRESH_SIGNAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static THREAD_REFRESH_SIGNAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+// APRS Message Retransmission Constants (per APRS 1.2 specification)
+// https://github.com/wb2osz/aprsspec
+// 
+// Standard APRS behavior:
+// - Messages should be retried at 30-second intervals initially
+// - Exponential backoff doubles the interval after each failed attempt: 30s → 60s → 120s → 240s → 480s → 960s
+// - Maximum 5 retries (6 total attempts including initial transmission)
+// - After 6 failed attempts with no ACK, the message is considered failed
+const APRS_BASE_RETRY_INTERVAL_SECS: u64 = 30;  // Initial retry interval (30 seconds)
+const APRS_MAX_RETRIES: u8 = 5;                  // Maximum retry count (max 6 total attempts)
+
 fn main() {
     let settings = SettingsManager::new();
     eprintln!("[pocket-modem] Settings loaded: freq={} kHz, squelch={}", 
@@ -2726,18 +2737,26 @@ fn create_ui(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             
-            // Get messages that need retry (with 10s minimum between retries)
+            // Get messages that need retry with APRS-standard exponential backoff
+            // APRS 1.2 spec: retry at 30s, then 60s, then 120s (doubling each time)
+            // Interval = base_interval * 2^retries (30, 60, 120, ...)
+            // First reload messages from GSettings to ensure we have latest state
+            unsafe { (*settings_update).reload_aprs_messages(); }
+            
             let retry_candidates: Vec<(String, String, String, String, String, u64)> = unsafe {
                 (*settings_update).aprs_messages()
                     .iter()
                     .filter(|m| {
-                        if m.status != aprs::DirectMessageStatus::Sent || m.retries >= 3 {
+                        if m.status != aprs::DirectMessageStatus::Sent || m.retries >= APRS_MAX_RETRIES {
                             return false;
                         }
+                        // Calculate retry interval with exponential backoff
+                        // First retry: 30s, second: 60s, third: 120s, etc.
+                        let retry_interval = APRS_BASE_RETRY_INTERVAL_SECS * (2_u64.pow(m.retries as u32));
                         // If last_retry_timestamp is 0, message was just stored - use message timestamp
-                        // Otherwise, check if 10s has passed since last retry
+                        // Otherwise, check if retry_interval has passed since last retry
                         let reference_time = if m.last_retry_timestamp == 0 { m.timestamp } else { m.last_retry_timestamp };
-                        now >= reference_time + 10
+                        now >= reference_time + retry_interval
                     })
                     .map(|m| (m.id.clone(), m.aprs_id.clone(), m.to_callsign.clone(), m.body.clone(), m.from_callsign.clone(), m.last_retry_timestamp))
                     .collect()
@@ -2747,12 +2766,14 @@ fn create_ui(
                 let callsign = unsafe { (*settings_update).aprs_full_callsign() };
                 if !callsign.is_empty() {
                     let current_retries = unsafe { (*settings_update).get_aprs_message(&msg_id).map(|m| m.retries).unwrap_or(0) };
-                    eprintln!("[pocket-modem] Retrying message {} [{}] to {} (attempt {})", 
-                              msg_id, aprs_id, to, current_retries + 1);
+                    eprintln!("[pocket-modem] Retrying [{}] to {} (attempt {})", 
+                              aprs_id, to, current_retries + 1);
                     
                     // Increment retry count and update timestamp
                     unsafe { (*settings_update).increment_aprs_message_retries(&msg_id); };
                     unsafe { (*settings_update).update_message_last_retry(&msg_id, now); };
+                    // Signal chat UI to refresh message status icon (show updated retry count)
+                    CHAT_REFRESH_SIGNAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     
                     // Retry sending
                     let radio_retry = radio_update.clone();
@@ -2770,14 +2791,20 @@ fn create_ui(
             // Mark messages that exceeded max retries as failed
             unsafe {
                 let messages = (*settings_update).aprs_messages();
+                let mut failed_message_ids: Vec<String> = Vec::new();
                 for m in messages {
-                    if m.status == aprs::DirectMessageStatus::Sent && m.retries >= 3 {
+                    if m.status == aprs::DirectMessageStatus::Sent && m.retries >= APRS_MAX_RETRIES {
                         (*settings_update).update_aprs_message_status(
                             &m.id,
                             aprs::DirectMessageStatus::Failed
                         );
-                        eprintln!("[pocket-modem] Message {} marked as failed after max retries", m.id);
+                        failed_message_ids.push(m.id.clone());
+                        eprintln!("[pocket-modem] Message {} marked as failed after {} retries", m.id, APRS_MAX_RETRIES);
                     }
+                }
+                // Signal chat UI to refresh failed message icons
+                if !failed_message_ids.is_empty() {
+                    CHAT_REFRESH_SIGNAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
@@ -2990,8 +3017,13 @@ fn create_ui(
             let current_signal = CHAT_REFRESH_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
             if current_signal != last_refresh_signal {
                 last_refresh_signal = current_signal;
+                
+                // Explicitly reload messages from GSettings to ensure fresh data
+                unsafe { (*settings_refresh).reload_aprs_messages(); }
+                
                 // Refresh messages for this thread
                 let thread_messages = unsafe { (*settings_refresh).aprs_messages_for_thread(&recipient_refresh) };
+                
                 // Clear and rebuild messages box
                 while let Some(child) = messages_box_refresh.first_child() {
                     messages_box_refresh.remove(&child);
@@ -3044,7 +3076,7 @@ fn create_ui(
             }
             
             dm.mark_sent();
-            // Set initial retry timestamp (first retry at 10s)
+            // Set initial retry timestamp (first APRS retry at 30s per spec)
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -3098,7 +3130,7 @@ fn create_ui(
             }
             
             dm.mark_sent();
-            // Set initial retry timestamp (first retry at 10s)
+            // Set initial retry timestamp (first APRS retry at 30s per spec)
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())

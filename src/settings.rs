@@ -671,6 +671,12 @@ impl SettingsManager {
         self.settings.set_string("aprs-messages", &messages_json).ok();
     }
     
+    /// Reload APRS messages from GSettings
+    /// Use this to ensure cached data is fresh after modifications
+    pub fn reload_aprs_messages(&mut self) {
+        self.cached.aprs_messages = self.load_aprs_messages_from_settings();
+    }
+    
     /// Initialize APRS settings with defaults (for first-time setup)
     pub fn initialize_aprs_settings(&mut self) {
         // Set sensible defaults for APRS if not already set
