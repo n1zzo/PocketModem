@@ -1617,10 +1617,10 @@ pub fn get_message_id_from_payload(payload: &[u8]) -> Option<String> {
 /// Returns the ACK text payload for sending back to the sender
 pub fn build_ack_payload(recipient: &str, msg_id: &str) -> String {
     // ACK format: :CALLSIGN :ackID\r (with 9-char padded recipient for space before ack)
-    // e.g., ":IU2KIN-7 :ack009\r" - padded to 9 chars adds the space before ack
+    // Use exact msg_id without zero-padding - FT-1D does string comparison
+    // e.g., ":IU2KIN-7 :ack52\r" for msg_id="52"
     let padded_recipient = format!("{:<9}", recipient.trim());
-    let padded_id = format!("{:03}", msg_id.parse::<u32>().unwrap_or(0));
-    format!(":{}:ack{}\r", padded_recipient, padded_id)
+    format!(":{}:ack{}\r", padded_recipient, msg_id)
 }
 
 /// Format a message thread for display in the APRS messages list
