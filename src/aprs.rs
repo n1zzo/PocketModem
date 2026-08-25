@@ -498,7 +498,15 @@ fn build_aprs_message(parsed: ParsedAX25Frame) -> APRSMessage {
                   parsed.destination, parsed.source, parsed.payload.len(), payload_hex);
     }
     
-    let dti = parsed.payload[0] as char;
+    let dti_byte = parsed.payload[0];
+    
+    // Check for Mic-E format (backtick 0x60 or 0x27)
+    if dti_byte == 0x60 || dti_byte == 0x27 {
+        decode_mic_e(&mut msg, &parsed.payload);
+        return msg;
+    }
+    
+    let dti = dti_byte as char;
     match dti {
         '=' | '!' | '\'' | '"' => decode_position(&mut msg, &parsed.payload, false),
         '/' | '@' => decode_position(&mut msg, &parsed.payload, true),
@@ -531,7 +539,7 @@ fn build_aprs_message(parsed: ParsedAX25Frame) -> APRSMessage {
 // ============================================================================
 
 /// Parse a 7-byte AX.25 callsign field
-fn parse_callsign(data: &[u8]) -> Option<(String, usize)> {
+pub fn parse_callsign(data: &[u8]) -> Option<(String, usize)> {
     if data.len() < 7 { return None; }
     
     // AX.25 callsigns are 6 characters stored in 7 bytes
@@ -568,24 +576,72 @@ fn parse_callsign(data: &[u8]) -> Option<(String, usize)> {
 
 /// Parse all addresses from AX.25 frame
 /// Returns (callsigns, total_bytes_consumed)
-fn parse_addresses(frame: &[u8]) -> Option<(Vec<String>, usize)> {
+/// 
+/// In AX.25, the "last address" flag (bit 0 of byte 6) indicates the final
+/// address. However, we must verify that ctrl+pid (0x03 0xF0 for UI frames)
+/// actually follows, otherwise the "final" bit was just part of the SSID.
+pub fn parse_addresses(frame: &[u8]) -> Option<(Vec<String>, usize)> {
     let mut addresses = Vec::new();
     let mut offset = 0;
     
     loop {
+        // Check if we've reached the end
+        if offset >= frame.len() { 
+            return Some((addresses, offset));
+        }
+        
+        // Need at least 7 bytes for an address
         if offset + 7 > frame.len() { return None; }
         
-        let (call, _) = parse_callsign(&frame[offset..offset+7])?;
-        addresses.push(call);
+        let remaining = &frame[offset..];
+        let ssid_byte = remaining[6];
+        let is_final = (ssid_byte & 0x01) != 0;
         
-        // Bit 0 of byte 6 is the "last address" flag
-        let is_final = (frame[offset + 6] & 0x01) != 0;
+        // Try to parse this address
+        let (call, _) = parse_callsign(remaining)?;
+        addresses.push(call);
         offset += 7;
         
-        if is_final { break; }
+        if is_final {
+            // Final bit is set - check for ctrl/pid
+            if offset + 2 <= frame.len() && frame[offset] == 0x03 && frame[offset + 1] == 0xF0 {
+                // Found valid ctrl/pid
+                break;
+            }
+            // No ctrl/pid found - check if we should continue parsing
+            // If we can fit another address AND it looks like callsign, continue
+            if offset + 7 <= frame.len() && looks_like_callsign_bytes(&frame[offset..]) {
+                // Continue parsing (likely a multi-address frame)
+                continue;
+            }
+            // Can't continue - return what we have
+            return Some((addresses, offset));
+        } else {
+            // Not final - check if we can continue
+            // If next bytes don't look like callsign, stop
+            if offset + 7 > frame.len() || !looks_like_callsign_bytes(&frame[offset..]) {
+                return Some((addresses, offset));
+            }
+        }
     }
     
     Some((addresses, offset))
+}
+
+/// Check if 7 bytes look like valid AX.25 callsign bytes
+fn looks_like_callsign_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() < 7 { return false; }
+    // Valid callsign: characters shifted left by 1 (0x41<<1=0x82 for 'A')
+    // So valid bytes after shifting are 0x42-0xFE (printable ASCII range)
+    let mut printable_count = 0;
+    for i in 0..6 {
+        let c = bytes[i] >> 1;  // Shift back to get ASCII
+        if c >= 0x20 && c <= 0x5F || c >= 0x61 && c <= 0x7A {
+            printable_count += 1;
+        }
+    }
+    // At least 4 of first 6 bytes should be printable for a callsign
+    printable_count >= 4
 }
 
 // ============================================================================
@@ -607,8 +663,8 @@ fn parse_aprs_timestamp(data: &[u8]) -> Option<(u64, Option<u8>, usize)> {
     let first = data[0] as char;
     let seventh = data[6] as char;
     
-    // Format: @HHMMSSz (8 chars)
-    if first == '@' && data.len() >= 8 && seventh == 'z' {
+    // Format: @HHMMSSz (8 chars) - z is at position 7, not 6
+    if first == '@' && data.len() >= 8 && data[7] == b'z' {
         let time_str = String::from_utf8_lossy(&data[1..7]);
         if let Some(secs) = parse_hhmmss(&time_str) {
             return Some((secs, None, 8));
@@ -688,6 +744,7 @@ fn decode_position(msg: &mut APRSMessage, payload: &[u8], has_timestamp: bool) {
     msg.msg_type = if has_timestamp { APRSType::PositionWithTimestamp } else { APRSType::Position };
     
     let data = &payload[1..];  // Skip DTI
+    eprintln!("[decode_position] data after skip: {:?} ({} bytes)", String::from_utf8_lossy(data), data.len());
     
     // First, try to parse timestamp if present
     if let Some((hhmmss, day, consumed)) = parse_aprs_timestamp(data) {
@@ -730,56 +787,63 @@ fn decode_position(msg: &mut APRSMessage, payload: &[u8], has_timestamp: bool) {
 
 /// Parse position data and return (lat, lon, symbol_table, symbol_code, remainder)
 fn parse_position_body(data: &[u8]) -> Option<(f64, f64, Option<char>, Option<char>, &[u8])> {
-    // Try compressed position first: /XXXXX000000>OOOOOO (13 chars)
-    if data.len() >= 14 && data[0] == b'/' {
-        if let Some(result) = parse_compressed_position(&data[1..]) {
-            return Some(result);
-        }
-    }
-    
-    // Try uncompressed positions (offset varies with timestamp)
-    
-    // Check for leading / (timestamp) or @ (timestamp)
-    if data.len() >= 1 {
-        let first = data[0] as char;
-        if first == '@' || first == '/' {
-            // This is a timestamp, skip it
-            // We'll handle this in parse_aprs_timestamp
-        }
-    }
-    
-    // Format A: DDMM.MMN/DDDMM.MMW[sym] (18+ chars with / separator)
-    // Pattern: DDMM.MM + N/S + / + DDDMM.MM + E/W
-    // Total: 18 chars for position, remainder is symbol + comment
-    
-    let lat_str = String::from_utf8_lossy(&data[0..7]);
-    let ns = data[7] as char;
-    let sep = data[8] as char;
-    
-    if sep == '/' {
-        if let Some(result) = try_parse_position_with_separator(data) {
-            return Some(result);
-        }
-    }
-    
-    // Format B: DDMM.MMN DDDMM.MMW[sym] (without / separator)
-    if is_ns(ns) {
-        if let Some(result) = try_parse_position_b(data) {
-            return Some(result);
-        }
-    }
-    
-    // Format C: DDMMN/DDDMMW[sym] (no decimal minutes)
-    if data.len() >= 12 {
-        let sep_c = data[5] as char;
-        if sep_c == '/' {
-            if let Some(result) = try_parse_position_c(data) {
+    // Try compressed position first: /XXXXX000000>OOOOOO (13+ chars)
+    // Compressed format starts with / and byte 11 (after leading /) should be table ID
+    if data.len() >= 13 && data[0] == b'/' {
+        // Check byte 11 for table ID indicator
+        let table_indicator = data[11] as char;
+        if table_indicator == '/' || table_indicator == '\\' {
+            if let Some(result) = parse_compressed_position(&data[1..]) {
                 return Some(result);
             }
         }
     }
     
+    // Check for leading / (timestamp) or @ (timestamp) and skip it
+    let position_data = if data.len() >= 1 {
+        let first = data[0] as char;
+        if first == '@' || first == '/' {
+            // This is a timestamp, try to skip it
+            if let Some((_, _, consumed)) = parse_aprs_timestamp(data) {
+                &data[consumed..]
+            } else {
+                data
+            }
+        } else {
+            data
+        }
+    } else {
+        data
+    };
+    
+    // Try Format A: DDMM.MMN/DDDMM.MMW[sym] (with / separator)
+    if let Some(result) = try_parse_position_with_separator(position_data) {
+        return Some(result);
+    }
+    
+    // Try Format B: DDMM.MMN DDDMM.MMW[sym] (without / separator)
+    if let Some(result) = try_parse_position_b(position_data) {
+        return Some(result);
+    }
+    
+    // Try Format C: DDMMN/DDDMMW[sym] (no decimal minutes)
+    if let Some(result) = try_parse_position_c(position_data) {
+        return Some(result);
+    }
+    
+    // Try Format D: DDMM.MMN\\DDDMM.MMW[sym] (symbol table between lat/lon)
+    if let Some(result) = try_parse_position_with_symbol_between(position_data) {
+        return Some(result);
+    }
+    
     None
+}
+
+/// Parse position data and return (lat, lon, symbol_table, symbol_code, remainder)
+/// 
+/// This is a public wrapper for testing purposes.
+pub fn parse_aprs_position(data: &[u8]) -> Option<(f64, f64, Option<char>, Option<char>, &[u8])> {
+    parse_position_body(data)
 }
 
 /// Parse compressed position format: XXXXX000000>OOOOOO (13 chars)
@@ -843,12 +907,15 @@ fn base91_decode_6(data: &[u8]) -> Option<u32> {
 /// Try to parse Format A: DDMM.MMN/DDDMM.MMW[sym] (with / separator)
 fn try_parse_position_with_separator(data: &[u8]) -> Option<(f64, f64, Option<char>, Option<char>, &[u8])> {
     // Pattern: DDMM.MM(7) + N/S(1) + /(1) + DDDMM.MM(8) + E/W(1)
-    // Total: 18 chars for position, remainder is symbol + comment
+    // Total: 18 chars for position, optional symbol + comment after
     
-    if data.len() < 19 { return None; }
+    if data.len() < 17 { return None; }  // Need at least 17 (position + E/W)
     
     let ns = data[7] as char;
     if !is_ns(ns) { return None; }
+    
+    // Verify byte 8 is '/' separator
+    if data[8] != b'/' { return None; }
     
     let lon_start = 9;
     let lon_str = String::from_utf8_lossy(&data[lon_start..lon_start + 8]);
@@ -859,9 +926,13 @@ fn try_parse_position_with_separator(data: &[u8]) -> Option<(f64, f64, Option<ch
     let lat = decode_lat(&String::from_utf8_lossy(&data[0..7]), ns)?;
     let lon = decode_lon(&lon_str, ew)?;
     
-    // Symbol is at position 18 (after E/W)
+    // Symbol is at position 18 (after E/W) - optional
     let sym_pos = 18;
-    let (sym_table, sym_code, consumed) = extract_symbol(data, sym_pos)?;
+    let (sym_table, sym_code, consumed) = if sym_pos < data.len() {
+        extract_symbol(data, sym_pos).unwrap_or((None, None, 0))
+    } else {
+        (None, None, 0)
+    };
     
     let remainder = &data[sym_pos + consumed..];
     
@@ -871,9 +942,9 @@ fn try_parse_position_with_separator(data: &[u8]) -> Option<(f64, f64, Option<ch
 /// Try to parse Format B: DDMM.MMN DDDMM.MMW[sym] (without / separator)
 fn try_parse_position_b(data: &[u8]) -> Option<(f64, f64, Option<char>, Option<char>, &[u8])> {
     // Pattern: DDMM.MM(7) + N/S(1) + DDDMM.MM(8) + E/W(1)
-    // Total: 17 chars for position
+    // Total: 17 chars for position, optional symbol + comment after
     
-    if data.len() < 18 { return None; }
+    if data.len() < 17 { return None; }  // Need at least 17 for position + E/W
     
     let ns = data[7] as char;
     if !is_ns(ns) { return None; }
@@ -887,9 +958,13 @@ fn try_parse_position_b(data: &[u8]) -> Option<(f64, f64, Option<char>, Option<c
     let lat = decode_lat(&String::from_utf8_lossy(&data[0..7]), ns)?;
     let lon = decode_lon(&lon_str, ew)?;
     
-    // Symbol is at position 17 (after E/W)
+    // Symbol is at position 17 (after E/W) - optional
     let sym_pos = 17;
-    let (sym_table, sym_code, consumed) = extract_symbol(data, sym_pos)?;
+    let (sym_table, sym_code, consumed) = if sym_pos < data.len() {
+        extract_symbol(data, sym_pos).unwrap_or((None, None, 0))
+    } else {
+        (None, None, 0)
+    };
     
     let remainder = &data[sym_pos + consumed..];
     
@@ -899,9 +974,9 @@ fn try_parse_position_b(data: &[u8]) -> Option<(f64, f64, Option<char>, Option<c
 /// Try to parse Format C: DDMMN/DDDMMW[sym] (no decimal minutes)
 fn try_parse_position_c(data: &[u8]) -> Option<(f64, f64, Option<char>, Option<char>, &[u8])> {
     // Pattern: DDMM(4) + N/S(1) + /(1) + DDDMM(5) + E/W(1)
-    // Total: 12 chars for position
+    // Total: 12 chars for position, optional symbol + comment
     
-    if data.len() < 13 { return None; }
+    if data.len() < 12 { return None; }  // Need at least 12 for position + E/W
     
     let ns = data[4] as char;
     let sep = data[5] as char;
@@ -917,9 +992,50 @@ fn try_parse_position_c(data: &[u8]) -> Option<(f64, f64, Option<char>, Option<c
     let lat = decode_lat_no_decimal(&String::from_utf8_lossy(&data[0..4]), ns)?;
     let lon = decode_lon_no_decimal(&lon_str, ew)?;
     
-    // Symbol is at position 12 (after E/W)
+    // Symbol is at position 12 (after E/W) - optional
     let sym_pos = 12;
-    let (sym_table, sym_code, consumed) = extract_symbol(data, sym_pos)?;
+    let (sym_table, sym_code, consumed) = if sym_pos < data.len() {
+        extract_symbol(data, sym_pos).unwrap_or((None, None, 0))
+    } else {
+        (None, None, 0)
+    };
+    
+    let remainder = &data[sym_pos + consumed..];
+    
+    Some((lat, lon, sym_table, sym_code, remainder))
+}
+
+/// Try to parse Format D: DDMM.MMN\\DDDMM.MMW[sym] (symbol table between lat and lon)
+/// Pattern: DDMM.MM(7) + N/S(1) + \\ or /(1) + DDDMM.MM(8) + E/W(1) + sym(optional)
+/// Total: 18 chars minimum for position
+fn try_parse_position_with_symbol_between(data: &[u8]) -> Option<(f64, f64, Option<char>, Option<char>, &[u8])> {
+    if data.len() < 18 { return None; }  // Need at least 18 for position + E/W
+    
+    // Parse latitude (first 8 chars: DDMM.MMN)
+    let lat_str = String::from_utf8_lossy(&data[0..7]);
+    let ns = data[7] as char;
+    if !is_ns(ns) { return None; }
+    
+    // Position 8 is the symbol table (\ or /)
+    let sym_table_char = data[8] as char;
+    if sym_table_char != '\\' && sym_table_char != '/' { return None; }
+    let sym_table = Some(sym_table_char);
+    
+    // Parse longitude (starts at position 9)
+    let lon_str = String::from_utf8_lossy(&data[9..17]);
+    let ew = data[17] as char;
+    if !is_ew(ew) { return None; }
+    
+    let lat = decode_lat(&lat_str, ns)?;
+    let lon = decode_lon(&lon_str, ew)?;
+    
+    // Symbol code is at position 18 (optional)
+    let sym_pos = 18;
+    let (sym_code, consumed) = if sym_pos < data.len() {
+        (Some(data[sym_pos] as char), 1)
+    } else {
+        (None, 0)
+    };
     
     let remainder = &data[sym_pos + consumed..];
     
@@ -1118,28 +1234,31 @@ fn decode_object(msg: &mut APRSMessage, payload: &[u8]) {
     let name_bytes: Vec<u8> = data[..9].iter().map(|&b| b & 0x7F).collect();
     msg.obj_name = Some(String::from_utf8_lossy(&name_bytes).trim().to_string());
     
-    // Check if killed (*)
-    if (data[9] & 0x7F) == b'*' {
-        msg.is_killed = true;
-        msg.msg_type = APRSType::Object;
-        // Rest should be position data
-        if data.len() > 10 {
-            decode_position(msg, &data[10..], false);
-        }
-    } else {
-        // Could be Item or Object - check if byte 9 is ')' (alive object)
-        if (data[9] & 0x7F) == b')' {
-            msg.msg_type = APRSType::Object;
-        } else {
-            msg.msg_type = APRSType::Item;
-        }
-        if data.len() > 10 {
-            decode_position(msg, &data[10..], false);
-        }
+    // Determine if killed and if Item or Object
+    let is_killed = (data[9] & 0x7F) == b'*';
+    let is_alive_object = (data[9] & 0x7F) == b')';
+    
+    msg.is_killed = is_killed;
+    
+    // Parse position data
+    // For objects/items, position starts at position 10 (the DTI byte like !, =, ', etc.)
+    // decode_position will skip the first byte as DTI
+    if data.len() > 10 {
+        let pos_data = &data[10..];
+        decode_position(msg, pos_data, false);
     }
     
-    if msg.comment.is_empty() && data.len() > 10 {
-        msg.comment = String::from_utf8_lossy(&data[10..]).trim_end().to_string();
+    // Set correct type AFTER decode_position (which sets Position/PositionWithTimestamp)
+    if is_alive_object {
+        msg.msg_type = APRSType::Object;
+    } else if !is_killed {
+        msg.msg_type = APRSType::Item;
+    } else {
+        msg.msg_type = APRSType::Object;
+    }
+    
+    if msg.comment.is_empty() && data.len() > 11 {
+        msg.comment = String::from_utf8_lossy(&data[11..]).trim_end().to_string();
     }
 }
 
@@ -1364,14 +1483,226 @@ fn parse_nmea_coord(s: &str, dir: char) -> Option<f64> {
 }
 
 // ============================================================================
+// Mic-E Parsing
+// ============================================================================
+
+/// Decode Mic-E format position report
+/// Mic-E uses a compact binary encoding where latitude, longitude, course, speed,
+/// and message type are all encoded in the first 12 bytes after the DTI.
+///
+/// Format: `CCCCCDDSRCSSSSDDMMPGLLGGB*...
+/// - Byte 0: DTI (0x60 for normal GPS, 0x27 for dead reckoning)
+/// - Bytes 1-9: Compressed position data (NMEA-encoded nibbles)
+/// - Byte 10: Longitude symbol table ID
+/// - Byte 11: Symbol table/code (latitude symbol is embedded in position data)
+/// - Bytes 12+: NMEA timestamp and comment
+fn decode_mic_e(msg: &mut APRSMessage, payload: &[u8]) {
+    msg.msg_type = APRSType::Position;
+    
+    // Mic-E minimum length: DTI(1) + pos(9) + lon_sym(1) + sym(1) + timestamp(7) = 19
+    if payload.len() < 13 {
+        msg.comment = String::from_utf8_lossy(payload).trim_end().to_string();
+        return;
+    }
+    
+    // Helper to check if a nibble is a valid NMEA digit (0-9, not the special values 10-15)
+    let is_valid_nibble = |n: u8| -> bool { n < 10 };
+    
+    // Helper to get nibble value
+    let get_nibble = |b: u8, high: bool| -> u8 { if high { b >> 4 } else { b & 0x0F } };
+    
+    // Validate that all position nibbles are in valid range (0-9)
+    // In standard Mic-E, nibble values 10-15 indicate special data or encryption
+    let mut valid_position = true;
+    // Lat bytes: 1-3, Lon bytes: 4-6, CS bytes: 7-9
+    for i in 1..10 {
+        let high = get_nibble(payload[i], true);
+        let low = get_nibble(payload[i], false);
+        if !is_valid_nibble(high) || !is_valid_nibble(low) {
+            valid_position = false;
+            break;
+        }
+    }
+    
+    if valid_position {
+        // Parse latitude from bytes 1-3
+        let lat_deg_tens = get_nibble(payload[1], true);
+        let lat_min_tens = get_nibble(payload[1], false);
+        let lat_min_ones = get_nibble(payload[2], true);
+        let lat_min_tenths = get_nibble(payload[2], false);
+        let lat_min_hundredths = get_nibble(payload[3], true);
+        
+        let lat_deg = (lat_deg_tens as f64) * 10.0 + (lat_min_tens as f64);
+        let lat_min = (lat_min_ones as f64 * 100.0 + lat_min_tenths as f64 * 10.0 + lat_min_hundredths as f64) / 100.0;
+        let mut latitude = lat_deg + lat_min / 60.0;
+        
+        // Parse longitude from bytes 4-6
+        let lon_deg_hundreds = get_nibble(payload[4], true);
+        let lon_deg_tens = get_nibble(payload[4], false);
+        let lon_deg_ones = get_nibble(payload[5], true);
+        let lon_min_tens = get_nibble(payload[5], false);
+        let lon_min_ones = get_nibble(payload[6], true);
+        let lon_min_tenths = get_nibble(payload[6], false);
+        
+        let lon_deg = (lon_deg_hundreds as f64) * 100.0 + (lon_deg_tens as f64) * 10.0 + (lon_deg_ones as f64);
+        let lon_min = (lon_min_tens as f64 * 100.0 + lon_min_ones as f64 * 10.0 + lon_min_tenths as f64) / 60.0;
+        let mut longitude = lon_deg + lon_min;
+        
+        // N/S and E/W from message type (bits 0-3 of byte 3)
+        let msg_type = get_nibble(payload[3], false);
+        let ns_bit = (msg_type >> 1) & 0x01;
+        let ew_bit = msg_type & 0x01;
+        
+        if ns_bit == 1 { latitude = -latitude; }
+        if ew_bit == 1 { longitude = -longitude; }
+        
+        msg.position_lat = latitude;
+        msg.position_lon = longitude;
+        
+        // Parse course and speed from bytes 7-9
+        let cs_2 = get_nibble(payload[7], true);
+        let cs_1 = get_nibble(payload[7], false);
+        let cs_0 = get_nibble(payload[8], true);
+        let spd_2 = get_nibble(payload[8], false);
+        let spd_1 = get_nibble(payload[9], true);
+        let spd_0 = get_nibble(payload[9], false);
+        
+        let course = (cs_2 as u16) * 100 + (cs_1 as u16) * 10 + (cs_0 as u16);
+        let speed = (spd_2 as u16) * 100 + (spd_1 as u16) * 10 + (spd_0 as u16);
+        
+        if course > 0 && course <= 360 {
+            msg.course = Some(course);
+        }
+        if speed > 0 && speed < 800 {
+            msg.speed = Some(speed);
+        }
+    }
+    
+    // Symbol table and code
+    // Byte 10 = longitude symbol table, byte 11 bits 4-7 = lat symbol table, 0-3 = code
+    let lat_sym_table = (payload[11] >> 4) & 0x0F;
+    let sym_code = payload[11] & 0x0F;
+    let sym_table_char = if lat_sym_table == 1 { '\\' } else { '/' };
+    
+    msg.symbol_table_id = Some(sym_table_char);
+    msg.symbol_code = Some(sym_code as char);
+    
+    // Parse timestamp if present (bytes 12-18)
+    // Mic-E timestamps are NMEA format: HHMMSS or DDHHMM
+    if payload.len() >= 19 {
+        let ts_data = &payload[12..std::cmp::min(19, payload.len())];
+        let ts_str = String::from_utf8_lossy(ts_data);
+        // Check if all printable ASCII digits
+        if ts_str.len() >= 6 && ts_str.chars().take(6).all(|c| c.is_ascii_digit()) {
+            if let Some(secs) = parse_hhmmss(&ts_str[..6]) {
+                msg.timestamp = Some(secs);
+                msg.timestamp_is_utc = true;
+            }
+        }
+        // Also try to extract comment from printable ASCII region
+        if payload.len() > 19 {
+            let comment_start = 19.min(payload.len());
+            let comment_bytes = &payload[comment_start..];
+            // Mic-E comments can be raw binary, but typically start with printable ASCII
+            // Look for the first printable region
+            let comment = extract_printable_comment(comment_bytes);
+            if !comment.is_empty() {
+                msg.comment = comment;
+            }
+        }
+    } else if payload.len() > 12 {
+        // Short packet - try to extract any comment
+        let comment = extract_printable_comment(&payload[12..]);
+        if !comment.is_empty() {
+            msg.comment = comment;
+        }
+    }
+}
+
+/// Extract a printable ASCII comment from raw bytes
+/// Mic-E data often contains non-printable bytes; find the readable portion
+fn extract_printable_comment(data: &[u8]) -> String {
+    // Find the longest contiguous printable ASCII sequence
+    let mut best_start = 0;
+    let mut best_len = 0;
+    let mut current_start = 0;
+    let mut current_len = 0;
+    
+    for &b in data {
+        if b >= 0x20 && b < 0x7F {
+            if current_len == 0 {
+                current_start = current_len;
+            }
+            current_len += 1;
+        } else {
+            if current_len > best_len {
+                best_len = current_len;
+                best_start = current_start;
+            }
+            current_len = 0;
+        }
+    }
+    
+    if current_len > best_len {
+        best_len = current_len;
+        best_start = current_start;
+    }
+    
+    if best_len > 0 && best_start + best_len <= data.len() {
+        String::from_utf8_lossy(&data[best_start..best_start + best_len])
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
+// ============================================================================
 // Status Parsing
 // ============================================================================
 
 /// Decode status report (>' DTI)
 fn decode_status(msg: &mut APRSMessage, payload: &[u8]) {
-    msg.msg_type = APRSType::Status;
     let data = &payload[1..];  // Skip '>'
-    msg.comment = String::from_utf8_lossy(data).trim_end().to_string();
+    let text = String::from_utf8_lossy(data);
+    
+    // Check for embedded position: status_text*:=position
+    // The "*:" marks the boundary between status and position
+    if let Some(pos_start) = text.find("*:") {
+        let remainder = &text[pos_start + 2..];
+        if let Some(first_char) = remainder.chars().next() {
+            match first_char {
+                '=' | '!' | '\'' | '"' | '/' | '@' => {
+                    // This is a status with embedded position
+                    // Parse position from the remainder
+                    let pos_bytes = remainder.as_bytes();
+                    if let Some((lat, lon, sym_table, sym_code, comment)) = parse_position_body(pos_bytes) {
+                        msg.msg_type = APRSType::PositionWithTimestamp;
+                        msg.position_lat = lat;
+                        msg.position_lon = lon;
+                        msg.symbol_table_id = sym_table;
+                        msg.symbol_code = sym_code;
+                        let comment_str = String::from_utf8_lossy(comment).trim_end().to_string();
+                        // Extract status text before *: and add to comment
+                        let status_text = &text[..pos_start];
+                        msg.comment = if comment_str.is_empty() {
+                            status_text.to_string()
+                        } else {
+                            format!("{} | {}", status_text, comment_str)
+                        };
+                        extract_course_speed(&comment_str, msg);
+                        extract_altitude(&comment_str, msg);
+                        return;
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
+    
+    // Pure status message
+    msg.msg_type = APRSType::Status;
+    msg.comment = text.trim_end().to_string();
 }
 
 // ============================================================================

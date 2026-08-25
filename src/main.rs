@@ -2106,13 +2106,24 @@ fn create_ui(
             // Log ACKs and queue for processing
             if msg.msg_type == APRSType::MessageAck {
                 // Parse ACK ID from raw payload (most reliable) or body
-                let ack_id = msg.raw_payload.as_ref()
-                    .and_then(|p| aprs::parse_ax25_payload_for_ack(p))
-                    .or_else(|| msg.msg_id.clone());
+                let raw_ack = msg.raw_payload.as_ref()
+                    .and_then(|p| {
+                        let id = aprs::parse_ax25_payload_for_ack(p);
+                        eprintln!("[pocket-modem] ACK parse_ax25_payload_for_ack: {:?}", id);
+                        id
+                    });
+                let ack_id = raw_ack.or_else(|| {
+                    eprintln!("[pocket-modem] ACK msg_id: {:?}", msg.msg_id);
+                    msg.msg_id.clone()
+                });
                 
                 if let Some(id) = ack_id {
                     eprintln!("[pocket-modem] Received ACK ID: {}", id);
                     acks_received.lock().unwrap().push(id);
+                } else {
+                    eprintln!("[pocket-modem] WARNING: Could not extract ACK ID from: {:?} {:?}", 
+                              msg.raw_payload.as_ref().map(|p| String::from_utf8_lossy(p)),
+                              msg.msg_body);
                 }
             }
         });
@@ -2954,31 +2965,18 @@ fn create_ui(
             }
         });
         
+        // Scroll helper function - uses delay to wait for layout
+        let scroll_to_bottom = |scroll: &gtk::ScrolledWindow| {
+            let scroll_w = scroll.clone();
+            glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                let adj = scroll_w.vadjustment();
+                let max_val = (adj.upper() - adj.page_size()).max(0.0);
+                adj.set_value(max_val);
+            });
+        };
+        
         chat_window.show();
-        
-        // Scroll to bottom when vadjustment changes (layout has been computed)
-        let vadjust = messages_scroll.vadjustment();
-        let scroll_clone = messages_scroll.clone();
-        let first_scroll_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let scroll_done_notify = first_scroll_done.clone();
-        scroll_clone.connect_vadjustment_notify(move |_| {
-            if !scroll_done_notify.load(std::sync::atomic::Ordering::SeqCst) {
-                scroll_done_notify.store(true, std::sync::atomic::Ordering::SeqCst);
-                vadjust.set_value(vadjust.upper() - vadjust.page_size());
-            }
-        });
-        
-        // Fallback: also try after a short delay in case notify doesn't fire
-        let scroll_delayed = messages_scroll.clone();
-        let scroll_done_delayed = first_scroll_done.clone();
-        glib::timeout_add_local_once(Duration::from_millis(100), move || {
-            if !scroll_done_delayed.load(std::sync::atomic::Ordering::SeqCst) {
-                scroll_done_delayed.store(true, std::sync::atomic::Ordering::SeqCst);
-                scroll_delayed.vadjustment().set_value(
-                    scroll_delayed.vadjustment().upper() - scroll_delayed.vadjustment().page_size()
-                );
-            }
-        });
+        scroll_to_bottom(&messages_scroll);
         
         // Periodic refresh of message status
         let settings_refresh = settings;
@@ -3001,9 +2999,8 @@ fn create_ui(
                 for msg in thread_messages {
                     add_direct_message_bubble(&messages_box_refresh, msg, &our_callsign_refresh);
                 }
-                // Scroll to bottom
-                let adj = scroll_refresh.vadjustment();
-                adj.set_value(adj.upper().max(adj.page_size()));
+                // Scroll to bottom after messages are added
+                scroll_to_bottom(&scroll_refresh);
             }
             glib::ControlFlow::Continue
         });
@@ -3058,13 +3055,13 @@ fn create_ui(
                       dm.id, dm.aprs_id, dm.to_callsign, dm.status);
             add_direct_message_bubble(&messages_btn, &dm, &our_callsign);
             entry_btn.set_text("");
-            let adj = scroll_btn.vadjustment();
-            adj.set_value(adj.upper() - adj.page_size());
+            scroll_to_bottom(&scroll_btn);
         });
         
         // Enter key handler
         let entry_enter = message_entry.clone();
         let scroll_enter = messages_scroll.clone();
+        let scroll_helper_enter = messages_scroll.clone();
         let messages_enter = messages_box.clone();
         let settings_enter = settings;
         let recipient_enter = recipient.to_string();
@@ -3112,8 +3109,7 @@ fn create_ui(
                       dm.id, dm.aprs_id, dm.to_callsign, dm.status);
             add_direct_message_bubble(&messages_enter, &dm, &callsign);
             entry_enter.set_text("");
-            let adj = scroll_enter.vadjustment();
-            adj.set_value(adj.upper() - adj.page_size());
+            scroll_to_bottom(&scroll_enter);
         });
     }
     
@@ -3156,17 +3152,17 @@ fn create_ui(
         }
         msg_label.set_wrap(true);
         msg_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        msg_label.set_margin_start(10);
-        msg_label.set_margin_end(10);
-        msg_label.set_margin_top(4);
+        msg_label.set_margin_start(6);
+        msg_label.set_margin_end(6);
+        msg_label.set_margin_top(1);
         msg_label.set_margin_bottom(0);
         
         // Bottom row: time stamp + status
         let bottom_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         bottom_row.set_halign(gtk::Align::End);
-        bottom_row.set_margin_start(10);
-        bottom_row.set_margin_end(10);
-        bottom_row.set_margin_bottom(2);
+        bottom_row.set_margin_start(6);
+        bottom_row.set_margin_end(6);
+        bottom_row.set_margin_bottom(1);
         
         // Time stamp
         let time_label = gtk::Label::new(None);
@@ -3211,7 +3207,7 @@ fn create_ui(
             let icon = get_message_status_icon(msg.status);
             let color = get_message_status_color(msg.status);
             let retry_text = if msg.retries > 0 {
-                format!(" {} <sup>{}</sup>", icon, msg.retries)
+                format!(" {} <sub>{}</sub>", icon, msg.retries)
             } else {
                 format!(" {}", icon)
             };

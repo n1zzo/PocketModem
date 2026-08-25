@@ -252,7 +252,7 @@ pub const APP_CSS: &str = r#"
     .chat-bubble {
         border-radius: 16px;
         max-width: 260px;
-        padding: 8px;
+        padding: 2px;
     }
     .chat-bubble-sent {
         background: #3d3520;

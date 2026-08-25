@@ -1047,8 +1047,8 @@ fn io_thread_main(
                 Ok(n) => {
                     let packets = parser.lock().unwrap().feed(&buf[..n]);
                     for pkt in &packets {
-                        // Debug: log non-audio/non-state packets
-                        if pkt.command != 0x0C && pkt.command != 0x07 && pkt.command != 0x0B {
+                        // Debug: log non-audio/non-state packets (suppress common noisy ones)
+                        if pkt.command != 0x0C && pkt.command != 0x07 && pkt.command != 0x0B && pkt.command != 0x09 {
                             eprintln!("[radio] Packet: cmd=0x{:02X}, len={}", pkt.command, pkt.payload.len());
                         }
                         
