@@ -2043,10 +2043,12 @@ fn create_ui(
             eprintln!("[pocket-modem] RECEIVED FRAME - type: {:?}, from: {}, to: {}, body: {:?}", 
                       msg.msg_type, msg.from_callsign, msg.to_callsign, msg.msg_body);
             
-            // Add to display list
-            let mut msgs = aprs_msgs.lock().unwrap();
-            msgs.push(msg.clone());
-            if msgs.len() > 100 { msgs.remove(0); }
+            // Add to display list (exclude ACKs - they're not user-visible messages)
+            if msg.msg_type != APRSType::MessageAck {
+                let mut msgs = aprs_msgs.lock().unwrap();
+                msgs.push(msg.clone());
+                if msgs.len() > 100 { msgs.remove(0); }
+            }
             
             // Store received messages for chat threads
             if msg.msg_type == APRSType::Message {
@@ -2090,12 +2092,14 @@ fn create_ui(
             
             // Log ACKs and queue for processing
             if msg.msg_type == APRSType::MessageAck {
-                if let Some(body) = &msg.msg_body {
-                    eprintln!("[pocket-modem] RECEIVED ACK - from: {}, to_callsign: {}, body: {:?}", msg.from_callsign, msg.to_callsign, body);
-                    if let Some(ack_id) = aprs::parse_message_ack(body) {
-                        eprintln!("[pocket-modem] Received ACK parsed ID: {}", ack_id);
-                        acks_received.lock().unwrap().push(ack_id);
-                    }
+                // Parse ACK ID from raw payload (most reliable) or body
+                let ack_id = msg.raw_payload.as_ref()
+                    .and_then(|p| aprs::parse_ax25_payload_for_ack(p))
+                    .or_else(|| msg.msg_id.clone());
+                
+                if let Some(id) = ack_id {
+                    eprintln!("[pocket-modem] Received ACK ID: {}", id);
+                    acks_received.lock().unwrap().push(id);
                 }
             }
         });
@@ -2591,39 +2595,18 @@ fn create_ui(
         static APRS_RETRY_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let retry_tick = APRS_RETRY_TICK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if retry_tick % 100 == 0 {
-            // Process received ACKs
-            let acks_to_process: Vec<String> = {
+            // Process received ACKs and ACK_SENT signals (all stored in same vec)
+            let items: Vec<String> = {
                 let mut acks = received_acks.lock().unwrap();
                 std::mem::take(&mut *acks)
             };
-            for ack_id in acks_to_process {
-                unsafe {
-                    let messages = (*settings_update).aprs_messages();
-                    for m in messages {
-                        if m.aprs_id == ack_id {
-                            if (*settings_update).update_aprs_message_status(&m.id, aprs::DirectMessageStatus::Acknowledged) {
-                                eprintln!("[pocket-modem] Message {} acknowledged (ACK {})", m.id, ack_id);
-                                // Signal chat UI to refresh
-                                CHAT_REFRESH_SIGNAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
             
-            // Process ACK_SENT signals - mark messages as having ACK sent
-            let acks_sent: Vec<String> = {
-                let mut acks = received_acks.lock().unwrap();
-                acks.drain(..).filter(|s| s.starts_with("ACK_SENT:")).collect()
-            };
-            for ack_sent in acks_sent {
-                if let Some(ack_id) = ack_sent.strip_prefix("ACK_SENT:") {
+            for item in items {
+                if let Some(ack_id) = item.strip_prefix("ACK_SENT:") {
+                    // ACK_SENT signal - mark received messages as having our ACK sent
                     eprintln!("[pocket-modem] Processing ACK_SENT for message ID: {}", ack_id);
-                    // Find the most recent message from the sender and mark ACK as sent
                     unsafe {
                         let messages = (*settings_update).aprs_messages();
-                        // Find messages matching the APRS ID (if any were stored with one)
                         let mut found = false;
                         for m in messages.iter().rev() {
                             if m.msg_id.as_ref() == Some(&ack_id.to_string()) {
@@ -2635,10 +2618,8 @@ fn create_ui(
                                 break;
                             }
                         }
-                        // Also check by checking for message with matching aprs_id in body
                         if !found {
                             for m in messages.iter().rev() {
-                                // Check if this is a received message that needs ack_sent
                                 if m.aprs_id.is_empty() && !m.from_callsign.is_empty() {
                                     if (*settings_update).mark_message_ack_sent(&m.id) {
                                         eprintln!("[pocket-modem] Marked ACK sent for recent message {}", m.id);
@@ -2646,6 +2627,22 @@ fn create_ui(
                                         break;
                                     }
                                 }
+                            }
+                        }
+                    }
+                } else {
+                    // Received ACK ID - match against sent messages
+                    let ack_id = &item;
+                    eprintln!("[pocket-modem] Processing received ACK: {}", ack_id);
+                    unsafe {
+                        let messages = (*settings_update).aprs_messages();
+                        for m in messages {
+                            if m.aprs_id == *ack_id {
+                                if (*settings_update).update_aprs_message_status(&m.id, aprs::DirectMessageStatus::Acknowledged) {
+                                    eprintln!("[pocket-modem] Message {} acknowledged (ACK {})", m.id, ack_id);
+                                    CHAT_REFRESH_SIGNAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                break;
                             }
                         }
                     }

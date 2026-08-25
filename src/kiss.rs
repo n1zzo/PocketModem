@@ -538,34 +538,35 @@ pub fn build_ax25_ui_frame(
     frame
 }
 
-/// Build an AX.25 UI frame for ACK messages with Yaesu-compatible destination
-/// 
 /// Build an AX.25 UI frame for ACK messages
-/// Uses standard APRS destination for interoperability with all radios
+/// 
+/// Standard APRS destination field for maximum compatibility
 pub fn build_ax25_ack_frame(
     src: &str,            // Source callsign (e.g., "IU2KIN-5")
+    dest: &str,           // Destination callsign (e.g., "APRS")
     digipath: &[String],  // Digipeater path (empty for direct ACK)
     payload: &[u8],       // ACK payload bytes (e.g., ":IU2KIN-7 :ackXXX\r")
 ) -> Vec<u8> {
-    // Standard APRS destination
-    let mut aprs_dest = encode_callsign("APRS");
-    aprs_dest[6] |= 0x01;  // Set last address bit on destination
+    // Destination: last bit = 0 (source always comes after destination)
+    let mut dest_bytes = encode_callsign(dest);
+    // Do NOT set last bit on destination - source always follows
     
     let mut frame = Vec::with_capacity(7 + 7 + digipath.len() * 7 + 2 + payload.len());
-    frame.extend_from_slice(&aprs_dest);
+    frame.extend_from_slice(&dest_bytes);
     
-    // Source (last address flag NOT set when there are digipeaters - matches reference)
+    // Source: H-bit always set for ACKs, last bit only if no digipeaters
     let mut src_bytes = encode_callsign(src);
+    src_bytes[6] |= 0x80;  // H-bit always set for ACKs
     if digipath.is_empty() {
-        src_bytes[6] |= 0x01;
+        src_bytes[6] |= 0x01;  // Last bit only if no digipeaters
     }
     frame.extend_from_slice(&src_bytes);
     
-    // Digipeaters - standard encoding (encode_callsign produces correct byte7)
+    // Digipeaters - last flag on final digi
     for (i, digi) in digipath.iter().enumerate() {
         let mut digi_bytes = encode_callsign(digi);
         if i == digipath.len() - 1 {
-            digi_bytes[6] |= 0x01;  // Last address flag on final digi
+            digi_bytes[6] |= 0x01;  // Final digi has last bit set
         }
         frame.extend_from_slice(&digi_bytes);
     }

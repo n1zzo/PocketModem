@@ -136,6 +136,9 @@ pub struct APRSMessage {
     pub to_callsign_msg: Option<String>,
     pub msg_id: Option<String>,  // Message ID for ACKs
     
+    /// Raw payload bytes for direct parsing (e.g., for reliable ACK ID extraction)
+    pub raw_payload: Option<Vec<u8>>,
+    
     // Tracking for sent messages
     pub is_sent: bool,            // True if this message was sent by us
     pub is_acknowledged: bool,    // True if we received an ACK for this message
@@ -481,10 +484,18 @@ fn build_aprs_message(parsed: ParsedAX25Frame) -> APRSMessage {
     msg.to_callsign = parsed.destination.clone();
     msg.digipeaters = parsed.digipeaters.clone();
     msg.i_gate = parsed.i_gate().map(String::from);
+    msg.raw_payload = Some(parsed.payload.clone());  // Store raw for reliable ACK parsing
     
     if parsed.payload.is_empty() {
         msg.msg_type = APRSType::Unknown;
         return msg;
+    }
+    
+    // Log full AX.25 frame addresses and payload for ACKs
+    if parsed.payload.len() > 1 && parsed.payload[1] == b':' {
+        let payload_hex: String = parsed.payload.iter().map(|b| format!(" {:02X}", b)).collect();
+        eprintln!("[aprs] INCOMING FRAME - dst={} src={} payload ({} bytes):{}", 
+                  parsed.destination, parsed.source, parsed.payload.len(), payload_hex);
     }
     
     let dti = parsed.payload[0] as char;
@@ -1159,6 +1170,8 @@ fn decode_message(msg: &mut APRSMessage, payload: &[u8]) {
                 // Acknowledgment
                 msg.msg_type = APRSType::MessageAck;
                 msg.msg_body = Some(body_str.clone());
+                let payload_hex: String = payload.iter().map(|b| format!(" {:02X}", b)).collect();
+                eprintln!("[aprs] INCOMING ACK - full AX.25 payload ({} bytes):{}", payload.len(), payload_hex);
                 eprintln!("[aprs] ACK detected - body_str: {:?}, bytes: {:?}", body_str, body);
                 // Extract message ID if present
                 if let Some(msg_id) = extract_message_id(&body_str) {
@@ -1168,6 +1181,8 @@ fn decode_message(msg: &mut APRSMessage, payload: &[u8]) {
                 // ACK with addressee prefix like ":CALLSIGN:ackID"
                 msg.msg_type = APRSType::MessageAck;
                 msg.msg_body = Some(body_str.clone());
+                let payload_hex: String = payload.iter().map(|b| format!(" {:02X}", b)).collect();
+                eprintln!("[aprs] INCOMING ACK - full AX.25 payload ({} bytes):{}", payload.len(), payload_hex);
                 eprintln!("[aprs] ACK (with prefix) detected - body_str: {:?}", body_str);
                 // Extract message ID
                 if let Some(colon_idx) = body_str.find(":ack") {
@@ -1212,8 +1227,37 @@ fn extract_message_id(body: &str) -> Option<String> {
     };
     
     let id = body[id_start..].trim();
-    if !id.is_empty() {
-        Some(id.to_string())
+    // Extract only the ACK ID digits - stop at non-digit (like \r, {, or end)
+    let digits: String = id.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
+/// Parse message ID directly from raw AX.25 payload bytes
+/// This bypasses any issues with UTF-8 parsing or truncation
+/// Format: :CALLSIGN:ackID\r{ID  (where first ID is the ACK ID, second is message ID in body)
+pub fn parse_ax25_payload_for_ack(payload: &[u8]) -> Option<String> {
+    // Look for ":ack" or "ack" pattern
+    let payload_str = String::from_utf8_lossy(payload);
+    
+    // Find "ack" or ":ack"
+    let ack_pos = if let Some(pos) = payload_str.find(":ack") {
+        pos + 4  // skip past ":ack"
+    } else if let Some(pos) = payload_str.find("ack") {
+        pos + 3  // skip past "ack"
+    } else {
+        return None;
+    };
+    
+    // Extract digits following "ack"
+    let after_ack = &payload_str[ack_pos..];
+    let digits: String = after_ack.chars().take_while(|c| c.is_ascii_digit()).collect();
+    
+    if !digits.is_empty() {
+        Some(digits)
     } else {
         None
     }
@@ -1572,10 +1616,10 @@ pub fn get_message_id_from_payload(payload: &[u8]) -> Option<String> {
 /// Build an ACK packet for a received message
 /// Returns the ACK text payload for sending back to the sender
 pub fn build_ack_payload(recipient: &str, msg_id: &str) -> String {
-    // ACK format: :CALLSIGN :ackID\r (with addressee prefix, matching Yaesu format)
-    // e.g., ":IU2KIN-7 :ack009\r" - space before ack is standard APRS format
-    let padded_id = format!("{:03}", msg_id.parse::<u32>().unwrap_or(0));
+    // ACK format: :CALLSIGN :ackID\r (with 9-char padded recipient for space before ack)
+    // e.g., ":IU2KIN-7 :ack009\r" - padded to 9 chars adds the space before ack
     let padded_recipient = format!("{:<9}", recipient.trim());
+    let padded_id = format!("{:03}", msg_id.parse::<u32>().unwrap_or(0));
     format!(":{}:ack{}\r", padded_recipient, padded_id)
 }
 

@@ -718,15 +718,16 @@ impl KV4PRadio {
         let ack_payload = aprs::build_ack_payload(original_sender, msg_id);  // original_sender is who we reply TO
         eprintln!("[radio] SENT ACK - payload: {:?} (from: {}, to: {}, msg_id: {})", ack_payload, callsign, original_sender, msg_id);
         
-        // Build AX.25 UI frame using Yaesu-compatible format
-        // The FT-1D expects ACK destination to be "APY01D" not "APRS"
-        // NO digipeaters for direct ACK - matches Yaesu reference ACK format
+        // Build AX.25 UI frame
+        // Match Android app: send ACKs via WIDE1-1, WIDE2-1
         let ax25_frame = build_ax25_ack_frame(
             callsign,
-            &[],  // No digipeaters - direct transmission only
+            "APRS",
+            &[String::from("WIDE1-1"), String::from("WIDE2-1")],
             ack_payload.as_bytes(),
         );
-        eprintln!("[radio] SENT ACK AX.25 frame ({} bytes): {:?}", ax25_frame.len(), ax25_frame);
+        let ax25_hex: String = ax25_frame.iter().map(|b| format!(" {:02X}", b)).collect();
+        eprintln!("[radio] SENT ACK AX.25 frame ({} bytes):{}", ax25_frame.len(), ax25_hex);
         
         // Send via KISS DATA frame
         let kiss_frame = {
@@ -1195,6 +1196,8 @@ fn process_packet(
         // KISS DATA frames (0x00) - raw AX.25 packets from AFSK decoder
         0x00 => {
             if !pkt.payload.is_empty() {
+                let hex: String = pkt.payload.iter().map(|b| format!(" {:02X}", b)).collect();
+                eprintln!("[radio] RX KISS 0x00 frame ({} bytes):{}", pkt.payload.len(), hex);
                 if let Some(msg) = aprs::parse_ax25_frame(&pkt.payload) {
                     if let Some(ref cb) = callbacks.lock().unwrap().aprs {
                         cb(&msg);
