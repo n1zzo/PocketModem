@@ -224,14 +224,27 @@ use crate::aprs::APRSMessage;
 use crate::utils::{escape_markup, calculate_distance_display, bearing_to_compass, calculate_distance_bearing};
 
 /// Create an APRS message row widget
-pub fn aprs_message_row(msg: &APRSMessage, my_lat: f64, my_lon: f64) -> gtk::Box {
+/// `is_sent` determines alignment: sent messages are right-aligned, received are left-aligned
+pub fn aprs_message_row(msg: &APRSMessage, is_sent: bool, my_lat: f64, my_lon: f64) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
     row.set_margin_top(8);
     row.set_margin_bottom(8);
     row.add_css_class("aprs-message-row");
     
+    // Align sent messages to the right, received to the left
+    if is_sent {
+        row.set_halign(gtk::Align::End);
+        row.set_margin_start(40);
+        row.add_css_class("aprs-message-sent");
+    } else {
+        row.set_halign(gtk::Align::Start);
+        row.set_margin_end(40);
+        row.add_css_class("aprs-message-received");
+    }
+    
     // Header: from → to callsigns
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // Always start header content from the beginning
     header.set_halign(gtk::Align::Start);
     
     let from_label = gtk::Label::new(None);

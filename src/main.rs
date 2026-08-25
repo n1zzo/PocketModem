@@ -945,10 +945,23 @@ fn create_ui(
     fn add_aprs_message_to_list(msg: &APRSMessage, list_box: &gtk::Box, empty_label: &gtk::Label, my_lat: f64, my_lon: f64) {
         empty_label.set_visible(false);
         
+        let is_sent = msg.is_sent;
+        
         let msg_row = gtk::Box::new(gtk::Orientation::Vertical, 4);
         msg_row.set_margin_top(8);
         msg_row.set_margin_bottom(8);
         msg_row.add_css_class("aprs-message-row");
+        
+        // Align sent messages to the right, received to the left
+        if is_sent {
+            msg_row.set_halign(gtk::Align::End);
+            msg_row.set_margin_start(40);
+            msg_row.add_css_class("aprs-message-sent");
+        } else {
+            msg_row.set_halign(gtk::Align::Start);
+            msg_row.set_margin_end(40);
+            msg_row.add_css_class("aprs-message-received");
+        }
         
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         header.set_halign(gtk::Align::Start);
@@ -2833,6 +2846,9 @@ fn create_ui(
             return;
         }
         
+        // Get our callsign to distinguish sent vs received messages
+        let our_callsign = unsafe { (*settings).aprs_full_callsign() };
+        
         // Use a Dialog as a proper child window
         let chat_window = gtk::Dialog::builder()
             .title(&format!("Chat: {}", recipient))
@@ -2843,16 +2859,16 @@ fn create_ui(
         
         // Get the content area and add our content
         let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
-        content.set_margin_top(12);
-        content.set_margin_bottom(12);
+        content.set_margin_start(4);
+        content.set_margin_end(4);
+        content.set_margin_top(8);
+        content.set_margin_bottom(8);
         
         // Title bar
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        header.set_margin_bottom(8);
+        header.set_margin_bottom(4);
         
-        let title = gtk::Label::new(Some(&format!("📱 Chat: {}", recipient)));
+        let title = gtk::Label::new(Some(&format!("Chat: {}", recipient)));
         title.set_hexpand(true);
         header.append(&title);
         
@@ -2869,14 +2885,22 @@ fn create_ui(
         
         // Messages scroll area
         let messages_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        messages_box.add_css_class("aprs-list");
+        messages_box.add_css_class("chat-messages-box");
+        messages_box.set_valign(gtk::Align::Start);  // Don't stretch vertically
         
         let messages_scroll = gtk::ScrolledWindow::new();
         messages_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         messages_scroll.set_hexpand(true);
         messages_scroll.set_vexpand(true);
         messages_scroll.set_child(Some(&messages_box));
+        messages_scroll.set_has_frame(true);
+        messages_scroll.add_css_class("chat-scroll-frame");
         content.append(&messages_scroll);
+        
+        // Get adjustment and connect to changes
+        let adj = messages_scroll.vadjustment();
+        adj.set_step_increment(20.0);
+        adj.set_page_increment(100.0);
         
         // Load existing messages for this thread
         let existing_messages: Vec<DirectMessage> = if settings.is_null() {
@@ -2887,16 +2911,12 @@ fn create_ui(
         
         // Display existing messages
         for msg in &existing_messages {
-            add_direct_message_bubble(&messages_box, msg);
+            add_direct_message_bubble(&messages_box, msg, &our_callsign);
         }
-        
-        // Scroll to bottom after adding messages
-        let adj = messages_scroll.vadjustment();
-        adj.set_value(adj.upper().max(adj.page_size()));
         
         // Input area
         let input_container = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        input_container.set_margin_top(8);
+        input_container.set_margin_top(4);
         
         let message_entry = gtk::Entry::new();
         message_entry.set_placeholder_text(Some("Type a message..."));
@@ -2915,10 +2935,10 @@ fn create_ui(
         // For Dialog, use content_area instead of set_child
         let chat_window_for_content = chat_window.clone();
         let chat_content = chat_window_for_content.content_area();
-        chat_content.set_margin_start(12);
-        chat_content.set_margin_end(12);
-        chat_content.set_margin_top(12);
-        chat_content.set_margin_bottom(12);
+        chat_content.set_margin_start(4);
+        chat_content.set_margin_end(4);
+        chat_content.set_margin_top(4);
+        chat_content.set_margin_bottom(4);
         while let Some(child) = chat_content.first_child() {
             chat_content.remove(&child);
         }
@@ -2935,13 +2955,37 @@ fn create_ui(
         });
         
         chat_window.show();
-        eprintln!("[pocket-modem] Chat: window should be visible now");
+        
+        // Scroll to bottom when vadjustment changes (layout has been computed)
+        let vadjust = messages_scroll.vadjustment();
+        let scroll_clone = messages_scroll.clone();
+        let first_scroll_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scroll_done_notify = first_scroll_done.clone();
+        scroll_clone.connect_vadjustment_notify(move |_| {
+            if !scroll_done_notify.load(std::sync::atomic::Ordering::SeqCst) {
+                scroll_done_notify.store(true, std::sync::atomic::Ordering::SeqCst);
+                vadjust.set_value(vadjust.upper() - vadjust.page_size());
+            }
+        });
+        
+        // Fallback: also try after a short delay in case notify doesn't fire
+        let scroll_delayed = messages_scroll.clone();
+        let scroll_done_delayed = first_scroll_done.clone();
+        glib::timeout_add_local_once(Duration::from_millis(100), move || {
+            if !scroll_done_delayed.load(std::sync::atomic::Ordering::SeqCst) {
+                scroll_done_delayed.store(true, std::sync::atomic::Ordering::SeqCst);
+                scroll_delayed.vadjustment().set_value(
+                    scroll_delayed.vadjustment().upper() - scroll_delayed.vadjustment().page_size()
+                );
+            }
+        });
         
         // Periodic refresh of message status
         let settings_refresh = settings;
         let messages_box_refresh = messages_box.clone();
         let recipient_refresh = recipient.to_string();
         let scroll_refresh = messages_scroll.clone();
+        let our_callsign_refresh = our_callsign.clone();
         let mut last_refresh_signal = CHAT_REFRESH_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
         
         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
@@ -2955,7 +2999,7 @@ fn create_ui(
                     messages_box_refresh.remove(&child);
                 }
                 for msg in thread_messages {
-                    add_direct_message_bubble(&messages_box_refresh, msg);
+                    add_direct_message_bubble(&messages_box_refresh, msg, &our_callsign_refresh);
                 }
                 // Scroll to bottom
                 let adj = scroll_refresh.vadjustment();
@@ -3012,7 +3056,7 @@ fn create_ui(
             unsafe { (*settings_btn).add_aprs_message(dm.clone()); }
             eprintln!("[pocket-modem] Message stored: id={}, aprs_id={}, to={}, status={:?}", 
                       dm.id, dm.aprs_id, dm.to_callsign, dm.status);
-            add_direct_message_bubble(&messages_btn, &dm);
+            add_direct_message_bubble(&messages_btn, &dm, &our_callsign);
             entry_btn.set_text("");
             let adj = scroll_btn.vadjustment();
             adj.set_value(adj.upper() - adj.page_size());
@@ -3066,7 +3110,7 @@ fn create_ui(
             unsafe { (*settings_enter).add_aprs_message(dm.clone()); }
             eprintln!("[pocket-modem] Message stored: id={}, aprs_id={}, to={}, status={:?}", 
                       dm.id, dm.aprs_id, dm.to_callsign, dm.status);
-            add_direct_message_bubble(&messages_enter, &dm);
+            add_direct_message_bubble(&messages_enter, &dm, &callsign);
             entry_enter.set_text("");
             let adj = scroll_enter.vadjustment();
             adj.set_value(adj.upper() - adj.page_size());
@@ -3074,81 +3118,133 @@ fn create_ui(
     }
     
     /// Add a message bubble to the chat UI
-    fn add_direct_message_bubble(messages_box: &gtk::Box, msg: &DirectMessage) {
+    fn add_direct_message_bubble(messages_box: &gtk::Box, msg: &DirectMessage, our_callsign: &str) {
         use crate::aprs::{get_message_status_icon, get_message_status_color};
         
-        let bubble = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        bubble.set_margin_top(4);
-        bubble.set_margin_bottom(4);
+        // Determine if this is a sent message by comparing from_callsign to our callsign
+        let is_sent = msg.from_callsign == our_callsign;
         
-        let is_sent = !msg.from_callsign.is_empty() && 
-            msg.from_callsign != msg.to_callsign && 
-            msg.from_callsign != "";
+        // Create a container for the entire message bubble
+        let bubble_container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        bubble_container.set_hexpand(true);
+        bubble_container.set_margin_start(4);
+        bubble_container.set_margin_end(4);
+        bubble_container.set_margin_top(2);
+        bubble_container.set_margin_bottom(2);
         
-        // Create message content
-        let content_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        content_box.set_margin_start(8);
-        content_box.set_margin_end(8);
-        content_box.set_margin_top(4);
-        content_box.set_margin_bottom(4);
+        // Inner bubble box that holds the content
+        let bubble = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        bubble.set_size_request(200, -1);
+        bubble.add_css_class("chat-bubble");
         
-        let body_label = gtk::Label::new(None);
+        // Message label
+        let msg_label = gtk::Label::new(None);
         if is_sent {
-            body_label.set_markup(&format!(
-                "<span color='#CCE5FF'>{}</span>",
+            msg_label.set_markup(&format!(
+                "<span color='#ffffff'>{}</span>",
                 escape_markup(&msg.body)
             ));
+            msg_label.set_halign(gtk::Align::End);
+            bubble.add_css_class("chat-bubble-sent");
         } else {
-            body_label.set_markup(&format!(
+            msg_label.set_markup(&format!(
                 "<span color='#FFFFFF'>{}</span>",
                 escape_markup(&msg.body)
             ));
+            msg_label.set_halign(gtk::Align::Start);
+            bubble.add_css_class("chat-bubble-received");
         }
-        body_label.set_halign(gtk::Align::Start);
-        body_label.set_wrap(true);
-        body_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        body_label.set_size_request(250, -1);
+        msg_label.set_wrap(true);
+        msg_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        msg_label.set_margin_start(10);
+        msg_label.set_margin_end(10);
+        msg_label.set_margin_top(4);
+        msg_label.set_margin_bottom(0);
         
+        // Bottom row: time stamp + status
+        let bottom_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        bottom_row.set_halign(gtk::Align::End);
+        bottom_row.set_margin_start(10);
+        bottom_row.set_margin_end(10);
+        bottom_row.set_margin_bottom(2);
+        
+        // Time stamp
+        let time_label = gtk::Label::new(None);
+        // Format: show date if not today, else just time
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let msg_time = msg.timestamp;
+        
+        // Check if same day
+        let time_str = if msg_time > 0 {
+            let msg_day = msg_time / 86400;
+            let now_day = now / 86400;
+            if msg_day == now_day {
+                // Same day: show HH:MM
+                format!("{:02}:{:02}", (msg_time / 3600) % 24, (msg_time / 60) % 60)
+            } else if msg_day == now_day - 1 {
+                // Yesterday: show "yest HH:MM"
+                format!("yest {:02}:{:02}", (msg_time / 3600) % 24, (msg_time / 60) % 60)
+            } else {
+                // Older: show month/day HH:MM
+                let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+                let month_idx = ((msg_time % 31557600) / 2592000) as usize;
+                let day = ((msg_time % 2592000) / 86400) as usize + 1;
+                let month_str = months.get(month_idx).unwrap_or(&"??");
+                format!("{} {} {:02}:{:02}", month_str, day, (msg_time / 3600) % 24, (msg_time / 60) % 60)
+            }
+        } else {
+            "--:--".to_string()
+        };
+        // Use Pango markup for explicit styling
+        time_label.set_markup(&format!(
+            "<span size='7000' color='#999999'>{}</span>",
+            escape_markup(&time_str)
+        ));
+        time_label.set_halign(gtk::Align::End);
+        
+        // Status label for sent messages only (to the right of timestamp for sent)
         let status_label = gtk::Label::new(None);
-        
-        // Received messages use flag icons; sent messages use status icons + retry count
-        let (status_text, status_color) = if is_sent {
+        if is_sent {
             let icon = get_message_status_icon(msg.status);
             let color = get_message_status_color(msg.status);
             let retry_text = if msg.retries > 0 {
-                format!("{} <sup>{}</sup>", icon, msg.retries)
+                format!(" {} <sup>{}</sup>", icon, msg.retries)
             } else {
-                icon.to_string()
+                format!(" {}", icon)
             };
-            (retry_text, color.to_string())
+            status_label.set_markup(&format!(
+                "<span color='{}'>{}</span>",
+                color, retry_text
+            ));
+            bottom_row.append(&time_label);
+            bottom_row.append(&status_label);
         } else {
-            // Received messages: single flag if received, double flag if we sent ACK
-            if msg.ack_sent {
-                ("🚩🚩".to_string(), "#33D17A".to_string())   // Green double flag - ACK sent
-            } else {
-                ("🚩".to_string(), "#888888".to_string())      // Gray single flag - received
-            }
-        };
-        status_label.set_markup(&format!(
-            "<span color='{}'>{}</span>",
-            status_color, status_text
-        ));
-        
-        content_box.append(&body_label);
-        
-        bubble.append(&content_box);
-        bubble.append(&status_label);
-        
-        // Align based on sent/received
-        if is_sent {
-            bubble.set_halign(gtk::Align::End);
-        } else {
-            bubble.set_halign(gtk::Align::Start);
+            bottom_row.append(&status_label);  // Hidden for received
+            bottom_row.append(&time_label);
         }
         
-        bubble.add_css_class("aprs-message-row");
+        bubble.append(&msg_label);
+        bubble.append(&bottom_row);
         
-        messages_box.append(&bubble);
+        // Put bubble in container with alignment
+        if is_sent {
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+            bubble_container.append(&spacer);
+            bubble_container.append(&bubble);
+            bubble_container.set_halign(gtk::Align::End);
+        } else {
+            bubble_container.append(&bubble);
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+            bubble_container.append(&spacer);
+            bubble_container.set_halign(gtk::Align::Start);
+        }
+        
+        messages_box.append(&bubble_container);
         messages_box.show();
     }
     
@@ -3406,6 +3502,8 @@ fn create_ui(
         .aprs-list { background: #2a2a2a; border-radius: 8px; border: 1px solid #444; }
         .aprs-message-row { background: transparent; border-bottom: 1px solid #333; padding: 8px; }
         .aprs-message-row:hover { background: #333; }
+        .chat-row-sent { background: transparent; }
+        .chat-row-received { background: transparent; }
         .aprs-callsign { font-size: 14px; font-weight: bold; }
         .aprs-to-callsign { font-size: 14px; color: #888; }
         .aprs-timestamp { font-size: 12px; color: #666; }
@@ -3433,6 +3531,12 @@ fn create_ui(
         .beacon-label { font-size: 14px; font-weight: bold; color: #888; }
         .beacon-button:active .beacon-label { color: #FFB000; }
         .beacon-status { font-size: 12px; color: #666; min-height: 20px; }
+        .chat-bubble { border-radius: 16px; max-width: 260px; padding: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.8); }
+        .chat-bubble-sent { background: #4a4228; border: 1px solid #FFB000; border-bottom-right-radius: 4px; }
+        .chat-bubble-received { background: #454545; border: 1px solid #888; border-bottom-left-radius: 4px; }
+        .chat-timestamp { font-size: 9px !important; color: #555555 !important; font-weight: lighter; }
+        .chat-messages-box { background: transparent; }
+        .chat-scroll-frame { background: #1a1a1a; border-radius: 8px; box-shadow: inset 0 0 20px rgba(0,0,0,0.5); }
     "#);
     
     gtk::style_context_add_provider_for_display(

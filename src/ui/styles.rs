@@ -184,6 +184,16 @@ pub const APP_CSS: &str = r#"
     .aprs-message-row:hover {
         background: #333;
     }
+    .aprs-message-sent {
+        background: rgba(255, 176, 0, 0.08);
+        border-radius: 12px;
+        border: 1px solid rgba(255, 176, 0, 0.2);
+    }
+    .aprs-message-received {
+        background: rgba(51, 209, 122, 0.05);
+        border-radius: 12px;
+        border: 1px solid rgba(51, 209, 122, 0.15);
+    }
     .aprs-callsign {
         font-size: 14px;
         font-weight: bold;
@@ -236,5 +246,28 @@ pub const APP_CSS: &str = r#"
         color: #888;
         font-family: monospace;
         min-width: 1px;
+    }
+    
+    /* Chat bubbles */
+    .chat-bubble {
+        border-radius: 16px;
+        max-width: 260px;
+        padding: 8px;
+    }
+    .chat-bubble-sent {
+        background: #3d3520;
+        border: 1px solid #FFB000;
+        border-bottom-right-radius: 4px;
+        color: #ffffff;
+    }
+    .chat-bubble-received {
+        background: #3a3a3a;
+        border: 1px solid #777;
+        border-bottom-left-radius: 4px;
+    }
+    .chat-timestamp {
+        font-size: 9px !important;
+        color: #888888 !important;
+        font-weight: lighter;
     }
 "#;
