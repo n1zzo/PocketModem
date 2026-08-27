@@ -4,11 +4,11 @@
 
 # PocketModem
 
-A GTK4/libadwaita application for controlling the KV4P HT radio modem over USB serial.
+A GTK4/libadwaita application for controlling the KV4P HT radio modem over USB serial, with APRS tracking and map support.
 
 **License:** [GPL-3.0](LICENSE)
 
-See [docs/BUILD.md](docs/BUILD.md) for build instructions.
+See [`flatpak/README.md`](flatpak/README.md) for Flatpak build instructions or `docs/BUILD.md` for native builds.
 
 ## Features
 
@@ -83,10 +83,10 @@ See `AGENTS.md` for detailed debug notes.
 - [x] Add APRS message log and map views using carousel
 - [x] Code refactor: move utils function in dedicated file, remove UI sizing constraints, move UI code to dedicated file, deal with unsafes.
 - [x] APRS Tx
-- [ ] APRS direct messages
+- [x] APRS direct messages
 - [ ] Fix light theme
 - [ ] Use libadwaita feature to show unrecoverable errors
-- [ ] Add flatpack build target
+- [x] Add flatpak build target
 - [ ] Offline maps
 
 ### Development

@@ -1,0 +1,134 @@
+# Flatpak manifest for PocketModem
+# GTK4/libadwaita application for KV4P HT radio modem
+
+app-id: org.pocketmodem.pocket-modem
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+command: pocket-modem
+
+arch: aarch64
+
+finish-args:
+  # Skip appstream validation
+  --metadata=GLib.Version:byteoffset 2>/dev/null || true
+
+finish-args:
+  # Serial device access - KV4P modem (Silicon Labs CP2102)
+  - --device=/dev/serial/by-id/*Silicon_Labs*
+  # Allow network access for APRS, map tiles
+  - --network
+  # Audio playback and recording
+  - --socket=pulseaudio
+  # Desktop notifications
+  - --socket=notifications
+  - --talk-name=org.freedesktop.Notifications
+  # GSettings persistence
+  - --config=xdg-config
+  # Map tile cache
+  - --filesystem=xdg-cache
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/pocket-modem/cargo
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+    PKG_CONFIG_PATH: /app/lib/pkgconfig:/usr/lib/pkgconfig
+
+modules:
+  # ===========================================================================
+  # protobuf - Required by protobuf-c and libshumate
+  # ===========================================================================
+  - name: protobuf
+    buildsystem: simple
+    build-commands:
+      - cd protobuf && cmake -B build -DCMAKE_INSTALL_PREFIX=/app -Dprotobuf_BUILD_TESTS=OFF -Dprotobuf_BUILD_SHARED_LIBS=ON
+      - cd protobuf && cmake --build build -j$(nproc)
+      - cd protobuf && cmake --install build
+      - mkdir -p /app/lib/pkgconfig
+      - echo prefix=/app > /app/lib/pkgconfig/protobuf.pc
+      - echo exec_prefix=/app >> /app/lib/pkgconfig/protobuf.pc
+      - echo libdir=/app/lib64 >> /app/lib/pkgconfig/protobuf.pc
+      - echo includedir=/app/include >> /app/lib/pkgconfig/protobuf.pc
+      - echo Name: protobuf >> /app/lib/pkgconfig/protobuf.pc
+      - echo Description: Protocol Buffers >> /app/lib/pkgconfig/protobuf.pc
+      - echo Version: 21.12 >> /app/lib/pkgconfig/protobuf.pc
+      - echo Libs: -L/app/lib64 -lprotobuf >> /app/lib/pkgconfig/protobuf.pc
+      - echo Cflags: -I/app/include >> /app/lib/pkgconfig/protobuf.pc
+    sources:
+      - type: archive
+        url: https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protobuf-cpp-3.21.12.tar.gz
+        sha256: 4eab9b524aa5913c6fffb20b2a8abf5ef7f95a80bc0701f3a6dbb4c607f73460
+        dest: protobuf
+
+  # ===========================================================================
+  # protobuf-c - Required by libshumate
+  # ===========================================================================
+  - name: protobuf-c
+    buildsystem: simple
+    build-commands:
+      - ./autogen.sh
+      - ./configure --prefix=/app CFLAGS=-I/app/include LDFLAGS=-L/app/lib64
+      - make -j$(nproc)
+      - make install
+    build-options:
+      env:
+        PKG_CONFIG_PATH: /app/lib/pkgconfig:/app/lib64/pkgconfig:/usr/lib/pkgconfig
+        LD_LIBRARY_PATH: /app/lib64:$LD_LIBRARY_PATH
+    sources:
+      - type: git
+        url: https://github.com/protobuf-c/protobuf-c.git
+        tag: v1.5.1
+
+  # ===========================================================================
+  # libshumate - Map widget for GTK4
+  # ===========================================================================
+  - name: libshumate
+    buildsystem: simple
+    build-commands:
+      - mkdir -p _build && PATH=/app/bin:$PATH /usr/bin/meson setup _build --prefix=/app -Dgir=false -Dvapi=false -Dgtk_doc=false -Ddemos=false
+      - PATH=/app/bin:$PATH /usr/bin/ninja -C _build
+      - PATH=/app/bin:$PATH /usr/bin/ninja -C _build install
+    build-options:
+      env:
+        PKG_CONFIG_PATH: /app/lib/pkgconfig:/app/lib64/pkgconfig
+        LD_LIBRARY_PATH: /app/lib64:$LD_LIBRARY_PATH
+    sources:
+      - type: git
+        url: https://github.com/gnome/libshumate.git
+        tag: 1.6.1
+
+  # ===========================================================================
+  # pocket-modem - Main application
+  # ===========================================================================
+  - name: pocket-modem
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /run/build/pocket-modem/.cargo
+      - cp src/.cargo/config.toml /run/build/pocket-modem/.cargo/config.toml
+      - cp -r src/vendor /run/build/pocket-modem/ 2>/dev/null || echo 'no vendor to copy'
+      - cargo build --release --manifest-path src/Cargo.toml 2>&1 | tail -20
+      # Install binary
+      - install -Dm755 src/target/release/pocket-modem /app/bin/pocket-modem
+      # Install desktop entry
+      - install -Dm644 org.pocketmodem.pocket-modem.desktop /app/share/applications/org.pocketmodem.pocket-modem.desktop
+      # Install AppStream metadata
+      - install -Dm644 flatpak/org.pocketmodem.pocket-modem.appdata.xml /app/share/metainfo/org.pocketmodem.pocket-modem.appdata.xml
+      # Install GSettings schema
+      - install -Dm644 data/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml /app/share/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml
+      - glib-compile-schemas /app/share/glib-2.0/schemas/
+      # Install icons
+      - install -Dm644 flatpak/icons/256x256/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/256x256/apps/org.pocketmodem.pocket-modem.png
+      - install -Dm644 flatpak/icons/128x128/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/128x128/apps/org.pocketmodem.pocket-modem.png
+      - install -Dm644 flatpak/icons/64x64/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/64x64/apps/org.pocketmodem.pocket-modem.png
+      - install -Dm644 flatpak/icons/48x48/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/48x48/apps/org.pocketmodem.pocket-modem.png
+      - install -Dm644 flatpak/icons/32x32/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/32x32/apps/org.pocketmodem.pocket-modem.png
+      - install -Dm644 flatpak/icons/16x16/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/16x16/apps/org.pocketmodem.pocket-modem.png
+      - install -Dm644 flatpak/icons/scalable/org.pocketmodem.pocket-modem.svg /app/share/icons/hicolor/scalable/apps/org.pocketmodem.pocket-modem.svg 2>/dev/null || true
+      - install -Dm644 flatpak/icons/512x512/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/512x512/apps/org.pocketmodem.pocket-modem.png 2>/dev/null || true
+      - touch /app/share/icons/hicolor/index.theme && echo '[Icon Theme]' > /app/share/icons/hicolor/index.theme && echo 'Name=hicolor' >> /app/share/icons/hicolor/index.theme && echo 'Comment=Default fallback theme' >> /app/share/icons/hicolor/index.theme
+    sources:
+      - type: dir
+        path: .

@@ -12,7 +12,7 @@ use gio::prelude::SettingsExt;
 use crate::aprs::{DirectMessage, DirectMessageStatus, MessageThread};
 
 /// Current schema version - increment when adding new settings
-const CURRENT_SCHEMA_VERSION: u32 = 3;
+const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Default values for settings
 pub mod defaults {
@@ -206,6 +206,8 @@ pub struct Channel {
     pub mode: String,
     /// Power level
     pub power: PowerLevel,
+    /// Squelch level (0-8, 0 = open, 8 = max)
+    pub squelch: u8,
     /// Optional comment/notes
     pub comment: String,
 }
@@ -224,6 +226,7 @@ impl Default for Channel {
             ctone_hz: 88.5,
             mode: "FM".to_string(),
             power: PowerLevel::High,
+            squelch: defaults::SQUELCH,
             comment: String::new(),
         }
     }
@@ -785,9 +788,12 @@ impl SettingsManager {
     // CHIRP CSV Import/Export
     // ========================================================================
 
-    /// Standard CHIRP CSV columns we support
+    /// Standard CHIRP CSV columns we support (plus PocketModem extensions)
     const CHIRP_COLUMNS: &'static str = 
         "Location,Name,Frequency,Duplex,Offset,Tone,rToneFreq,cToneFreq,Mode,Power,Comment";
+    
+    /// PocketModem extended columns (appended after standard columns)
+    const PM_EXT_COLUMNS: &'static str = "Squelch";
 
     /// Export all channels to CHIRP CSV format
     pub fn export_csv(&self, path: &Path) -> std::io::Result<()> {
@@ -828,7 +834,7 @@ impl SettingsManager {
             };
 
             csv.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 ch.location,
                 escape_csv(&ch.name),
                 freq,
@@ -840,6 +846,7 @@ impl SettingsManager {
                 ch.mode,
                 power_str,
                 escape_csv(&ch.comment),
+                ch.squelch,
             ));
         }
 
@@ -1009,6 +1016,13 @@ fn parse_csv_line(line: &str) -> Result<Channel, String> {
     } else {
         String::new()
     };
+    
+    // Squelch (column 11, PocketModem extension)
+    let squelch = if parts.len() > 11 && !parts[11].trim().is_empty() {
+        parts[11].trim().parse::<u8>().unwrap_or(defaults::SQUELCH).min(8)
+    } else {
+        defaults::SQUELCH
+    };
 
     Ok(Channel {
         location,
@@ -1022,6 +1036,7 @@ fn parse_csv_line(line: &str) -> Result<Channel, String> {
         ctone_hz: ctone,
         mode,
         power,
+        squelch,
         comment,
     })
 }

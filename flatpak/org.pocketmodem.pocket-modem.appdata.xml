@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.pocketmodem.pocket-modem</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  
+  <name>PocketModem</name>
+  <summary>GTK4 interface for KV4P HT radio modem</summary>
+  
+  <description>
+    <p>
+      PocketModem is a GTK4/libadwaita application for controlling the KV4P HT
+      radio modem over USB serial. Transform your mobile Linux device into a
+      powerful RF transceiver.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>VFO Control — Tune to any frequency with decimal input</li>
+      <li>Signal Meter — Real-time RSSI S-meter display (S0-S9+)</li>
+      <li>ADPCM Audio — Voice TX/RX with automatic codec</li>
+      <li>GPS Display — Location with fix indicator and Maidenhead grid</li>
+      <li>APRS Support — Receive and transmit APRS beacons and messages</li>
+      <li>Interactive Map — See APRS stations on OpenStreetMap</li>
+    </ul>
+  </description>
+  
+  <launchable type="desktop-id">org.pocketmodem.pocket-modem.desktop</launchable>
+  
+  <url type="homepage">https://github.com/nizzo/pocket-modem</url>
+  <url type="bugtracker">https://github.com/nizzo/pocket-modem/issues</url>
+  
+  <developer_name>PocketModem Team</developer_name>
+  
+  <content_rating type="oa6rva" />
+  
+  <releases>
+    <release version="0.1.0" date="2025-08-22">
+      <description>
+        <p>Initial Flatpak release with core functionality:</p>
+        <ul>
+          <li>VFO control and frequency tuning</li>
+          <li>RSSI signal meter</li>
+          <li>Audio TX/RX with ADPCM codec</li>
+          <li>GPS location display</li>
+          <li>APRS beaconing and message reception</li>
+          <li>Interactive map with APRS station overlay</li>
+        </ul>
+      </description>
+    </release>
+  </releases>
+  
+  <categories>
+    <category>Utility</category>
+    <category>Network</category>
+    <category>HamRadio</category>
+  </categories>
+  
+  <keywords>
+    <keyword>radio</keyword>
+    <keyword>ham</keyword>
+    <keyword>kv4p</keyword>
+    <keyword>modem</keyword>
+    <keyword>fm</keyword>
+    <keyword>aprs</keyword>
+    <keyword>transceiver</keyword>
+    <keyword>rf</keyword>
+  </keywords>
+  
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>voice</control>
+  </supports>
+  
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+</component>

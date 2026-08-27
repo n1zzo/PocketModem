@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=PocketModem
+GenericName=RF Transceiver
+Comment=Turn your mobile Linux device into a powerful RF transceiver
+Exec=pocket-modem
+Icon=pocket-modem
+Terminal=false
+Type=Application
+Categories=Utility;Network;HamRadio
+Keywords=radio;ham;kv4p;modem;fm;aprs;m17;transceiver;rf
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

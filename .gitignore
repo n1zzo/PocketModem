@@ -6,3 +6,5 @@
 block
 trough
 AGENTS.md
+src/vendor/
+src/target/

@@ -662,6 +662,7 @@ fn create_ui(
                 ctone_hz: 88.5,
                 mode: "FM".to_string(),
                 power: PowerLevel::High,
+                squelch: settings::defaults::SQUELCH,
                 comment: String::new(),
             };
             
@@ -3474,6 +3475,7 @@ fn create_ui(
                     ctone_hz,
                     power,
                     mode: channel_clone.mode.clone(),
+                    squelch: channel_clone.squelch,
                     comment: channel_clone.comment.clone(),
                 };
                 

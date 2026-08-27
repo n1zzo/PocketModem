@@ -1,0 +1,59 @@
+# Flatpak manifest for PocketModem
+# GTK4/libadwaita application for KV4P HT radio modem
+
+app-id: org.pocketmodem.pocket-modem
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+command: pocket-modem
+
+finish-args:
+  # Serial device access - KV4P modem (Silicon Labs CP2102)
+  - --device=/dev/serial/by-id/*Silicon_Labs*
+
+  # Allow network access for cargo builds and runtime (APRS, map tiles)
+  - --network
+
+  # Audio playback and recording
+  - --socket=pulseaudio
+
+  # Desktop notifications
+  - --socket=notifications
+  - --talk-name=org.freedesktop.Notifications
+
+
+  # GSettings persistence
+  - --config=xdg-config
+
+  # Map tile cache
+  - --filesystem=xdg-cache
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/pocket-modem/cargo
+    PKG_CONFIG_PATH: /app/lib/pkgconfig:/usr/lib/pkgconfig
+
+modules:
+  - name: pocket-modem
+    buildsystem: simple
+    build-commands:
+      - cargo fetch --manifest-path src/Cargo.toml
+      - cargo build --release --manifest-path src/Cargo.toml
+      # Install binary
+      - install -Dm755 src/target/release/pocket-modem /app/bin/pocket-modem
+      # Install desktop entry
+      - install -Dm644 org.pocketmodem.pocket-modem.desktop /app/share/applications/org.pocketmodem.pocket-modem.desktop
+      # Install AppStream metadata
+      - install -Dm644 flatpak/org.pocketmodem.pocket-modem.appdata.xml /app/share/metainfo/org.pocketmodem.pocket-modem.appdata.xml
+      # Install GSettings schema
+      - install -Dm644 data/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml /app/share/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml
+      - glib-compile-schemas /app/share/glib-2.0/schemas/
+      # Install icons
+      - install -Dm644 flatpak/icons/256x256/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/256x256/apps/org.pocketmodem.pocket-modem.png
+    sources:
+      - type: dir
+        path: .
