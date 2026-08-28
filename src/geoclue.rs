@@ -4,7 +4,8 @@
 //! from various sources (GPS, WiFi, Cell towers). Used as fallback when
 //! mmcli/ModemManager is not available.
 
-use std::process::Command;
+use zbus::{Connection, proxy};
+use zbus::zvariant::OwnedObjectPath;
 
 /// Location data from GeoClue2
 #[derive(Debug, Clone)]
@@ -15,50 +16,72 @@ pub struct GeoClueLocation {
     pub accuracy: f64,
 }
 
-/// Parse object path from gdbus output
-fn parse_object_path(output: &str) -> Option<String> {
-    let trimmed = output.trim();
-    if !trimmed.starts_with("(") {
-        return None;
-    }
-    
-    // Find the closing parenthesis or comma
-    let rest = &trimmed[1..];
-    if let Some(end_pos) = rest.find(|c| c == ',' || c == ')') {
-        let path_part = &rest[..end_pos];
-        let path = path_part.trim()
-            .strip_prefix("objectpath ")
-            .unwrap_or(path_part.trim())
-            .trim_matches('\'');
-        if !path.is_empty() {
-            return Some(path.to_string());
-        }
-    }
-    None
+#[proxy(
+    interface = "org.freedesktop.GeoClue2.Manager",
+    default_service = "org.freedesktop.GeoClue2",
+    default_path = "/org/freedesktop/GeoClue2/Manager"
+)]
+trait Manager {
+    async fn get_client(&self) -> zbus::Result<OwnedObjectPath>;
 }
 
-/// Initialize GeoClue2 client
-/// Returns true if GeoClue2 is available
-pub fn init_geoclue() -> bool {
-    let output = Command::new("gdbus")
-        .args(["call", "--system", "--dest", "org.freedesktop.GeoClue2",
-               "--object-path", "/org/freedesktop/GeoClue2/Manager",
-               "--method", "org.freedesktop.GeoClue2.Manager.GetClient"])
-        .output();
+#[proxy(
+    interface = "org.freedesktop.GeoClue2.Client",
+    default_service = "org.freedesktop.GeoClue2"
+)]
+trait Client {
+    async fn start(&self) -> zbus::Result<()>;
+    async fn location(&self) -> zbus::Result<OwnedObjectPath>;
+    async fn desktop_id(&self) -> zbus::Result<String>;
+    async fn set_desktop_id(&self, id: &str) -> zbus::Result<()>;
+    async fn requested_accuracy_level(&self) -> zbus::Result<u32>;
+    async fn set_requested_accuracy_level(&self, level: u32) -> zbus::Result<()>;
+}
 
-    match output {
-        Ok(o) => {
-            if o.status.success() {
-                eprintln!("[geoclue] GeoClue2 client created successfully");
-                true
-            } else {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                eprintln!("[geoclue] GeoClue2 error: {}", stderr);
-                false
-            }
+#[proxy(
+    interface = "org.freedesktop.GeoClue2.Location",
+    default_service = "org.freedesktop.GeoClue2"
+)]
+trait Location {
+    async fn latitude(&self) -> zbus::Result<f64>;
+    async fn longitude(&self) -> zbus::Result<f64>;
+    async fn altitude(&self) -> zbus::Result<f64>;
+    async fn accuracy(&self) -> zbus::Result<f64>;
+}
+
+/// Initialize GeoClue2 - returns true if connection works
+pub fn init_geoclue() -> bool {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("[geoclue] Failed to create runtime: {}", e);
+            return false;
+        }
+    };
+    
+    let result = rt.block_on(async_init_geoclue());
+    if result {
+        eprintln!("[geoclue] GeoClue2 initialized successfully");
+    }
+    result
+}
+
+async fn async_init_geoclue() -> bool {
+    let connection = match Connection::system().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("[geoclue] Failed to connect to system D-Bus: {}", e);
+            return false;
+        }
+    };
+
+    match ManagerProxy::new(&connection).await {
+        Ok(_manager) => {
+            eprintln!("[geoclue] Manager proxy created");
+            true
         }
         Err(e) => {
-            eprintln!("[geoclue] gdbus not found: {}", e);
+            eprintln!("[geoclue] Failed to create Manager proxy: {}", e);
             false
         }
     }
@@ -67,108 +90,57 @@ pub fn init_geoclue() -> bool {
 /// Get current location from GeoClue2
 /// Returns None if location is not available
 pub fn get_location() -> Option<GeoClueLocation> {
-    // Get a client
-    let client_output = match Command::new("gdbus")
-        .args(["call", "--system", "--dest", "org.freedesktop.GeoClue2",
-               "--object-path", "/org/freedesktop/GeoClue2/Manager",
-               "--method", "org.freedesktop.GeoClue2.Manager.GetClient"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return None,
-    };
-
-    if !client_output.status.success() {
-        return None;
-    }
-
-    // Parse client path
-    let stdout = String::from_utf8_lossy(&client_output.stdout);
-    let client_path = parse_object_path(&stdout)?;
-
-    // Start the client
-    let _ = Command::new("gdbus")
-        .args(["call", "--system", "--dest", "org.freedesktop.GeoClue2",
-               "--object-path", &client_path,
-               "--method", "org.freedesktop.GeoClue2.Client.Start"])
-        .output();
-
-    // Get location path from client
-    let loc_output = match Command::new("gdbus")
-        .args(["call", "--system", "--dest", "org.freedesktop.GeoClue2",
-               "--object-path", &client_path,
-               "--method", "org.freedesktop.GeoClue2.Client.GetLocation"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return None,
-    };
-
-    if !loc_output.status.success() {
-        return None;
-    }
-
-    // Parse location path
-    let loc_stdout = String::from_utf8_lossy(&loc_output.stdout);
-    let loc_path = parse_object_path(&loc_stdout)?;
-
-    // Get location properties
-    let props_output = match Command::new("gdbus")
-        .args(["call", "--system", "--dest", "org.freedesktop.GeoClue2",
-               "--object-path", &loc_path,
-               "--method", "org.freedesktop.DBus.Properties.GetAll",
-               "--arg-type", "s", "--arg-value", "org.freedesktop.GeoClue2.Location"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return None,
-    };
-
-    if !props_output.status.success() {
-        return None;
-    }
-
-    // Parse properties from output
-    let props = String::from_utf8_lossy(&props_output.stdout);
-    parse_location_from_props(&props)
+    let rt = tokio::runtime::Runtime::new().ok()?;
+    rt.block_on(async_get_location())
 }
 
-/// Parse location from gdbus GetAll output
-fn parse_location_from_props(output: &str) -> Option<GeoClueLocation> {
-    let mut latitude: f64 = 0.0;
-    let mut longitude: f64 = 0.0;
-    let mut altitude: Option<f64> = None;
-    let mut accuracy: f64 = 999.0;
-
-    for line in output.lines() {
-        let line = line.trim();
-        if line.starts_with("'Latitude'") || line.starts_with("\"Latitude\"") {
-            if let Some(val) = extract_variant_value(line) {
-                if let Ok(v) = val.parse::<f64>() {
-                    latitude = v;
-                }
-            }
-        } else if line.starts_with("'Longitude'") || line.starts_with("\"Longitude\"") {
-            if let Some(val) = extract_variant_value(line) {
-                if let Ok(v) = val.parse::<f64>() {
-                    longitude = v;
-                }
-            }
-        } else if line.starts_with("'Altitude'") || line.starts_with("\"Altitude\"") {
-            if let Some(val) = extract_variant_value(line) {
-                if let Ok(v) = val.parse::<f64>() {
-                    altitude = Some(v);
-                }
-            }
-        } else if line.starts_with("'Accuracy'") || line.starts_with("\"Accuracy\"") {
-            if let Some(val) = extract_variant_value(line) {
-                if let Ok(v) = val.parse::<f64>() {
-                    accuracy = v;
-                }
-            }
-        }
+async fn async_get_location() -> Option<GeoClueLocation> {
+    let connection = Connection::system().await.ok()?;
+    let manager = ManagerProxy::new(&connection).await.ok()?;
+    
+    // Get or create client
+    let client_path = manager.get_client().await.ok()?;
+    
+    // Create client proxy - use .path() then .build()
+    let client = ClientProxy::builder(&connection)
+        .path(client_path.as_str())
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+    
+    // Set desktop ID (required for authorization)
+    let _ = client.set_desktop_id("pocket-modem").await;
+    
+    // Set accuracy level (6 = Exact for GPS)
+    let _ = client.set_requested_accuracy_level(6).await;
+    
+    // Start location tracking
+    if let Err(e) = client.start().await {
+        eprintln!("[geoclue] start failed: {}", e);
+        return None;
     }
-
+    
+    // Wait briefly for location to be available
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    
+    // Get location path
+    let location_path = client.location().await.ok()?;
+    
+    // Create location proxy
+    let location = LocationProxy::builder(&connection)
+        .path(location_path.as_str())
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+    
+    // Read location data
+    let latitude = location.latitude().await.unwrap_or(0.0);
+    let longitude = location.longitude().await.unwrap_or(0.0);
+    let altitude = location.altitude().await.ok();
+    let accuracy = location.accuracy().await.unwrap_or(999.0);
+    
     if latitude != 0.0 || longitude != 0.0 {
         Some(GeoClueLocation {
             latitude,
@@ -179,18 +151,4 @@ fn parse_location_from_props(output: &str) -> Option<GeoClueLocation> {
     } else {
         None
     }
-}
-
-/// Extract value from gdbus variant output
-fn extract_variant_value(line: &str) -> Option<&str> {
-    // Format: 'Latitude' = <double 37.123456>, or "Latitude" = <double 37.123456>
-    if let Some(pos) = line.find("double ") {
-        let val = &line[pos + 7..];
-        return Some(val.trim_end_matches('>').trim_end_matches(','));
-    }
-    if let Some(pos) = line.find("int64 ") {
-        let val = &line[pos + 6..];
-        return Some(val.trim_end_matches('>').trim_end_matches(','));
-    }
-    None
 }

@@ -30,6 +30,10 @@ image = "0.25"
 # Desktop notifications
 libnotify = "1.0"
 
+# D-Bus for GeoClue2 location
+zbus = { version = "5", features = ["tokio"] }
+zvariant = { version = "4", default-features = false, features = ["default"] }
+
 # HTTP client for tile downloading (rustls for TLS, no OpenSSL needed)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
