@@ -350,6 +350,8 @@ pub struct MapManager {
     user_marker: Option<Marker>,
     /// Vector renderer (to keep alive)
     vector_renderer: Option<VectorRenderer>,
+    /// Tile downloader (to keep alive and connected)
+    tile_downloader: Option<TileDownloader>,
     /// Track if viewport changes should update user marker position
     viewport_listener_id: Option<glib::SignalHandlerId>,
     /// Whether the map has been centered on user position yet
@@ -398,6 +400,7 @@ impl MapManager {
             user_lon: None,
             user_marker: None,
             vector_renderer: None,
+            tile_downloader: None,
             viewport_listener_id: None,
             has_centered_on_user: false,
             dark_mode: true,
@@ -407,6 +410,8 @@ impl MapManager {
 
     /// Initialize the map with vector renderer
     pub fn initialize(&mut self, dark_mode: bool) {
+        use std::io::Write;
+        eprintln!("[map] INITIALIZE called, dark_mode={}", dark_mode);
         self.dark_mode = dark_mode;
         // Check if already initialized
         if self.map_layer.is_some() {
@@ -423,9 +428,21 @@ impl MapManager {
                 eprintln!("[map] VectorRenderer created successfully");
                 eprintln!("[map] Style: {}", if dark_mode { "dark" } else { "light" });
                 
-                // Create tile downloader
-                let _downloader = TileDownloader::new(GNOME_TILE_URL);
+                // Create tile downloader and keep it alive
+                let downloader = TileDownloader::new(GNOME_TILE_URL);
                 eprintln!("[map] TileDownloader created");
+                
+                // Store downloader in struct first (needed for borrow)
+                self.tile_downloader = Some(downloader);
+                
+                // Wire the downloader to the renderer - source name matches style JSON
+                // This tells VectorRenderer where to get tile data for the "vector-tiles" source
+                if let Some(ref dl) = self.tile_downloader {
+                    renderer.set_data_source("vector-tiles", dl);
+                    eprintln!("[map] TileDownloader connected to source 'vector-tiles'");
+                } else {
+                    eprintln!("[map] WARNING: tile_downloader is None after setting!");
+                }
                 
                 // Create map layer to display the tiles
                 let map_layer = MapLayer::new(&renderer, &self.viewport);
@@ -475,6 +492,12 @@ impl MapManager {
         // Recreate vector renderer with new style
         match VectorRenderer::new("vector-tiles", &style_json) {
             Ok(renderer) => {
+                // Reconnect tile downloader to new renderer
+                if let Some(ref downloader) = self.tile_downloader {
+                    renderer.set_data_source("vector-tiles", downloader);
+                    eprintln!("[map] TileDownloader reconnected to updated VectorRenderer");
+                }
+                
                 // Create new map layer
                 let map_layer = MapLayer::new(&renderer, &self.viewport);
                 self.map.add_layer(&map_layer);

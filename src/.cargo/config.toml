@@ -1,5 +1,8 @@
 [source.crates-io]
-replace-with = "vendored-sources"
+replace-with = "vendor"
 
-[source.vendored-sources]
+[source.vendor]
 directory = "vendor"
+
+[net]
+git-fetch-with-cli = true

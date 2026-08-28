@@ -65,4 +65,4 @@ ringbuf = "0.3"
 
 [[bin]]
 name = "pocket-modem"
-path = "main.rs"
+path = "src/main.rs"
