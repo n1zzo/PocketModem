@@ -91,3 +91,19 @@ This ensures compatibility across different Linux distributions without relying 
 - Settings: GSettings via `xdg-config`
 - Network: Required for map tiles and APRS
 - Vendored Rust dependencies for offline builds
+
+## GPS
+
+GPS via cellular modem requires `mmcli` from ModemManager to be available on the host system. If `mmcli` is not found, GPS will be disabled with a warning.
+
+To enable GPS on the host:
+```bash
+# Alpine/PostmarketOS
+sudo apk add modemmanager
+
+# Debian/Ubuntu
+sudo apt install modemmanager
+
+# Fedora
+sudo dnf install ModemManager
+```

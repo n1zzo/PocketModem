@@ -26,6 +26,11 @@ finish-args:
   - --config=xdg-config
   # Map tile cache
   - --filesystem=xdg-cache
+  # Geoclue2 for location (GPS via ModemManager, WiFi, etc.)
+  - --talk-name=org.freedesktop.GeoClue2
+  # System D-Bus for GeoClue2
+  - --bus=system
+  - --filesystem=/run/dbus:ro
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin

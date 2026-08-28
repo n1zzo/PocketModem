@@ -8,6 +8,7 @@
 mod aprs;
 mod aprs_icons;
 mod audio;
+mod geoclue;
 mod gps;
 mod kiss;
 mod map;

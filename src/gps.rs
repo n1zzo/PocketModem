@@ -1,16 +1,18 @@
-//! GPS module using ModemManager to get NMEA location data
+//! GPS module using ModemManager (via mmcli) or GeoClue2
+//!
+//! Primary: ModemManager via mmcli (full NMEA data)
+//! Fallback: GeoClue2 D-Bus (basic lat/lon only)
 //!
 //! GPS requires:
-//! 1. Cellular modem with GPS capability (separate from KV4P radio)
-//! 2. GPS to be enabled via ModemManager
-//! 3. Satellite visibility for fix
+//! 1. Cellular modem with GPS capability OR GeoClue2 service
+//! 2. For ModemManager: GPS to be enabled via ModemManager
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-/// GPS data parsed from NMEA sentences
+/// GPS data parsed from NMEA sentences or GeoClue2
 #[derive(Debug, Clone, Default)]
 pub struct GpsData {
     pub latitude: Option<f64>,
@@ -19,19 +21,21 @@ pub struct GpsData {
     pub speed: Option<f64>,
     pub course: Option<f64>,
     pub satellites: u8,
-    /// True if we have valid NMEA data from the modem
+    /// True if we have valid GPS data
     pub gps_enabled: bool,
     /// True if we have a position fix
     pub has_fix: bool,
 }
 
-/// GPS manager that queries ModemManager
+/// GPS manager that queries ModemManager or GeoClue2
 pub struct GpsManager {
     pub data: Arc<Mutex<GpsData>>,
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
-    /// Track which modem has GPS (auto-detected)
+    /// Track which modem has GPS (auto-detected) - only used for mmcli
     modem_index: Arc<Mutex<Option<u32>>>,
+    /// Which backend we're using
+    use_geoclue: Arc<Mutex<bool>>,
 }
 
 impl GpsManager {
@@ -41,33 +45,42 @@ impl GpsManager {
             running: Arc::new(AtomicBool::new(false)),
             enabled: Arc::new(AtomicBool::new(true)),
             modem_index: Arc::new(Mutex::new(None)),
+            use_geoclue: Arc::new(Mutex::new(false)),
         }
     }
 
     /// Start GPS polling thread
     pub fn start(&self) {
-        if self.running.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.running.load(Ordering::SeqCst) {
             return;
         }
 
-        self.running.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.running.store(true, Ordering::SeqCst);
         let data = Arc::clone(&self.data);
         let running = Arc::clone(&self.running);
         let enabled = Arc::clone(&self.enabled);
-
         let modem_index = Arc::clone(&self.modem_index);
-        
+        let use_geoclue = Arc::clone(&self.use_geoclue);
+
         thread::spawn(move || {
             eprintln!("[gps] Starting GPS polling thread");
 
-            // Auto-detect GPS modem on startup
+            // Try mmcli first (full GPS data)
             if let Some(idx) = Self::find_gps_modem() {
+                eprintln!("[gps] Using ModemManager (mmcli) for GPS");
                 *modem_index.lock().unwrap() = Some(idx);
-                // Enable GPS on the detected modem
                 Self::enable_gps_location_internal(idx);
+                *use_geoclue.lock().unwrap() = false;
             } else {
-                eprintln!("[gps] WARNING: No GPS modem found. GPS will not work.");
-                eprintln!("[gps] Make sure cellular modem with GPS is connected.");
+                // Fallback to GeoClue2 (basic location only)
+                eprintln!("[gps] mmcli not available, trying GeoClue2...");
+                if crate::geoclue::init_geoclue() {
+                    eprintln!("[gps] Using GeoClue2 for GPS");
+                    *use_geoclue.lock().unwrap() = true;
+                } else {
+                    eprintln!("[gps] WARNING: No GPS source found. GPS will not work.");
+                    eprintln!("[gps] Install ModemManager or enable GeoClue2.");
+                }
             }
 
             loop {
@@ -76,11 +89,15 @@ impl GpsManager {
                 }
 
                 if enabled.load(Ordering::SeqCst) {
-                    let idx = *modem_index.lock().unwrap();
-                    Self::poll_location(&data, idx);
+                    let geoclue = *use_geoclue.lock().unwrap();
+                    if geoclue {
+                        Self::poll_location_geoclue(&data);
+                    } else {
+                        let idx = *modem_index.lock().unwrap();
+                        Self::poll_location_mmcli(&data, idx);
+                    }
                 }
 
-                // Poll at 1 second intervals (GPS updates every ~1 second)
                 thread::sleep(Duration::from_secs(1));
             }
 
@@ -98,19 +115,15 @@ impl GpsManager {
         self.enabled.store(enabled, Ordering::SeqCst);
     }
 
-    /// Find the modem index that has GPS capability
-    /// Queries all modems and returns the first one with GPS
+    /// Find the modem index that has GPS capability using mmcli
     fn find_gps_modem() -> Option<u32> {
         use std::process::Command;
-        
+
         // Get list of modems
         match Command::new("mmcli").args(["-L"]).output() {
             Ok(o) if o.status.success() => {
                 let output = String::from_utf8_lossy(&o.stdout);
-    
-                
-                // Parse modem indices from output
-                // Format: /org/freedesktop/ModemManager1/Modem/N
+
                 for line in output.lines() {
                     if let Some(idx) = line.rsplit('/').next()?.split_whitespace().next() {
                         if let Ok(modem_num) = idx.parse::<u32>() {
@@ -118,7 +131,7 @@ impl GpsManager {
                             let status = Command::new("mmcli")
                                 .args(["-m", &modem_num.to_string(), "--location-status"])
                                 .output();
-                            
+
                             if let Ok(s) = status {
                                 let status_str = String::from_utf8_lossy(&s.stdout);
                                 if status_str.contains("gps-raw") || status_str.contains("gps-nmea") {
@@ -137,25 +150,23 @@ impl GpsManager {
                 None
             }
             Err(e) => {
-                eprintln!("[gps] Failed to run mmcli -L: {}", e);
+                eprintln!("[gps] mmcli not found: {}", e);
                 None
             }
         }
     }
-    
-    /// Enable GPS location in ModemManager for the specified modem
+
+    /// Enable GPS location in ModemManager
     fn enable_gps_location_internal(modem_idx: u32) -> bool {
         use std::process::Command;
-        
-        // First check if already enabled
+
+        // Check if already enabled
         match Command::new("mmcli")
             .args(["-m", &modem_idx.to_string(), "--location-status"])
             .output()
         {
             Ok(o) => {
                 let status = String::from_utf8_lossy(&o.stdout);
-                
-                // Check if GPS is already enabled - "enabled: gps-nmea" line indicates it's active
                 if status.contains("enabled: gps-nmea") {
                     return true;
                 }
@@ -164,7 +175,7 @@ impl GpsManager {
                 eprintln!("[gps] Failed to check location status: {}", e);
             }
         }
-        
+
         // Enable GPS NMEA
         match Command::new("mmcli")
             .args(["-m", &modem_idx.to_string(), "--location-enable-gps-nmea"])
@@ -186,17 +197,15 @@ impl GpsManager {
         }
     }
 
-    /// Poll location from ModemManager via mmcli
-    fn poll_location(data: &Arc<Mutex<GpsData>>, modem_index: Option<u32>) {
+    /// Poll location using mmcli (ModemManager)
+    fn poll_location_mmcli(data: &Arc<Mutex<GpsData>>, modem_index: Option<u32>) {
         use std::process::Command;
 
         let mut new_data = GpsData::default();
-        
-        // If no modem found, mark GPS as not enabled
+
         let idx = match modem_index {
             Some(i) => i,
             None => {
-                // Update shared data with no GPS
                 if let Ok(mut d) = data.lock() {
                     *d = new_data;
                 }
@@ -204,28 +213,18 @@ impl GpsManager {
             }
         };
 
-        // Query ModemManager for GPS location
         let output = Command::new("mmcli")
             .args(["-m", &idx.to_string(), "--location-get"])
             .output();
 
         if output.is_ok() && output.as_ref().unwrap().status.success() {
             let stdout = String::from_utf8_lossy(&output.as_ref().unwrap().stdout);
-            
-            // GPS hardware is present and responding - enabled is true
             new_data.gps_enabled = true;
-            
 
-            
-
-            
-            // Parse NMEA sentences from output
             for line in stdout.lines() {
-                // Extract NMEA sentence (handle "|       $GPGGA,..." format)
                 if let Some(nmea_start) = line.find("$") {
                     let nmea = &line[nmea_start..];
-                    
-                    // Handle GPS, GLONASS, and Galileo GGA sentences
+
                     if nmea.starts_with("$GPGGA") || nmea.starts_with("$GNGGA") || nmea.starts_with("$GAGGA") {
                         if let Some(parsed) = Self::parse_gga(nmea) {
                             new_data.latitude = parsed.latitude;
@@ -235,11 +234,7 @@ impl GpsManager {
                             new_data.has_fix = parsed.has_fix;
                         }
                     } else if nmea.starts_with("$GPGSV") || nmea.starts_with("$GLGSV") || nmea.starts_with("$GAGSV") {
-                        // GSV: Satellite in view information
-                        // Format: $GPGSV,total,num,count,sv1,elv1,az1,snr1,sv2,elv2,az2,snr2,...*checksum
-                        // Only count field (field 3) gives total satellites in view
                         if let Some(sats) = Self::parse_gsv(nmea) {
-                            // Only update if we don't have satellites from GGA yet
                             if new_data.satellites == 0 {
                                 new_data.satellites = sats;
                             }
@@ -248,27 +243,37 @@ impl GpsManager {
                         if let Some(rmc) = Self::parse_rmc(nmea) {
                             new_data.speed = rmc.speed;
                             new_data.course = rmc.course;
-                            
-                            // RMC has its own validity check - if status is 'A' (active), position is valid
-                            // The GGA fix quality is more authoritative, but RMC active is a good indicator
                         }
                     }
                 }
             }
-        
-            
-
         } else if let Some(e) = output.as_ref().err() {
             eprintln!("[gps] mmcli error: {}", e);
         }
 
-        // Update shared data
         if let Ok(mut d) = data.lock() {
             *d = new_data;
         }
     }
 
-    /// Parse GGA sentence: $GPGGA,time,lat,lat_dir,lon,lon_dir,fix,sats,hdop,alt,alt_unit,sep,sep_unit,diff*checksum
+    /// Poll location using GeoClue2 (fallback)
+    fn poll_location_geoclue(data: &Arc<Mutex<GpsData>>) {
+        let mut new_data = GpsData::default();
+
+        if let Some(loc) = crate::geoclue::get_location() {
+            new_data.gps_enabled = true;
+            new_data.latitude = Some(loc.latitude);
+            new_data.longitude = Some(loc.longitude);
+            new_data.altitude = loc.altitude;
+            new_data.has_fix = loc.accuracy < 100.0; // Good fix if < 100m accuracy
+        }
+
+        if let Ok(mut d) = data.lock() {
+            *d = new_data;
+        }
+    }
+
+    /// Parse GGA sentence
     fn parse_gga(line: &str) -> Option<GpsData> {
         let parts: Vec<&str> = line.split(',').collect();
         if parts.len() < 10 {
@@ -278,20 +283,15 @@ impl GpsManager {
         let fix_quality: u8 = parts[6].parse().unwrap_or(0);
         let has_fix = fix_quality > 0;
 
-        // Parse latitude: ddmm.mmmmm
         let lat_raw: f64 = parts[2].parse().unwrap_or(0.0);
         let lat_dir = parts[3];
         let lat = Self::convert_nmea_coord(lat_raw) * if lat_dir == "S" { -1.0 } else { 1.0 };
 
-        // Parse longitude: dddmm.mmmmm
         let lon_raw: f64 = parts[4].parse().unwrap_or(0.0);
         let lon_dir = parts[5];
         let lon = Self::convert_nmea_coord(lon_raw) * if lon_dir == "W" { -1.0 } else { 1.0 };
 
-        // Altitude
         let altitude: f64 = parts[9].parse().unwrap_or(0.0);
-
-        // Number of satellites
         let sats: u8 = parts[7].parse().unwrap_or(0);
 
         let mut data = GpsData::default();
@@ -300,45 +300,38 @@ impl GpsManager {
         data.altitude = if altitude != 0.0 { Some(altitude) } else { None };
         data.satellites = sats;
         data.has_fix = has_fix;
-        // Note: gps_enabled is set by caller, not here
 
         Some(data)
     }
 
-    /// Parse RMC sentence: $GPRMC,time,status,lat,lat_dir,lon,lon_dir,speed,course,date,mag_var,mag_dir*checksum
+    /// Parse RMC sentence
     fn parse_rmc(line: &str) -> Option<GpsData> {
         let parts: Vec<&str> = line.split(',').collect();
         if parts.len() < 11 {
             return None;
         }
 
-        // Speed in knots -> km/h
         let speed_knots: f64 = parts[7].parse().unwrap_or(0.0);
         let speed_kmh = speed_knots * 1.852;
-
-        // Course in degrees
         let course: f64 = parts[8].parse().unwrap_or(0.0);
 
         let mut data = GpsData::default();
         data.speed = if speed_kmh > 0.0 { Some(speed_kmh) } else { None };
         data.course = if course > 0.0 { Some(course) } else { None };
-        // Note: gps_enabled and has_fix are set by caller based on GGA data
 
         Some(data)
     }
 
-    /// Parse GSV sentence: $GPGSV,total,num,count,sv1,elv1,az1,snr1,...*checksum
-    /// Returns the number of satellites in view (from the count field)
+    /// Parse GSV sentence
     fn parse_gsv(line: &str) -> Option<u8> {
         let parts: Vec<&str> = line.split(',').collect();
         if parts.len() < 4 {
             return None;
         }
-        // Field 3 is the total number of satellites in view
         parts[3].parse().ok()
     }
 
-    /// Convert NMEA coordinate format (ddmm.mmmm) to decimal degrees
+    /// Convert NMEA coordinate format to decimal degrees
     fn convert_nmea_coord(nmea: f64) -> f64 {
         if nmea == 0.0 {
             return 0.0;
@@ -353,11 +346,11 @@ impl GpsManager {
         self.data.lock().unwrap().clone()
     }
 
-    /// Check if GPS is enabled and receiving data
+    /// Check if GPS is enabled
     pub fn is_enabled(&self) -> bool {
         self.data.lock().unwrap().gps_enabled
     }
-    
+
     /// Get formatted location string
     pub fn get_location_string(&self) -> String {
         let data = self.get_data();
@@ -367,9 +360,7 @@ impl GpsManager {
         }
 
         if let (Some(lat), Some(lon)) = (data.latitude, data.longitude) {
-            let lat_str = format!("{:.6}", lat);
-            let lon_str = format!("{:.6}", lon);
-            format!("{}, {}", lat_str, lon_str)
+            format!("{:.6}, {:.6}", lat, lon)
         } else {
             "Searching...".to_string()
         }
@@ -390,7 +381,7 @@ impl Default for GpsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_gps_data_default() {
         let data = GpsData::default();
