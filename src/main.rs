@@ -40,6 +40,8 @@ const MAP_MARGIN: i32 = 8;
 
 const APP_ID: &str = "org.pocketmodem.pocket-modem";
 
+
+
 // Signal that chat UI needs refresh
 static CHAT_REFRESH_SIGNAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static THREAD_REFRESH_SIGNAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -535,6 +537,7 @@ fn create_ui(
             };
             let ch_ctone = channel.ctone_hz;
             let ch_rtone = channel.rtone_hz;
+            let ch_squelch = channel.squelch;
             let ch_index = channel_index as i32;
             let cc_idx = current_channel_index.clone();
             let ch_list = channel_list.clone();
@@ -554,8 +557,12 @@ fn create_ui(
                 std::thread::spawn(move || {
                     if let Ok(r) = r.lock() {
                         let _ = r.set_frequency_with_ctcss(ch_freq, ch_tone_mode, ch_ctone, ch_rtone);
+                        let _ = r.set_squelch(ch_squelch);
                     }
                 });
+                
+                // Also update global squelch setting to match channel
+                unsafe { (*settings).set_squelch(ch_squelch); }
             });
             click
         });
@@ -1417,11 +1424,11 @@ fn create_ui(
     let settings_sq = settings as *const SettingsManager as *mut SettingsManager;
     let last_sent_sq: Arc<std::sync::atomic::AtomicU8> = Arc::new(std::sync::atomic::AtomicU8::new(saved_squelch));
     
-    let adj = gtk::Adjustment::new(saved_squelch as f64, 0.0, 8.0, 1.0, 0.0, 0.0);
+    let adj_sq = gtk::Adjustment::new(saved_squelch as f64, 0.0, 8.0, 1.0, 0.0, 0.0);
     let squelch_row = adw::SpinRow::builder()
         .title("Squelch Level")
         .subtitle("Signal threshold for audio output")
-        .adjustment(&adj)
+        .adjustment(&adj_sq)
         .build();
     squelch_row.set_digits(0);
     squelch_row.set_numeric(true);
@@ -1431,7 +1438,7 @@ fn create_ui(
     let sent_clone = Arc::clone(&last_sent_sq);
     let r_clone = Arc::clone(&radio_sq);
     let s_clone = settings_sq;
-    adj.connect_value_changed(move |adj| {
+    adj_sq.connect_value_changed(move |adj| {
         let level = adj.value() as u8;
         if level != sent_clone.load(std::sync::atomic::Ordering::SeqCst) {
             unsafe { (*s_clone).set_squelch(level); }
@@ -2439,6 +2446,7 @@ fn create_ui(
             
             let squelch_open = if let Ok(r) = radio_update.lock() { r.state().squelch_open } else { false };
             
+            // audio_label is the circle that should turn green
             if !audio_started {
                 audio_label_clone.set_text("○");
                 audio_label_clone.remove_css_class("status-icon-green");
@@ -2448,11 +2456,13 @@ fn create_ui(
                 audio_label_clone.set_text("●");
                 audio_label_clone.remove_css_class("status-icon-gray-empty");
                 audio_label_clone.remove_css_class("status-icon-red");
+                audio_label_clone.remove_css_class("status-icon-gray-filled");
                 audio_label_clone.add_css_class("status-icon-green");
             } else {
                 audio_label_clone.set_text("●");
                 audio_label_clone.remove_css_class("status-icon-green");
                 audio_label_clone.remove_css_class("status-icon-red");
+                audio_label_clone.remove_css_class("status-icon-gray-empty");
                 audio_label_clone.add_css_class("status-icon-gray-filled");
             }
             
@@ -3397,6 +3407,15 @@ fn create_ui(
         power_row.add_suffix(&power_combo);
         content.append(&power_row);
         
+        // Squelch Level
+        let squelch_row = adw::ActionRow::new();
+        squelch_row.set_title("Squelch");
+        let squelch_combo = gtk::DropDown::from_strings(&["Open", "1", "2", "3", "4", "5", "6", "7", "8"]);
+        squelch_combo.set_hexpand(true);
+        squelch_combo.set_selected(channel.squelch as u32);
+        squelch_row.add_suffix(&squelch_combo);
+        content.append(&squelch_row);
+        
         // Delete button
         let delete_btn = gtk::Button::with_label("Delete Channel");
         delete_btn.add_css_class("destructive-action");
@@ -3464,6 +3483,8 @@ fn create_ui(
                     None
                 };
                 
+                let squelch = squelch_combo.selected() as u8;
+                
                 let updated = Channel {
                     location: channel_clone.location,
                     name,
@@ -3476,7 +3497,7 @@ fn create_ui(
                     ctone_hz,
                     power,
                     mode: channel_clone.mode.clone(),
-                    squelch: channel_clone.squelch,
+                    squelch,
                     comment: channel_clone.comment.clone(),
                 };
                 
