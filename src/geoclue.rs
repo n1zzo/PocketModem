@@ -1,13 +1,19 @@
-//! GeoClue2 integration for basic location data
+//! Location via XDG Desktop Portal (ashpd)
 //!
-//! GeoClue2 is the standard Linux location service that provides location
-//! from various sources (GPS, WiFi, Cell towers). Used as fallback when
-//! mmcli/ModemManager is not available.
+//! Uses ashpd (flatpak-xdg-utils) to access location through the XDG Location
+//! portal. This is the preferred method in Flatpak/sandboxed environments.
+//!
+//! Falls back gracefully if location access is denied or unavailable.
 
-use zbus::{Connection, proxy};
-use zbus::zvariant::OwnedObjectPath;
+use ashpd::desktop::location::{Accuracy, Location, LocationProxy};
+use futures::StreamExt;
+use once_cell::sync::OnceCell;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::runtime::Runtime;
+use tokio::time::sleep;
 
-/// Location data from GeoClue2
+/// Location data from the XDG Location portal
 #[derive(Debug, Clone)]
 pub struct GeoClueLocation {
     pub latitude: f64,
@@ -16,139 +22,114 @@ pub struct GeoClueLocation {
     pub accuracy: f64,
 }
 
-#[proxy(
-    interface = "org.freedesktop.GeoClue2.Manager",
-    default_service = "org.freedesktop.GeoClue2",
-    default_path = "/org/freedesktop/GeoClue2/Manager"
-)]
-trait Manager {
-    async fn get_client(&self) -> zbus::Result<OwnedObjectPath>;
-}
+/// Shared runtime for geoclue operations
+static GEOFENCE_RUNTIME: OnceCell<Arc<Runtime>> = OnceCell::new();
 
-#[proxy(
-    interface = "org.freedesktop.GeoClue2.Client",
-    default_service = "org.freedesktop.GeoClue2"
-)]
-trait Client {
-    async fn start(&self) -> zbus::Result<()>;
-    async fn location(&self) -> zbus::Result<OwnedObjectPath>;
-    async fn desktop_id(&self) -> zbus::Result<String>;
-    async fn set_desktop_id(&self, id: &str) -> zbus::Result<()>;
-    async fn requested_accuracy_level(&self) -> zbus::Result<u32>;
-    async fn set_requested_accuracy_level(&self, level: u32) -> zbus::Result<()>;
-}
-
-#[proxy(
-    interface = "org.freedesktop.GeoClue2.Location",
-    default_service = "org.freedesktop.GeoClue2"
-)]
-trait Location {
-    async fn latitude(&self) -> zbus::Result<f64>;
-    async fn longitude(&self) -> zbus::Result<f64>;
-    async fn altitude(&self) -> zbus::Result<f64>;
-    async fn accuracy(&self) -> zbus::Result<f64>;
-}
-
-/// Initialize GeoClue2 - returns true if connection works
+/// Initialize the location service (creates a portal session)
+/// Returns true if the session was created successfully.
+/// Note: This doesn't prompt the user yet - that happens on first location request.
 pub fn init_geoclue() -> bool {
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("[geoclue] Failed to create runtime: {}", e);
-            return false;
-        }
-    };
-    
-    let result = rt.block_on(async_init_geoclue());
-    if result {
-        eprintln!("[geoclue] GeoClue2 initialized successfully");
-    }
-    result
+    // Create or get the tokio runtime
+    let rt = GEOFENCE_RUNTIME.get_or_init(|| {
+        Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime for geoclue"),
+        )
+    });
+
+    rt.block_on(async_init_geoclue())
 }
 
 async fn async_init_geoclue() -> bool {
-    let connection = match Connection::system().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            eprintln!("[geoclue] Failed to connect to system D-Bus: {}", e);
-            return false;
+    LocationProxy::new().await.is_ok()
+}
+
+/// Get current location from the XDG Location portal
+/// Returns None if location is not available or denied.
+pub fn get_location() -> Option<GeoClueLocation> {
+    let rt = match GEOFENCE_RUNTIME.get() {
+        Some(rt) => rt.clone(),
+        None => {
+            if !init_geoclue() {
+                return None;
+            }
+            GEOFENCE_RUNTIME.get().unwrap().clone()
         }
     };
 
-    match ManagerProxy::new(&connection).await {
-        Ok(_manager) => {
-            eprintln!("[geoclue] Manager proxy created");
-            true
-        }
-        Err(e) => {
-            eprintln!("[geoclue] Failed to create Manager proxy: {}", e);
-            false
-        }
-    }
-}
-
-/// Get current location from GeoClue2
-/// Returns None if location is not available
-pub fn get_location() -> Option<GeoClueLocation> {
-    let rt = tokio::runtime::Runtime::new().ok()?;
     rt.block_on(async_get_location())
 }
 
 async fn async_get_location() -> Option<GeoClueLocation> {
-    let connection = Connection::system().await.ok()?;
-    let manager = ManagerProxy::new(&connection).await.ok()?;
-    
-    // Get or create client
-    let client_path = manager.get_client().await.ok()?;
-    
-    // Create client proxy - use .path() then .build()
-    let client = ClientProxy::builder(&connection)
-        .path(client_path.as_str())
-        .ok()?
-        .build()
+    let proxy = match LocationProxy::new().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[geoclue] Failed to create LocationProxy: {}", e);
+            return None;
+        }
+    };
+
+    // Create a session with exact accuracy (GPS)
+    let session = match proxy
+        .create_session(
+            None, // No distance threshold
+            None, // No time threshold
+            Some(Accuracy::Exact),
+        )
         .await
-        .ok()?;
-    
-    // Set desktop ID (required for authorization)
-    let _ = client.set_desktop_id("pocket-modem").await;
-    
-    // Set accuracy level (6 = Exact for GPS)
-    let _ = client.set_requested_accuracy_level(6).await;
-    
-    // Start location tracking
-    if let Err(e) = client.start().await {
-        eprintln!("[geoclue] start failed: {}", e);
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[geoclue] Failed to create location session: {}", e);
+            return None;
+        }
+    };
+
+    // Start the session (this triggers the permission prompt)
+    if let Err(e) = proxy.start(&session, &ashpd::WindowIdentifier::default()).await {
+        eprintln!("[geoclue] Failed to start location session: {}", e);
+        let _ = session.close().await;
         return None;
     }
-    
-    // Wait briefly for location to be available
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    
-    // Get location path
-    let location_path = client.location().await.ok()?;
-    
-    // Create location proxy
-    let location = LocationProxy::builder(&connection)
-        .path(location_path.as_str())
-        .ok()?
-        .build()
-        .await
-        .ok()?;
-    
-    // Read location data
-    let latitude = location.latitude().await.unwrap_or(0.0);
-    let longitude = location.longitude().await.unwrap_or(0.0);
-    let altitude = location.altitude().await.ok();
-    let accuracy = location.accuracy().await.unwrap_or(999.0);
-    
-    if latitude != 0.0 || longitude != 0.0 {
-        Some(GeoClueLocation {
-            latitude,
-            longitude,
+
+    // Listen for location updates
+    let mut stream = match proxy.receive_location_updated().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[geoclue] Failed to subscribe to location updates: {}", e);
+            let _ = session.close().await;
+            return None;
+        }
+    };
+
+    // Wait for first location (with timeout)
+    let location = tokio::select! {
+        signal = stream.next() => match signal {
+            Some(loc) => Some(loc),
+            None => {
+                eprintln!("[geoclue] Location stream closed unexpectedly");
+                None
+            }
+        },
+        _ = sleep(Duration::from_secs(10)) => {
+            eprintln!("[geoclue] Location timeout (10s)");
+            None
+        }
+    };
+
+    // Clean up session
+    let _ = session.close().await;
+
+    // Convert to our internal type
+    location.map(|loc| {
+        let altitude = loc.altitude().filter(|&a| a > -1000.0 && a < 50000.0);
+        GeoClueLocation {
+            latitude: loc.latitude(),
+            longitude: loc.longitude(),
             altitude,
-            accuracy,
-        })
-    } else {
-        None
-    }
+            accuracy: loc.accuracy(),
+        }
+    })
 }

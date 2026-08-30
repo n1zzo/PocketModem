@@ -1,7 +1,7 @@
 //! GPS module using ModemManager (via mmcli) or GeoClue2
 //!
-//! Primary: ModemManager via mmcli (full NMEA data)
-//! Fallback: GeoClue2 D-Bus (basic lat/lon only)
+//! Primary: ModemManager via mmcli (full NMEA data, GPS hardware required)
+//! Fallback: GeoClue2 D-Bus (WiFi/Cell tower geolocation)
 //!
 //! GPS requires:
 //! 1. Cellular modem with GPS capability OR GeoClue2 service
@@ -65,23 +65,25 @@ impl GpsManager {
         thread::spawn(move || {
             eprintln!("[gps] Starting GPS polling thread");
 
-            // Try mmcli first (full GPS data)
+            // Try mmcli first (ModemManager - full NMEA GPS data)
+            eprintln!("[gps] Trying mmcli (ModemManager) first...");
             if let Some(idx) = Self::find_gps_modem() {
                 eprintln!("[gps] Using ModemManager (mmcli) for GPS");
                 *modem_index.lock().unwrap() = Some(idx);
                 Self::enable_gps_location_internal(idx);
                 *use_geoclue.lock().unwrap() = false;
             } else {
-                // Fallback to GeoClue2 (basic location only)
-                eprintln!("[gps] mmcli not available, trying GeoClue2...");
+                // Fallback to ashpd/XDG portal (WiFi/Cell tower geolocation)
+                eprintln!("[gps] mmcli not available, trying ashpd (XDG Location portal)...");
                 if crate::geoclue::init_geoclue() {
-                    eprintln!("[gps] Using GeoClue2 for GPS");
+                    eprintln!("[gps] Using ashpd/XDG Location portal for GPS");
                     *use_geoclue.lock().unwrap() = true;
                 } else {
                     eprintln!("[gps] WARNING: No GPS source found. GPS will not work.");
-                    eprintln!("[gps] Install ModemManager or enable GeoClue2.");
+                    eprintln!("[gps] Install ModemManager or enable XDG Location portal.");
                 }
             }
+
 
             loop {
                 if !running.load(Ordering::SeqCst) {
@@ -264,8 +266,15 @@ impl GpsManager {
             new_data.gps_enabled = true;
             new_data.latitude = Some(loc.latitude);
             new_data.longitude = Some(loc.longitude);
-            new_data.altitude = loc.altitude;
-            new_data.has_fix = loc.accuracy < 100.0; // Good fix if < 100m accuracy
+            // Only set altitude if it's a valid value
+            // GeoClue2 returns f64::MIN for unknown altitude
+            if let Some(alt) = loc.altitude {
+                if alt > f64::MIN && alt > -1000.0 && alt < 50000.0 {
+                    new_data.altitude = Some(alt);
+                }
+            }
+            // GeoClue2 always has a "fix" (WiFi/IP location)
+            new_data.has_fix = true;
         }
 
         if let Ok(mut d) = data.lock() {

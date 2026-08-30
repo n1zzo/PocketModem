@@ -2485,12 +2485,16 @@ fn create_ui(
             let gps_data = g.get_data();
             
             // Determine fix type
+            // Determine fix type
             let (fix_type, fix_class) = if !gps_data.gps_enabled {
                 ("No GPS", "status-warning")
             } else if !gps_data.has_fix {
                 ("No Fix", "status-warning")
             } else if gps_data.satellites >= 4 {
                 ("3D Fix", "status-success")
+            } else if gps_data.gps_enabled && gps_data.satellites == 0 {
+                // GeoClue2 doesn't report satellites, but has a fix
+                ("WiFi Fix", "status-success")
             } else {
                 ("2D Fix", "status-warning")
             };

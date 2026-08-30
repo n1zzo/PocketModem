@@ -221,6 +221,22 @@ pub const APP_CSS: &str = r#"
         padding: 32px;
     }
     
+    /* APRS add button */
+    .aprs-add-btn {
+        background: rgba(255, 176, 0, 0.3);
+        border-radius: 8px;
+        border: 1px solid #FFB000;
+        min-width: 36px;
+        min-height: 36px;
+        color: #FFB000;
+    }
+    .aprs-add-btn:hover {
+        background: rgba(80, 80, 80, 0.95);
+    }
+    .aprs-add-btn:active {
+        background: rgba(100, 100, 100, 1.0);
+    }
+    
     /* Map */
     .map-recenter-btn {
         background: rgba(30, 30, 30, 0.8);

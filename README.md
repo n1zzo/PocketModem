@@ -84,9 +84,15 @@ See `AGENTS.md` for detailed debug notes.
 - [x] Code refactor: move utils function in dedicated file, remove UI sizing constraints, move UI code to dedicated file, deal with unsafes.
 - [x] APRS Tx
 - [x] APRS direct messages
+- [x] Add flatpak build target
+- [x] Geoclue backend
+- [ ] Merge MM and Geoclue
+- [ ] Auto flash ESP32
+- [ ] Better AX.25 demodulator
+- [ ] APRS duplicates detection
+- [ ] FX.25 support
 - [ ] Fix light theme
 - [ ] Use libadwaita feature to show unrecoverable errors
-- [x] Add flatpak build target
 - [ ] Offline maps
 
 ### Development

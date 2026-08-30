@@ -5,6 +5,7 @@
   <project_license>GPL-3.0-or-later</project_license>
   
   <name>PocketModem</name>
+  <icon type="cached">org.pocketmodem.pocket-modem</icon>
   <summary>GTK4 interface for KV4P HT radio modem</summary>
   
   <description>
