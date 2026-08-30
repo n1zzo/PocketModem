@@ -1010,7 +1010,7 @@ fn create_ui(
         content.set_valign(gtk::Align::Start);
         content.set_wrap(true);
         content.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        content.set_size_request(280, -1);
+        content.set_justify(gtk::Justification::Fill);
         
         match msg.msg_type {
             aprs::APRSType::Position => {
