@@ -11,20 +11,33 @@ sdk-extensions:
 command: pocket-modem
 
 finish-args:
-  # Serial device access for USB serial devices
-  - --device=all
+  # KV4P Serial Port access (USB Serial / CDC-ACM)
+  - --device=tty
+  # Alternatively, for specific device paths:
+  # - --device=/dev/ttyUSB0
+  # - --device=/dev/ttyACM0
 
   # Network access (APRS, map tiles)
   - --share=network
 
-  # Audio playback and recording
+  # Audio playback (PulseAudio/WirePlumber)
   - --socket=pulseaudio
+  - --socket=wayland
+  - --socket=x11
 
   # Map tile cache
   - --filesystem=xdg-cache
 
-  # D-Bus for GeoClue2 location
-  - --bus=system
+  # D-Bus for GeoClue2 location via portal
+  - --bus=session
+
+  # XDG Desktop Portal for location access
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --talk-name=org.freedesktop.portal.Location
+
+  # Settings storage
+  - --filesystem=xdg-config:rw
+  - --filesystem=xdg-data:rw
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
@@ -107,17 +120,18 @@ modules:
       - echo 'replace-with = "vendor"' >> /run/build/pocket-modem/cargo/config.toml
       - echo '' >> /run/build/pocket-modem/cargo/config.toml
       - echo '[source.vendor]' >> /run/build/pocket-modem/cargo/config.toml
-      - echo 'directory = "src/vendor"' >> /run/build/pocket-modem/cargo/config.toml
-      - cd src && CARGO_HOME=/run/build/pocket-modem/cargo cargo build --release --features map 2>&1 | tail -30
+      - echo 'directory = "sources/src/vendor"' >> /run/build/pocket-modem/cargo/config.toml
+      - cd sources && CARGO_HOME=/run/build/pocket-modem/cargo cargo build --release --features map 2>&1 | tail -30
       # Install binary
-      - install -Dm755 src/target/release/pocket-modem /app/bin/pocket-modem
+      - install -Dm755 sources/target/release/pocket-modem /app/bin/pocket-modem
       # Install desktop entry
       - install -Dm644 org.pocketmodem.pocket-modem.desktop /app/share/applications/org.pocketmodem.pocket-modem.desktop
       # Install GSettings schema
-      - install -Dm644 data/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml /app/share/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml
+      - install -Dm644 sources/data/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml /app/share/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml
       - glib-compile-schemas /app/share/glib-2.0/schemas/
       # Install icons in all sizes
-      - for size in 16 32 48 64 128 256 512; do install -Dm644 flatpak/icons/${size}x${size}/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/${size}x${size}/apps/org.pocketmodem.pocket-modem.png 2>/dev/null || true; done
+      - for size in 16 32 48 64 128 256 512; do install -Dm644 icons/${size}x${size}/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/${size}x${size}/apps/org.pocketmodem.pocket-modem.png 2>/dev/null || true; done
     sources:
       - type: dir
-        path: .
+        path: ..
+        dest: sources

@@ -2,7 +2,7 @@
 Name=PocketModem
 GenericName=RF Transceiver
 Comment=Turn your mobile Linux device into a powerful RF transceiver
-Exec=/home/nizzo/PocketModem/target/release/pocket-modem
+Exec=pocket-modem
 Icon=pocket-modem
 Terminal=false
 Type=Application

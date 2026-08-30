@@ -11,31 +11,33 @@ sdk-extensions:
 command: pocket-modem
 
 finish-args:
-  # Serial device access - KV4P modem (Silicon Labs CP2102)
-  - --device=/dev/serial/by-id/*Silicon_Labs*
+  # KV4P Serial Port access (USB Serial / CDC-ACM)
+  - --device=tty
+  # Alternatively, for specific device paths:
+  # - --device=/dev/ttyUSB0
+  # - --device=/dev/ttyACM0
 
-  # Allow network access for cargo builds and runtime (APRS, map tiles)
-  - --network
+  # Network access (APRS, map tiles)
+  - --share=network
 
-  # Audio playback and recording
+  # Audio playback (PulseAudio/WirePlumber)
   - --socket=pulseaudio
-
-  # Desktop notifications
-  - --socket=notifications
-  - --talk-name=org.freedesktop.Notifications
-
-  # GSettings persistence
-  - --config=xdg-config
+  - --socket=wayland
+  - --socket=x11
 
   # Map tile cache
   - --filesystem=xdg-cache
 
-  # Geoclue2 for location (GPS via ModemManager, WiFi, etc.)
-  - --talk-name=org.freedesktop.GeoClue2
+  # D-Bus for GeoClue2 location via portal
+  - --bus=session
 
-  # System D-Bus for GeoClue2
-  - --bus=system
-  - --filesystem=/run/dbus:ro
+  # XDG Desktop Portal for location access
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --talk-name=org.freedesktop.portal.Location
+
+  # Settings storage
+  - --filesystem=xdg-config:rw
+  - --filesystem=xdg-data:rw
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
@@ -51,6 +53,7 @@ modules:
   - name: protobuf
     buildsystem: simple
     build-commands:
+      - echo "[1/4] Building protobuf..."
       - cd protobuf && cmake -B build -DCMAKE_INSTALL_PREFIX=/app -Dprotobuf_BUILD_TESTS=OFF -Dprotobuf_BUILD_SHARED_LIBS=ON
       - cd protobuf && cmake --build build -j$(nproc)
       - cd protobuf && cmake --install build
@@ -76,6 +79,7 @@ modules:
   - name: protobuf-c
     buildsystem: simple
     build-commands:
+      - echo "[2/4] Building protobuf-c..."
       - ./autogen.sh
       - ./configure --prefix=/app CFLAGS=-I/app/include LDFLAGS=-L/app/lib64
       - make -j$(nproc)
@@ -88,6 +92,7 @@ modules:
       - type: git
         url: https://github.com/protobuf-c/protobuf-c.git
         tag: v1.5.1
+        commit: 185beed28e65494be7505b30c1afeaf199e19b23
 
   # ===========================================================================
   # libshumate - Map widget for GTK4
@@ -95,6 +100,7 @@ modules:
   - name: libshumate
     buildsystem: simple
     build-commands:
+      - echo "[3/4] Building libshumate..."
       - mkdir -p _build && PATH=/app/bin:$PATH /usr/bin/meson setup _build --prefix=/app -Dgir=false -Dvapi=false -Dgtk_doc=false -Ddemos=false
       - PATH=/app/bin:$PATH /usr/bin/ninja -C _build
       - PATH=/app/bin:$PATH /usr/bin/ninja -C _build install
@@ -106,6 +112,7 @@ modules:
       - type: git
         url: https://github.com/gnome/libshumate.git
         tag: 1.6.1
+        commit: bc23e3624fddb6248de7c147f989f86ced22001a
 
   # ===========================================================================
   # pocket-modem - Main application
@@ -113,21 +120,24 @@ modules:
   - name: pocket-modem
     buildsystem: simple
     build-commands:
-      - mkdir -p /run/build/pocket-modem/.cargo
-      - cp src/.cargo/config.toml /run/build/pocket-modem/.cargo/config.toml
-      - cp -r src/vendor /run/build/pocket-modem/ 2>/dev/null || echo 'no vendor to copy'
-      - cargo build --release --manifest-path src/Cargo.toml --features map 2>&1 | tail -30
+      - echo "[4/4] Building pocket-modem..."
+      - mkdir -p /run/build/pocket-modem/cargo
+      - echo '[source.crates-io]' > /run/build/pocket-modem/cargo/config.toml
+      - echo 'replace-with = "vendor"' >> /run/build/pocket-modem/cargo/config.toml
+      - echo '' >> /run/build/pocket-modem/cargo/config.toml
+      - echo '[source.vendor]' >> /run/build/pocket-modem/cargo/config.toml
+      - echo 'directory = "../src/vendor"' >> /run/build/pocket-modem/cargo/config.toml
+      - cd .. && CARGO_HOME=/run/build/pocket-modem/cargo cargo build --release --features map 2>&1 | tail -30
       # Install binary
-      - install -Dm755 src/target/release/pocket-modem /app/bin/pocket-modem
+      - install -Dm755 ../src/target/release/pocket-modem /app/bin/pocket-modem
       # Install desktop entry
       - install -Dm644 org.pocketmodem.pocket-modem.desktop /app/share/applications/org.pocketmodem.pocket-modem.desktop
-      # Install AppStream metadata
-      - install -Dm644 flatpak/org.pocketmodem.pocket-modem.appdata.xml /app/share/metainfo/org.pocketmodem.pocket-modem.appdata.xml
       # Install GSettings schema
-      - install -Dm644 data/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml /app/share/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml
+      - install -Dm644 ../data/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml /app/share/glib-2.0/schemas/org.pocketmodem.pocket-modem.gschema.xml
       - glib-compile-schemas /app/share/glib-2.0/schemas/
-      # Install icons
-      - install -Dm644 flatpak/icons/256x256/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/256x256/apps/org.pocketmodem.pocket-modem.png
+      # Install icons in all sizes
+      - for size in 16 32 48 64 128 256 512; do install -Dm644 icons/${size}x${size}/org.pocketmodem.pocket-modem.png /app/share/icons/hicolor/${size}x${size}/apps/org.pocketmodem.pocket-modem.png 2>/dev/null || true; done
     sources:
       - type: dir
-        path: .
+        path: ..
+        dest: sources

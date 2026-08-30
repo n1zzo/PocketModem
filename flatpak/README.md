@@ -2,6 +2,16 @@
 
 GTK4/libadwaita application for KV4P HT radio modem with map support.
 
+## Permissions (Minimal)
+
+- `--device=tty` - KV4P serial port access only
+- `--share=network` - APRS/map tiles
+- `--socket=pulseaudio` - Audio playback
+- `--socket=wayland` - Display
+- `--filesystem=xdg-cache` - Map tile cache
+- `--bus=session` - GeoClue2 location via portal
+- `--filesystem=xdg-config:rw, xdg-data:rw` - Settings
+
 ## Prerequisites (Alpine Linux / PostmarketOS)
 
 ```bash
@@ -59,16 +69,40 @@ The build will:
 4. Build PocketModem with vendored Rust dependencies
 5. Install to `build/` directory
 
-**First build takes ~10-15 minutes** depending on network. Subsequent builds are faster due to caching.
+**Build Progress Tracker**
+
+The build script (`build.sh`) shows a progress bar during compilation:
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║                  PocketModem Flatpak Builder                    ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Checking dependencies...
+  ✓ flatpak-builder found
+
+Checking flatpak runtimes...
+  ✓ GNOME runtime installed
+
+Creating vendor directory in repo root...
+
+Starting build...
+
+  [###################.....................................] 2/4 - protobuf-c ...
+  [################################........................] 3/4 - libshumate ...
+  [######################################..................] 4/4 - pocket-modem ...
+```
+
+**First build takes ~15-30 minutes** depending on network and CPU. Subsequent builds are faster due to caching.
 
 ## Running the Flatpak
 
 ```bash
-# Build and run with proper permissions (for testing)
-flatpak-builder build --run flatpak/org.pocketmodem.pocket-modem.yml /app/bin/pocket-modem
+# Install (on ht)
+cd ~/PocketModem/flatpak
+flatpak-builder --user --install build org.pocketmodem.pocket-modem.yml
 
-# Or install locally and run
-flatpak-builder --user --install build flatpak/org.pocketmodem.pocket-modem.yml
+# Run
 flatpak run org.pocketmodem.pocket-modem
 ```
 
@@ -80,16 +114,9 @@ flatpak uninstall org.pocketmodem.pocket-modem
 
 ## Serial Device Access
 
-The Flatpak is configured to access Silicon Labs CP2102 devices only:
-
-```
-/dev/serial/by-id/*Silicon_Labs*
-```
-
-### Permissions
+The Flatpak uses `--device=tty` for KV4P serial port access (USB CDC-ACM, CP2102, etc.).
 
 Ensure your user is in the `dialout` group:
-
 ```bash
 sudo adduser $USER dialout
 # Log out and back in
@@ -97,19 +124,7 @@ sudo adduser $USER dialout
 
 ## GPS
 
-GPS via cellular modem requires `mmcli` from ModemManager to be available on the host system. If `mmcli` is not found, GPS will be disabled with a warning.
-
-To enable GPS on the host:
-```bash
-# Alpine/PostmarketOS
-sudo apk add modemmanager
-
-# Debian/Ubuntu
-sudo apt install modemmanager
-
-# Fedora
-sudo dnf install ModemManager
-```
+GPS via cellular modem requires `mmcli` from ModemManager. If `mmcli` is not found, GPS falls back to GeoClue2 (requires location permission prompt).
 
 ## Architecture
 
@@ -120,11 +135,10 @@ The Flatpak manifest builds the following from source:
 
 This ensures compatibility across different Linux distributions without relying on system packages.
 
-## Notes
+## Files
 
-- Uses GNOME 50 runtime
-- Audio: PulseAudio socket
-- Settings: GSettings via `xdg-config`
-- Network: Required for map tiles and APRS
-- Vendored Rust dependencies for offline builds
-- **Does not affect native builds** - the flatpak uses `src/Cargo.toml` with its own vendored dependencies
+- `org.pocketmodem.pocket-modem.yml` - Flatpak manifest
+- `build.sh` - Build script
+- `org.pocketmodem.pocket-modem.desktop` - Desktop entry
+- `org.pocketmodem.pocket-modem.appdata.xml` - AppStream metadata
+- `icons/` - Application icons (16-512px)
