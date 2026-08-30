@@ -86,7 +86,7 @@ See `AGENTS.md` for detailed debug notes.
 - [x] APRS direct messages
 - [x] Add flatpak build target
 - [x] Geoclue backend
-- [ ] Merge MM and Geoclue
+- [x] Merge MM and Geoclue
 - [ ] Auto flash ESP32
 - [ ] Better AX.25 demodulator
 - [ ] APRS duplicates detection

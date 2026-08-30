@@ -1,101 +1,79 @@
 # Beamforming Configuration for Motorola Edge 30
 
-This directory contains configuration files to enable beamformed microphone recording
-using the dual microphone array on the Motorola Edge 30 (dubai).
+Configuration for dual microphone beamforming on the Motorola Edge 30 (dubai) running postmarketOS.
 
-## Status: ✅ Phase 1 Complete
-
-The UCM profiles are working. The beamforming filter chain requires additional configuration.
-
-## What Works
+## Status
 
 | Feature | Status |
 |---------|--------|
 | UCM profiles (Beamform, DualMic) | ✅ Working |
-| GNOME Settings shows options | ✅ Working |
 | DualMic 2-channel stereo source | ✅ Working |
-| Beamforming filter chain | 🔧 Requires additional setup |
+| GNOME Settings integration | ✅ Working |
+| WebRTC beamforming | ❌ AEC library crashes on this device |
+
+## What Works
+
+1. **UCM Profiles**: Select "Microphone Array" in GNOME Settings → Sound → Input
+2. **Stereo Input**: DualMic provides 2-channel stereo:
+   - Left = Top Microphone  
+   - Right = Bottom Microphone
+3. Applications receive stereo audio from both mics
 
 ## Files
 
-| Path | Purpose |
-|------|---------|
-| `usr/share/alsa/ucm2/Motorola/dubai/HiFi-beamform.conf` | ALSA UCM profile for beamform |
-| `usr/share/alsa/ucm2/Motorola/dubai/HiFi-dualmic.conf` | UCM profile for dual mic stereo |
-| `usr/share/alsa/ucm2/Motorola/dubai/dubai.conf` | UCM main config |
-| `root/.config/pipewire/filter-chain.conf.d/beamform.conf` | PipeWire filter chain config (needs work) |
+```
+beamform-config/
+├── usr/share/alsa/ucm2/Motorola/dubai/
+│   ├── dubai.conf              # Main UCM config
+│   ├── HiFi-beamform.conf      # Beamform profile
+│   └── HiFi-dualmic.conf       # DualMic profile
+├── root/.config/pipewire/
+│   ├── pipewire.conf           # Main PipeWire config (backup)
+│   └── filter-chain.conf.d/
+│       └── beamform-ladspa.conf # LADSPA filter (not loading)
+└── install.sh                  # Installation script
+```
 
 ## Installation
 
-SSH to your device and run:
-
 ```bash
-scp -r beamform-config/ root@<device-ip>:~/
-ssh root@<device-ip>
+scp -r beamform-config/ root@<device>:~/
+ssh root@<device>
 cd beamform-config && ./install.sh
 ```
 
 ## Usage
 
-1. Open GNOME Settings → Sound
-2. Under "Input", select:
-   - **"Beamformed Microphone"** or **"Dual Microphone Array"**
-3. The input will be stereo (2 channels) where:
-   - Left channel = Top Microphone
-   - Right channel = Bottom Microphone
-
-## Manual Filter Chain Setup
-
-The beamforming filter chain config needs the `libfilter-chain` module to be loaded.
-PipeWire 1.6.8 doesn't auto-load filter chains based on the config file.
-
-### Option 1: Use the stereo source directly
-
-Applications that support stereo input will see both microphones:
-```
-alsa_input.platform-sound.Beamform__DualMic__source
-Format: s16le 2ch 48000Hz (FL=Top, FR=Bottom)
-```
-
-### Option 2: Use a custom filter script
-
-Create a script to apply the filter manually or configure WirePlumber.
-
-## Testing
-
-```bash
-# Check profiles
-pactl list cards | grep -A5 'Profiles:'
-
-# Set Beamform profile
-pactl set-card-profile 51 'Beamform (DualMic, Speaker)'
-
-# Verify 2-channel input
-pw-cli ls Node | grep DualMic
-# Should show: audio.channels = "2", audio.position = "[ FL, FR ]"
-
-# Record test (suspend PipeWire source first)
-pactl suspend-source alsa_input.platform-sound.Beamform__DualMic__source 1
-arecord -D hw:Motoroladubai,2 -f cd -c 2 -d 3 /tmp/test-dualmic.wav
-```
+1. Open GNOME Settings → Sound → Input
+2. Select "Microphone Array" 
+3. Applications receive: `alsa_input.platform-sound.Beamform__DualMic__source`
+   - Format: s16le 2ch 48000Hz
+   - FL = Top Mic, FR = Bottom Mic
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  DualMic Source (stereo: FL=Top Mic, FR=Bottom Mic) │
-│  s16le 2ch 48000Hz                                  │
+│  DualMic Source                                     │
+│  s16le 2ch 48000Hz (FL=Top, FR=Bottom)            │
 └─────────────────────────────────────────────────────┘
                            │
                            ▼
-┌─────────────────────────────────────────────────────┐
-│  Beamforming Filter Chain (planned)                 │
-│  Left ─────┐                                        │
-│            ├──(gain 0.5)──┐                         │
-│  Right ──(delay 0.44ms)──┴──(gain 0.5)──▶ Mono     │
-└─────────────────────────────────────────────────────┘
+              ┌────────────────────────┐
+              │  Beamforming Filter    │
+              │  (WebRTC AEC attempted,│
+              │   LADSPA fallback)     │
+              └────────────────────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │  Mono Beamformed Audio │
+              └────────────────────────┘
 ```
 
-## Author
+## Notes
 
-Based on the beamforming setup documentation in `.pi/docs/beamforming-setup.md`
+- The WebRTC AEC library (`libspa-aec-webrtc.so`) crashes with "Illegal instruction" on this device
+- The LADSPA filter chain config is created but doesn't auto-load in PipeWire 1.6.8
+- As a workaround, applications can use the stereo source directly and do their own beamforming
+- The stereo separation provides some directional benefit even without explicit beamforming

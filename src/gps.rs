@@ -27,15 +27,17 @@ pub struct GpsData {
     pub has_fix: bool,
 }
 
-/// GPS manager that queries ModemManager or GeoClue2
+/// GPS manager that queries ModemManager and/or GeoClue2
 pub struct GpsManager {
     pub data: Arc<Mutex<GpsData>>,
     running: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
     /// Track which modem has GPS (auto-detected) - only used for mmcli
     modem_index: Arc<Mutex<Option<u32>>>,
-    /// Which backend we're using
-    use_geoclue: Arc<Mutex<bool>>,
+    /// Whether mmcli backend is available
+    has_mmcli: Arc<AtomicBool>,
+    /// Whether geoclue backend is available
+    has_geoclue: Arc<AtomicBool>,
 }
 
 impl GpsManager {
@@ -45,7 +47,8 @@ impl GpsManager {
             running: Arc::new(AtomicBool::new(false)),
             enabled: Arc::new(AtomicBool::new(true)),
             modem_index: Arc::new(Mutex::new(None)),
-            use_geoclue: Arc::new(Mutex::new(false)),
+            has_mmcli: Arc::new(AtomicBool::new(false)),
+            has_geoclue: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -60,30 +63,51 @@ impl GpsManager {
         let running = Arc::clone(&self.running);
         let enabled = Arc::clone(&self.enabled);
         let modem_index = Arc::clone(&self.modem_index);
-        let use_geoclue = Arc::clone(&self.use_geoclue);
+        let has_mmcli = Arc::clone(&self.has_mmcli);
+        let has_geoclue = Arc::clone(&self.has_geoclue);
 
         thread::spawn(move || {
             eprintln!("[gps] Starting GPS polling thread");
 
-            // Try mmcli first (ModemManager - full NMEA GPS data)
-            eprintln!("[gps] Trying mmcli (ModemManager) first...");
+            // Detect available backends
+            // Try mmcli (ModemManager - full NMEA GPS data)
+            eprintln!("[gps] Checking mmcli (ModemManager)...");
             if let Some(idx) = Self::find_gps_modem() {
-                eprintln!("[gps] Using ModemManager (mmcli) for GPS");
+                eprintln!("[gps] ModemManager available with GPS modem {}", idx);
                 *modem_index.lock().unwrap() = Some(idx);
                 Self::enable_gps_location_internal(idx);
-                *use_geoclue.lock().unwrap() = false;
+                has_mmcli.store(true, Ordering::SeqCst);
             } else {
-                // Fallback to ashpd/XDG portal (WiFi/Cell tower geolocation)
-                eprintln!("[gps] mmcli not available, trying ashpd (XDG Location portal)...");
-                if crate::geoclue::init_geoclue() {
-                    eprintln!("[gps] Using ashpd/XDG Location portal for GPS");
-                    *use_geoclue.lock().unwrap() = true;
-                } else {
-                    eprintln!("[gps] WARNING: No GPS source found. GPS will not work.");
-                    eprintln!("[gps] Install ModemManager or enable XDG Location portal.");
-                }
+                eprintln!("[gps] ModemManager GPS not available");
             }
 
+            // Try geoclue (XDG Location portal - WiFi/Cell tower geolocation)
+            eprintln!("[gps] Checking geoclue (XDG Location portal)...");
+            if crate::geoclue::init_geoclue() {
+                eprintln!("[gps] GeoClue available");
+                has_geoclue.store(true, Ordering::SeqCst);
+            } else {
+                eprintln!("[gps] GeoClue not available");
+            }
+
+            if !has_mmcli.load(Ordering::SeqCst) && !has_geoclue.load(Ordering::SeqCst) {
+                eprintln!("[gps] WARNING: No GPS source found. GPS will not work.");
+                eprintln!("[gps] Install ModemManager or enable XDG Location portal.");
+            } else {
+                eprintln!(
+                    "[gps] Using: {}{}",
+                    if has_mmcli.load(Ordering::SeqCst) {
+                        "mmcli "
+                    } else {
+                        ""
+                    },
+                    if has_geoclue.load(Ordering::SeqCst) {
+                        "geoclue"
+                    } else {
+                        ""
+                    }
+                );
+            }
 
             loop {
                 if !running.load(Ordering::SeqCst) {
@@ -91,12 +115,47 @@ impl GpsManager {
                 }
 
                 if enabled.load(Ordering::SeqCst) {
-                    let geoclue = *use_geoclue.lock().unwrap();
-                    if geoclue {
-                        Self::poll_location_geoclue(&data);
-                    } else {
+                    let mmcli_ok = has_mmcli.load(Ordering::SeqCst);
+                    let geoclue_ok = has_geoclue.load(Ordering::SeqCst);
+
+                    if mmcli_ok && geoclue_ok {
+                        // Both available: use mmcli for position, geoclue if no fix
                         let idx = *modem_index.lock().unwrap();
-                        Self::poll_location_mmcli(&data, idx);
+                        let mmcli_data = Self::poll_location_mmcli_internal(idx);
+
+                        if mmcli_data.has_fix {
+                            // We have a GPS fix - use mmcli data fully
+                            if let Ok(mut d) = data.lock() {
+                                *d = mmcli_data;
+                            }
+                        } else {
+                            // No GPS fix - try geoclue as fallback
+                            if let Some(loc) = crate::geoclue::get_location() {
+                                let mut merged_data = mmcli_data;
+                                merged_data.latitude = Some(loc.latitude);
+                                merged_data.longitude = Some(loc.longitude);
+                                // GeoClue2 always has a "fix" (WiFi/IP location)
+                                merged_data.has_fix = true;
+                                if let Ok(mut d) = data.lock() {
+                                    *d = merged_data;
+                                }
+                            } else {
+                                // Geoclue also failed, just use whatever mmcli has
+                                if let Ok(mut d) = data.lock() {
+                                    *d = mmcli_data;
+                                }
+                            }
+                        }
+                    } else if mmcli_ok {
+                        // Only mmcli
+                        let idx = *modem_index.lock().unwrap();
+                        let mmcli_data = Self::poll_location_mmcli_internal(idx);
+                        if let Ok(mut d) = data.lock() {
+                            *d = mmcli_data;
+                        }
+                    } else if geoclue_ok {
+                        // Only geoclue
+                        Self::poll_location_geoclue(&data);
                     }
                 }
 
@@ -136,7 +195,8 @@ impl GpsManager {
 
                             if let Ok(s) = status {
                                 let status_str = String::from_utf8_lossy(&s.stdout);
-                                if status_str.contains("gps-raw") || status_str.contains("gps-nmea") {
+                                if status_str.contains("gps-raw") || status_str.contains("gps-nmea")
+                                {
                                     eprintln!("[gps] Found GPS on modem {}", modem_num);
                                     return Some(modem_num);
                                 }
@@ -148,7 +208,10 @@ impl GpsManager {
                 None
             }
             Ok(o) => {
-                eprintln!("[gps] mmcli -L failed: {}", String::from_utf8_lossy(&o.stderr));
+                eprintln!(
+                    "[gps] mmcli -L failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
                 None
             }
             Err(e) => {
@@ -188,7 +251,10 @@ impl GpsManager {
                     eprintln!("[gps] GPS location enabled on modem {}", modem_idx);
                     true
                 } else {
-                    eprintln!("[gps] Failed to enable GPS: {}", String::from_utf8_lossy(&o.stderr));
+                    eprintln!(
+                        "[gps] Failed to enable GPS: {}",
+                        String::from_utf8_lossy(&o.stderr)
+                    );
                     false
                 }
             }
@@ -199,20 +265,15 @@ impl GpsManager {
         }
     }
 
-    /// Poll location using mmcli (ModemManager)
-    fn poll_location_mmcli(data: &Arc<Mutex<GpsData>>, modem_index: Option<u32>) {
+    /// Poll location using mmcli (ModemManager) - internal version returning data
+    fn poll_location_mmcli_internal(modem_index: Option<u32>) -> GpsData {
         use std::process::Command;
 
         let mut new_data = GpsData::default();
 
         let idx = match modem_index {
             Some(i) => i,
-            None => {
-                if let Ok(mut d) = data.lock() {
-                    *d = new_data;
-                }
-                return;
-            }
+            None => return new_data,
         };
 
         let output = Command::new("mmcli")
@@ -227,7 +288,10 @@ impl GpsManager {
                 if let Some(nmea_start) = line.find("$") {
                     let nmea = &line[nmea_start..];
 
-                    if nmea.starts_with("$GPGGA") || nmea.starts_with("$GNGGA") || nmea.starts_with("$GAGGA") {
+                    if nmea.starts_with("$GPGGA")
+                        || nmea.starts_with("$GNGGA")
+                        || nmea.starts_with("$GAGGA")
+                    {
                         if let Some(parsed) = Self::parse_gga(nmea) {
                             new_data.latitude = parsed.latitude;
                             new_data.longitude = parsed.longitude;
@@ -235,13 +299,19 @@ impl GpsManager {
                             new_data.satellites = parsed.satellites;
                             new_data.has_fix = parsed.has_fix;
                         }
-                    } else if nmea.starts_with("$GPGSV") || nmea.starts_with("$GLGSV") || nmea.starts_with("$GAGSV") {
+                    } else if nmea.starts_with("$GPGSV")
+                        || nmea.starts_with("$GLGSV")
+                        || nmea.starts_with("$GAGSV")
+                    {
                         if let Some(sats) = Self::parse_gsv(nmea) {
                             if new_data.satellites == 0 {
                                 new_data.satellites = sats;
                             }
                         }
-                    } else if nmea.starts_with("$GPRMC") || nmea.starts_with("$GNRMC") || nmea.starts_with("$GARMC") {
+                    } else if nmea.starts_with("$GPRMC")
+                        || nmea.starts_with("$GNRMC")
+                        || nmea.starts_with("$GARMC")
+                    {
                         if let Some(rmc) = Self::parse_rmc(nmea) {
                             new_data.speed = rmc.speed;
                             new_data.course = rmc.course;
@@ -253,6 +323,12 @@ impl GpsManager {
             eprintln!("[gps] mmcli error: {}", e);
         }
 
+        new_data
+    }
+
+    /// Poll location using mmcli (ModemManager) - updates shared data
+    fn poll_location_mmcli(data: &Arc<Mutex<GpsData>>, modem_index: Option<u32>) {
+        let new_data = Self::poll_location_mmcli_internal(modem_index);
         if let Ok(mut d) = data.lock() {
             *d = new_data;
         }
@@ -306,7 +382,11 @@ impl GpsManager {
         let mut data = GpsData::default();
         data.latitude = if lat != 0.0 { Some(lat) } else { None };
         data.longitude = if lon != 0.0 { Some(lon) } else { None };
-        data.altitude = if altitude != 0.0 { Some(altitude) } else { None };
+        data.altitude = if altitude != 0.0 {
+            Some(altitude)
+        } else {
+            None
+        };
         data.satellites = sats;
         data.has_fix = has_fix;
 
@@ -325,7 +405,11 @@ impl GpsManager {
         let course: f64 = parts[8].parse().unwrap_or(0.0);
 
         let mut data = GpsData::default();
-        data.speed = if speed_kmh > 0.0 { Some(speed_kmh) } else { None };
+        data.speed = if speed_kmh > 0.0 {
+            Some(speed_kmh)
+        } else {
+            None
+        };
         data.course = if course > 0.0 { Some(course) } else { None };
 
         Some(data)
