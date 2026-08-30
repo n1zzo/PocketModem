@@ -8,9 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Progress tracking
-MODULE_COUNT=0
 CURRENT_MODULE=0
 MODULES=(
+    "setup"
     "protobuf"
     "protobuf-c"
     "libshumate"
@@ -18,26 +18,26 @@ MODULES=(
 )
 TOTAL_MODULES=${#MODULES[@]}
 
-print_progress() {
-    local module="$1"
-    local status="$2"
-    local filled=$((CURRENT_MODULE * 50 / TOTAL_MODULES))
-    local empty=$((50 - filled))
-    local bar=$(printf '#%.0s' $(seq 1 $filled) 2>/dev/null || true)
-    local spaces=$(printf '.%.0s' $(seq 1 $empty) 2>/dev/null || true)
-    
-    printf "\r  [%s%s] %d/%d - %s %-10s" "$bar" "$spaces" "$CURRENT_MODULE" "$TOTAL_MODULES" "$module" "$status"
-    if [ "$status" = "DONE" ]; then
-        printf "\n"
-    fi
-}
-
 print_header() {
     echo ""
     echo "╔══════════════════════════════════════════════════════════════════╗"
     echo "║                  PocketModem Flatpak Builder                    ║"
     echo "╚══════════════════════════════════════════════════════════════════╝"
     echo ""
+}
+
+print_progress() {
+    local module="$1"
+    local status="$2"
+    local filled=$((CURRENT_MODULE * 50 / TOTAL_MODULES))
+    local empty=$((50 - filled))
+    
+    # Build bar without using printf tricks (portable)
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar="${bar}#"; done
+    for ((i=filled; i<50; i++)); do bar="${bar}."; done
+    
+    printf "  [%s] %d/%d - %-12s %s\n" "$bar" "$CURRENT_MODULE" "$TOTAL_MODULES" "$module" "$status"
 }
 
 # Check for flatpak-builder
@@ -72,16 +72,16 @@ check_dependencies() {
 
 # Ensure vendor directory exists
 setup_vendor() {
-    ((CURRENT_MODULE++))
-    print_progress "setup" "..."
-    
-    if [ ! -d "src/vendor" ]; then
-        echo ""
-        echo "Creating vendor directory..."
-        mkdir -p src && cd .. && cargo vendor src/vendor
-        cd "$SCRIPT_DIR"
+    echo ""
+    echo "Preparing vendor directory..."
+    if [ ! -d "../src/vendor" ]; then
+        echo "  Creating vendor directory..."
+        (cd .. && mkdir -p src && cargo vendor src/vendor)
+    else
+        echo "  ✓ Vendor directory exists"
     fi
-    print_progress "setup" "DONE  "
+    CURRENT_MODULE=1
+    print_progress "setup" "[DONE]"
 }
 
 # Build function
@@ -90,27 +90,38 @@ run_build() {
     echo "Starting build..."
     echo ""
     
+    # Pre-print initial state
+    CURRENT_MODULE=1
+    print_progress "protobuf" "[BUILDING...]"
+    
     # Run flatpak-builder with module progress detection
     flatpak-builder --force-clean build org.pocketmodem.pocket-modem.yml 2>&1 | \
     while IFS= read -r line; do
         echo "$line"
         
         # Detect module transitions from build output
-        if echo "$line" | grep -q "Starting build of protobuf"; then
-            CURRENT_MODULE=1; print_progress "protobuf" "..."
-        elif echo "$line" | grep -q "Starting build of protobuf-c"; then
-            CURRENT_MODULE=2; print_progress "protobuf-c" "..."
-        elif echo "$line" | grep -q "Starting build of libshumate"; then
-            CURRENT_MODULE=3; print_progress "libshumate" "..."
-        elif echo "$line" | grep -q "Starting build of pocket-modem"; then
-            CURRENT_MODULE=4; print_progress "pocket-modem" "..."
-        elif echo "$line" | grep -q "Build complete"; then
-            CURRENT_MODULE=$TOTAL_MODULES; print_progress "complete" "DONE  "
+        if echo "$line" | grep -q "Building module protobuf"; then
+            CURRENT_MODULE=1; print_progress "protobuf" "[DONE]"
+        elif echo "$line" | grep -q "Building module protobuf-c"; then
+            CURRENT_MODULE=2; print_progress "protobuf-c" "[BUILDING...]"
+        elif echo "$line" | grep -q "Building module libshumate"; then
+            CURRENT_MODULE=3; print_progress "libshumate" "[BUILDING...]"
+        elif echo "$line" | grep -q "Building module pocket-modem"; then
+            CURRENT_MODULE=4; print_progress "pocket-modem" "[BUILDING...]"
+        elif echo "$line" | grep -q "Committing stage"; then
+            # Update current module count based on what's being committed
+            if echo "$line" | grep -q "build-protobuf$"; then
+                CURRENT_MODULE=1; print_progress "protobuf" "[DONE]"
+            elif echo "$line" | grep -q "build-protobuf-c$"; then
+                CURRENT_MODULE=2; print_progress "protobuf-c" "[DONE]"
+            elif echo "$line" | grep -q "build-libshumate$"; then
+                CURRENT_MODULE=3; print_progress "libshumate" "[DONE]"
+            fi
         fi
     done
     
     CURRENT_MODULE=$TOTAL_MODULES
-    print_progress "BUILD" "DONE  "
+    print_progress "BUILD" "[DONE]"
 }
 
 print_footer() {
@@ -119,11 +130,11 @@ print_footer() {
     echo "║                    Build Complete!                               ║"
     echo "╠══════════════════════════════════════════════════════════════════╣"
     echo "║                                                                  ║"
-    echo "║  Test: flatpak-builder build --run flatpak/org.pocketmodem.     ║"
-    echo "║        pocket-modem.yml /app/bin/pocket-modem                    ║"
+    echo "║  Test: flatpak-builder build --run org.pocketmodem.pocket-      ║"
+    echo "║        modem.yml /app/bin/pocket-modem                           ║"
     echo "║                                                                  ║"
-    echo "║  Install: flatpak-builder --user --install build flatpak/       ║"
-    echo "║           org.pocketmodem.pocket-modem.yml                       ║"
+    echo "║  Install: flatpak-builder --user --install build org.pocket-    ║"
+    echo "║           modem.pocket-modem.yml                                 ║"
     echo "║                                                                  ║"
     echo "║  Run: flatpak run org.pocketmodem.pocket-modem                   ║"
     echo "║                                                                  ║"
