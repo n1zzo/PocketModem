@@ -8,4 +8,6 @@ trough
 AGENTS.md
 src/vendor/
 src/target/
+target/
+Cargo.lock
 vendor/
