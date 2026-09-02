@@ -1,0 +1,14 @@
+[package]
+name = "rade"
+version = "0.1.0"
+edition = "2021"
+description = "RADAEv2 Radio Autoencoder FFI bindings"
+license = "BSD-3-Clause"
+repository = "https://github.com/drowe67/radae"
+
+[dependencies]
+libc = "0.2"
+num-complex = "0.4"
+
+[build-dependencies]
+cc = "1.0"

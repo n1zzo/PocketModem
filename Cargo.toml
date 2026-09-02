@@ -65,6 +65,10 @@ once_cell = "1.20"
 # XDG Desktop Portal for location (Flatpak-compatible)
 ashpd = { version = "0.8", default-features = false, features = ["tokio", "glib"] }
 
+# RADAEv2 neural codec integration (workspace members for cross-platform builds)
+rade = { path = "src/vendor/rade" }
+lpcnet = { path = "src/vendor/lpcnet" }
+
 [[bin]]
 name = "pocket-modem"
 path = "src/main.rs"
