@@ -12,16 +12,17 @@ mod geoclue;
 mod gps;
 mod kiss;
 mod map;
+mod rade_audio;
 mod radio;
 mod settings;
 mod utils;
-mod ui;
 
-use aprs::{APRSMessage, APRSType, DirectMessage, DirectMessageStatus};
+use aprs::{APRSMessage, APRSType, DirectMessage};
 use audio::{AudioConfig, AudioManager};
 use gps::GpsManager;
 use map::MapManager;
-use settings::{SettingsManager, Channel, Duplex, ToneMode, PowerLevel};
+use rade_audio::RadeAudioManager;
+use settings::{SettingsManager, Channel, CodecMode, Duplex, ToneMode, PowerLevel};
 use utils::{calculate_maidenhead, calculate_distance_bearing, escape_markup, bearing_to_compass};
 
 use radio::{KV4PRadio, SerialConfig};
@@ -57,10 +58,22 @@ static THREAD_REFRESH_SIGNAL: std::sync::atomic::AtomicU32 = std::sync::atomic::
 const APRS_BASE_RETRY_INTERVAL_SECS: u64 = 30;  // Initial retry interval (30 seconds)
 const APRS_MAX_RETRIES: u8 = 5;                  // Maximum retry count (max 6 total attempts)
 
+// Atomic codec mode - updated by settings and read by audio callbacks
+use std::sync::atomic::{AtomicU8, Ordering};
+static CURRENT_CODEC_MODE: AtomicU8 = AtomicU8::new(0);  // 0=ADPCM, 1=RADAEv2
+
 fn main() {
     let settings = SettingsManager::new();
     eprintln!("[pocket-modem] Settings loaded: freq={} kHz, squelch={}", 
               settings.frequency(), settings.squelch());
+    
+    // Initialize atomic codec mode from settings
+    let saved_codec = settings.codec_mode();
+    CURRENT_CODEC_MODE.store(
+        if saved_codec == CodecMode::Radaev2 { 1 } else { 0 },
+        Ordering::SeqCst
+    );
+    eprintln!("[pocket-modem] Codec mode: {:?}", saved_codec);
     
     let serial_device = std::env::var("POCKET_MODEM_DEVICE").ok().unwrap_or_else(|| {
         if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
@@ -83,7 +96,7 @@ fn main() {
         baudrate: 115200,
         timeout_ms: 500,
     })));
-    let radio_clone = Arc::clone(&radio);
+    let _radio_clone = Arc::clone(&radio);
 
     let gps_manager = Arc::new(Mutex::new(GpsManager::new()));
     {
@@ -99,16 +112,67 @@ fn main() {
         pre_emphasis_alpha: 0.0,
         hard_limit: 0.95,
     };
-    let audio_manager = Arc::new(Mutex::new(AudioManager::new(audio_config)));
+    let audio_manager = Arc::new(Mutex::new(AudioManager::new(audio_config.clone())));
+    
+    // Initialize RADAEv2 audio manager
+    let rade_audio_manager = match RadeAudioManager::new() {
+        Ok(mgr) => {
+            eprintln!("[pocket-modem] RADAEv2 audio manager initialized");
+            Some(Arc::new(Mutex::new(mgr)))
+        }
+        Err(e) => {
+            eprintln!("[pocket-modem] Failed to init RADAEv2: {}", e);
+            eprintln!("[pocket-modem] Falling back to ADPCM mode only");
+            None
+        }
+    };
     
     {
         let mut audio = audio_manager.lock().unwrap();
-        let radio = Arc::clone(&radio);
+        // Clone radio FIRST before any closures capture it
+        let radio_adpcm = Arc::clone(&radio);
+        let radio_for_rade = Arc::clone(&radio);
+        
         audio.on_tx_audio(move |adpcm_data| {
-            if let Ok(r) = radio.lock() {
+            if let Ok(r) = radio_adpcm.lock() {
                 let _ = r.send_audio(adpcm_data);
             }
         });
+        
+        // Register RADE callbacks if RADAEv2 is available
+        if let Some(ref rade) = rade_audio_manager {
+            let rade_for_raw = Arc::clone(rade);
+            
+            // TX callback: sends PCM8 frames to radio
+            {
+                let mut rade_guard = rade.lock().unwrap();
+                rade_guard.on_tx_audio(move |pcm8_frame| {
+                    if let Ok(r) = radio_for_rade.lock() {
+                        if let Err(e) = r.send_pcm8_frame(pcm8_frame) {
+                            eprintln!("[pocket-modem] PCM8 TX error: {}", e);
+                        }
+                    }
+                });
+            }
+            
+            // Raw TX callback: routes mic samples to RADE pipeline
+            // Note: This is pre-registered; RADE.start_tx()/stop_tx() controls actual processing
+            audio.on_raw_tx_audio(move |pcm_samples| {
+                if let Ok(mut rade_mgr) = rade_for_raw.lock() {
+                    // Only process if TX is active
+                    if rade_mgr.is_tx_active() {
+                        match rade_mgr.process_mic(pcm_samples) {
+                            Ok(Some(_pcm8_frame)) => {
+                                // TX callback in rade_mgr will send the frame
+                            }
+                            Ok(None) => { /* Need more samples */ }
+                            Err(e) => eprintln!("[main] RADE mic error: {}", e),
+                        }
+                    }
+                }
+            });
+        }
+        drop(audio);  // Release lock
     }
 
     let app = adw::Application::builder()
@@ -125,7 +189,7 @@ fn main() {
     let radio_for_ui = Arc::clone(&radio);
     let radio_for_shutdown = Arc::clone(&radio);
     app.connect_activate(move |app| {
-        create_ui(app, &radio_for_ui, &audio_activate, &gps_manager_activate, &settings);
+        create_ui(app, &radio_for_ui, &audio_activate, &gps_manager_activate, &settings, rade_audio_manager.clone());
     });
     
     let gps_for_shutdown = Arc::clone(&gps_manager);
@@ -152,7 +216,13 @@ fn create_ui(
     audio: &Arc<Mutex<AudioManager>>,
     gps: &Arc<Mutex<GpsManager>>,
     settings: &SettingsManager,
+    rade_audio: Option<Arc<Mutex<RadeAudioManager>>>,
 ) {
+    // Get codec mode at startup (will be checked dynamically in callbacks)
+    let codec_mode_at_startup = settings.codec_mode();
+    let rade_available = rade_audio.is_some();
+    eprintln!("[pocket-modem] Codec mode: {:?}, RADE available: {}", codec_mode_at_startup, rade_available);
+
     // Window sized to fit screen
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -202,29 +272,87 @@ fn create_ui(
     });
     
     // Register radio callbacks
+    // Route based on codec mode: ADPCM uses audio callbacks, RADAEv2 uses PCM8
     {
         let r = radio.lock().unwrap();
         let audio_cb = Arc::clone(audio);
+        let rade_cb = rade_audio.clone();
+        let rade_available = rade_audio.is_some();
+
+        // RX callback: always register both, check mode at runtime
         r.on_rx_audio(move |adpcm_data| {
-            if let Ok(mut a) = audio_cb.lock() {
-                a.accumulate_and_start(adpcm_data);
+            // Check codec mode via atomic
+            let codec_mode = CURRENT_CODEC_MODE.load(Ordering::SeqCst);
+            if codec_mode == 0 {  // ADPCM
+                if let Ok(mut a) = audio_cb.lock() {
+                    a.accumulate_and_start(adpcm_data);
+                }
             }
+            // In RADAEv2 mode, ADPCM RX is ignored (PCM8 RX handles it)
         });
-        
+
+        // PCM8 RX callback: always register, check mode at runtime
+        let audio_pcm8 = Arc::clone(&audio);
+        r.on_pcm8_rx(move |pcm8_frame| {
+            let codec_mode = CURRENT_CODEC_MODE.load(Ordering::SeqCst);
+            if codec_mode == 1 && rade_available {  // RADAEv2
+                if let Some(ref rade) = rade_cb {
+                    if let Ok(mut rade_mgr) = rade.lock() {
+                        match rade_mgr.process_pcm8(pcm8_frame) {
+                            Ok(Some(speech)) => {
+                                if let Ok(mut a) = audio_pcm8.lock() {
+                                    a.accumulate_and_start_raw(&speech);
+                                }
+                            }
+                            Ok(None) => { /* Need more frames */ }
+                            Err(e) => eprintln!("[main] PCM8 RX error: {}", e),
+                        }
+                    }
+                }
+            }
+            // In ADPCM mode, PCM8 frames are ignored
+        });
+
+        // PTT callback: route TX based on codec mode
         let radio_ptt = Arc::clone(&radio);
         let audio_ptt = Arc::clone(audio);
+        let rade_ptt = rade_audio.clone();
         r.on_phys_ptt(move |pressed| {
+            // Check codec mode at PTT time
+            let codec_mode = CURRENT_CODEC_MODE.load(Ordering::SeqCst);
+            let use_rade = codec_mode == 1 && rade_ptt.is_some();
+
+            // PTT on/off
             if let Ok(r) = radio_ptt.lock() {
-                if pressed { let _ = r.ptt_on(); } 
+                if pressed { let _ = r.ptt_on(); }
                 else { let _ = r.ptt_off(); }
             }
-            if let Ok(mut a) = audio_ptt.lock() {
-                if pressed {
-                    a.stop_playback();
-                    let _ = a.start_capture();
-                } else {
-                    let _ = a.stop_capture();
-                    let _ = a.start_playback();
+
+            if use_rade {
+                // RADAEv2 TX path
+                if let Some(ref rade) = rade_ptt {
+                    if let Ok(mut rade_mgr) = rade.lock() {
+                        if pressed {
+                            rade_mgr.start_tx();
+                            // Enable PCM8 mode on radio
+                            if let Ok(r) = radio_ptt.lock() {
+                                let _ = r.set_pcm8_mode(true);
+                            }
+                        } else {
+                            rade_mgr.stop_tx();
+                        }
+                    }
+                }
+            } else {
+                // ADPCM TX path - just capture mic samples
+                if let Ok(mut a) = audio_ptt.lock() {
+                    if pressed {
+                        a.stop_playback();
+                        let _ = a.start_capture();
+                    } else {
+                        let _ = a.stop_capture();
+                        let _ = a.start_playback();
+                    }
                 }
             }
         });
@@ -300,7 +428,7 @@ fn create_ui(
     gps_status_box.append(&gps_status_label);
     gps_status_btn.set_child(Some(&gps_status_box));
     
-    // AUDIO button
+    // AUDIO button - shows codec mode (FM/RADE)
     let audio_status_btn = gtk::Button::new();
     audio_status_btn.add_css_class("flat");
     audio_status_btn.add_css_class("status-btn");
@@ -310,7 +438,9 @@ fn create_ui(
     audio_icon.set_pixel_size(28);
     let audio_label = gtk::Label::new(Some("○"));
     audio_label.add_css_class("status-icon-gray");
-    let audio_status_label = gtk::Label::new(Some("AUDIO"));
+    // Show codec mode as label text (FM or RADE)
+    let codec_mode_text = if codec_mode_at_startup == settings::CodecMode::Radaev2 { "RADE" } else { "FM" };
+    let audio_status_label = gtk::Label::new(Some(codec_mode_text));
     audio_status_label.add_css_class("status-text");
     audio_status_label.add_css_class("audio-label");
     audio_status_box.append(&audio_icon);
@@ -600,7 +730,7 @@ fn create_ui(
                     freq_save.set_text(&format!("{}.{:03}", ch_freq / 1000, ch_freq % 1000));
                     let r = radio_save.clone();
                     std::thread::spawn(move || {
-                        if let Ok(mut r) = r.lock() {
+                        if let Ok(r) = r.lock() {
                             let _ = r.set_frequency_with_ctcss(ch_freq, ch_tone_mode, ch_ctone, ch_rtone);
                         }
                     });
@@ -750,7 +880,7 @@ fn create_ui(
         move |_, _, _, _| {
             label.set_text("TX");
             
-            let (tx_freq, rx_freq) = unsafe {
+            let (tx_freq, _rx_freq) = unsafe {
                 let rx_freq = (*settings).frequency();
                 let channels = (*settings).channels();
                 let tx_freq = if let Some(ch) = channels.iter().find(|c| c.rx_freq_khz == rx_freq) {
@@ -767,7 +897,7 @@ fn create_ui(
             freq_entry.set_text(&format!("{}.{:03}", tx_freq / 1000, tx_freq % 1000));
             freq_entry.add_css_class("tx-frequency");
             
-            if let Ok(mut rad) = r.lock() {
+            if let Ok(rad) = r.lock() {
                 let _ = rad.set_frequency(tx_freq);
                 let _ = rad.ptt_on();
             }
@@ -788,7 +918,7 @@ fn create_ui(
             
             let rx_freq = unsafe { (*settings).frequency() };
             
-            if let Ok(mut rad) = r.lock() { let _ = rad.ptt_off(); }
+            if let Ok(rad) = r.lock() { let _ = rad.ptt_off(); }
             
             freq_entry.remove_css_class("tx-frequency");
             freq_entry.set_text(&format!("{}.{:03}", rx_freq / 1000, rx_freq % 1000));
@@ -818,7 +948,7 @@ fn create_ui(
     // =========================================================================
     
     let aprs_messages: Arc<Mutex<Vec<APRSMessage>>> = Arc::new(Mutex::new(Vec::new()));
-    let aprs_messages_clone = Arc::clone(&aprs_messages);
+    let _aprs_messages_clone = Arc::clone(&aprs_messages);
     let aprs_last_displayed: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     
     // Reference to settings for APRS message management
@@ -837,10 +967,10 @@ fn create_ui(
     aprs_list_box.append(&aprs_empty_label);
     
     // Function to add a thread row button that opens chat
-    let aprs_list_for_thread = aprs_list_box.clone();
-    let aprs_empty_for_thread = aprs_empty_label.clone();
-    let radio_for_thread = Arc::clone(radio);
-    let settings_for_thread = settings as *const SettingsManager as *mut SettingsManager;
+    let _aprs_list_for_thread = aprs_list_box.clone();
+    let _aprs_empty_for_thread = aprs_empty_label.clone();
+    let _radio_for_thread = Arc::clone(radio);
+    let _settings_for_thread = settings as *const SettingsManager as *mut SettingsManager;
     
     // Build threads from stored messages and display as buttons
     fn build_and_display_threads(
@@ -1010,21 +1140,45 @@ fn create_ui(
         content.set_valign(gtk::Align::Start);
         content.set_wrap(true);
         content.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        content.set_justify(gtk::Justification::Fill);
+        
+        // Helper to format position with pin, distance, and bearing
+        let format_position = |msg: &aprs::APRSMessage, my_lat: f64, my_lon: f64| -> String {
+            if msg.position_lat == 0.0 && msg.position_lon == 0.0 {
+                return String::new(); // No position
+            }
+            let dist_bearing = calculate_distance_bearing(my_lat, my_lon, msg.position_lat, msg.position_lon);
+            let (dist_text, bearing_text) = if let Some((dist_km, bearing)) = dist_bearing {
+                let dist_str = if dist_km < 1.0 { format!("{:.0}m", dist_km * 1000.0) }
+                    else if dist_km < 10.0 { format!("{:.1}km", dist_km) }
+                    else { format!("{:.0}km", dist_km) };
+                (dist_str, bearing_to_compass(bearing))
+            } else { ("??".to_string(), "--°".to_string()) };
+            let comment = if msg.comment.is_empty() { String::new() } else { format!(" - {}", escape_markup(&msg.comment)) };
+            format!("<span color='#33D17A'>📍 {} {}</span>{}", dist_text, bearing_text, comment)
+        };
         
         match msg.msg_type {
-            aprs::APRSType::Position => {
+            aprs::APRSType::Position | aprs::APRSType::PositionWithTimestamp => {
                 if msg.position_lat != 0.0 || msg.position_lon != 0.0 {
-                    let dist_bearing = calculate_distance_bearing(my_lat, my_lon, msg.position_lat, msg.position_lon);
-                    let (dist_text, bearing_text) = if let Some((dist_km, bearing)) = dist_bearing {
-                        let dist_str = if dist_km < 1.0 { format!("{:.0}m", dist_km * 1000.0) }
-                            else if dist_km < 10.0 { format!("{:.1}km", dist_km) }
-                            else { format!("{:.0}km", dist_km) };
-                        (dist_str, bearing_to_compass(bearing))
-                    } else { ("??".to_string(), "--°".to_string()) };
-                    
-                    let comment = if msg.comment.is_empty() { String::new() } else { format!(" - {}", escape_markup(&msg.comment)) };
-                    content.set_markup(&format!("<span color='#33D17A'>📍 {} {}</span>{}", dist_text, bearing_text, comment));
+                    content.set_markup(&format_position(msg, my_lat, my_lon));
+                } else {
+                    content.set_text(&msg.comment);
+                    content.add_css_class("aprs-comment");
+                }
+            }
+            aprs::APRSType::ThirdParty | aprs::APRSType::Object | aprs::APRSType::Item | aprs::APRSType::Weather => {
+                // These types may contain positions - show them with pin if valid
+                if msg.position_lat != 0.0 || msg.position_lon != 0.0 {
+                    content.set_markup(&format_position(msg, my_lat, my_lon));
+                } else {
+                    content.set_text(&msg.comment);
+                    content.add_css_class("aprs-comment");
+                }
+            }
+            aprs::APRSType::Status => {
+                // Status may be plain text or contain position info (DX spots, etc.)
+                if msg.position_lat != 0.0 || msg.position_lon != 0.0 {
+                    content.set_markup(&format_position(msg, my_lat, my_lon));
                 } else {
                     content.set_text(&msg.comment);
                     content.add_css_class("aprs-comment");
@@ -1455,7 +1609,7 @@ fn create_ui(
     // TX Power using ToggleGroup
     let radio_tg = Arc::clone(radio);
     let settings_tg = settings as *const SettingsManager as *mut SettingsManager;
-    let initial_high = unsafe { (*settings).tx_power_high() };
+    let initial_high = (*settings).tx_power_high();
     
     let toggle_group = adw::ToggleGroup::builder()
         .homogeneous(true)
@@ -1496,6 +1650,58 @@ fn create_ui(
     tx_power_row.set_activatable_widget(Some(&toggle_group));
     modem_group.add(&tx_power_row);
     
+    // Voice Codec mode using ToggleGroup (FM vs RADAEv2)
+    let settings_codec = settings as *const SettingsManager as *mut SettingsManager;
+    let initial_radae = (*settings).codec_mode() == settings::CodecMode::Radaev2;
+    
+    let codec_toggle_group = adw::ToggleGroup::builder()
+        .homogeneous(true)
+        .build();
+    
+    let toggle_fm = adw::Toggle::builder()
+        .name("fm")
+        .child(&gtk::Label::new(Some("FM")))
+        .build();
+    
+    let toggle_radae = adw::Toggle::builder()
+        .name("rade")
+        .child(&gtk::Label::new(Some("RADAEv2")))
+        .build();
+    
+    // Add toggles BEFORE setting active_name
+    codec_toggle_group.add(toggle_fm);
+    codec_toggle_group.add(toggle_radae);
+    
+    // Set initial selection
+    codec_toggle_group.set_active_name(Some(if initial_radae { "rade" } else { "fm" }));
+    
+    // Connect handler to update settings and atomic
+    let codec_notify = Arc::clone(&radio_tg);
+    let settings_codec_notify = settings_codec;
+    codec_toggle_group.connect_active_name_notify(move |group| {
+        let is_radae = group.active_name().as_deref() == Some("rade");
+        let mode = if is_radae { settings::CodecMode::Radaev2 } else { settings::CodecMode::Adpcm };
+        unsafe { (*settings_codec_notify).set_codec_mode(mode); }
+        // Update global atomic for runtime routing
+        CURRENT_CODEC_MODE.store(if is_radae { 1 } else { 0 }, Ordering::SeqCst);
+        eprintln!("[pocket-modem] Codec mode changed to: {}", if is_radae { "RADAEv2" } else { "FM (ADPCM)" });
+        // Disable PCM8 mode on radio when switching to FM
+        if !is_radae {
+            let r = codec_notify.clone();
+            std::thread::spawn(move || {
+                if let Ok(r) = r.lock() { let _ = r.set_pcm8_mode(false); }
+            });
+        }
+    });
+    
+    let codec_row = adw::ActionRow::builder()
+        .title("Voice Codec")
+        .subtitle("FM: ADPCM / RADAEv2: Neural codec")
+        .build();
+    codec_row.add_suffix(&codec_toggle_group);
+    codec_row.set_activatable_widget(Some(&codec_toggle_group));
+    modem_group.add(&codec_row);
+    
     settings_box.append(&modem_group);
     
     // === AUDIO Section ===
@@ -1508,7 +1714,7 @@ fn create_ui(
     let pre_emph_row = adw::SwitchRow::builder()
         .title("Pre-Emphasis")
         .subtitle("Boost high frequencies before TX")
-        .active(unsafe { (*settings).pre_emphasis() })
+        .active((*settings).pre_emphasis())
         .build();
     pre_emph_row.connect_notify_local(Some("active"), move |row, _| {
         unsafe { (*settings_audio).set_pre_emphasis(row.is_active()); }
@@ -1519,7 +1725,7 @@ fn create_ui(
     let de_emph_row = adw::SwitchRow::builder()
         .title("De-Emphasis")
         .subtitle("Reduce high frequencies on RX")
-        .active(unsafe { (*settings).de_emphasis() })
+        .active((*settings).de_emphasis())
         .build();
     de_emph_row.connect_notify_local(Some("active"), move |row, _| {
         unsafe { (*settings_deemph).set_de_emphasis(row.is_active()); }
@@ -1530,7 +1736,7 @@ fn create_ui(
     let hpf_row = adw::SwitchRow::builder()
         .title("High-Pass Filter")
         .subtitle("Remove low frequency rumble (300Hz cutoff)")
-        .active(unsafe { (*settings).high_pass_filter() })
+        .active((*settings).high_pass_filter())
         .build();
     hpf_row.connect_notify_local(Some("active"), move |row, _| {
         unsafe { (*settings_hpf).set_high_pass_filter(row.is_active()); }
@@ -1541,7 +1747,7 @@ fn create_ui(
     let lpf_row = adw::SwitchRow::builder()
         .title("Low-Pass Filter")
         .subtitle("Remove high frequency hiss (3.4kHz cutoff)")
-        .active(unsafe { (*settings).low_pass_filter() })
+        .active((*settings).low_pass_filter())
         .build();
     lpf_row.connect_notify_local(Some("active"), move |row, _| {
         unsafe { (*settings_lpf).set_low_pass_filter(row.is_active()); }
@@ -1551,7 +1757,7 @@ fn create_ui(
     let settings_mic = settings as *const SettingsManager as *mut SettingsManager;
     let mic_gains = vec!["None".to_string(), "Low".to_string(), "Medium".to_string(), "High".to_string()];
     let mic_model = gtk::StringList::new(&mic_gains.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    let current_mic = unsafe { (*settings).mic_gain() };
+    let current_mic = (*settings).mic_gain();
     let mic_idx = mic_gains.iter().position(|g| {
         g.to_lowercase() == current_mic.to_lowercase()
     }).unwrap_or(0) as u32;
@@ -1578,14 +1784,14 @@ fn create_ui(
         .build();
     
     // Callsign input
-    let settings_aprs_call = settings as *const SettingsManager as *mut SettingsManager;
+    let _settings_aprs_call = settings as *const SettingsManager as *mut SettingsManager;
     let aprs_call_entry = gtk::Entry::new();
     aprs_call_entry.set_placeholder_text(Some("KD4LCD (UPPERCASE)"));
     aprs_call_entry.set_hexpand(true);
     aprs_call_entry.set_max_width_chars(8);
     aprs_call_entry.set_css_classes(&["monospace"]);
     // Note: uppercase hint shown in placeholder; conversion happens on settings save
-    let current_call = unsafe { (*settings).aprs_callsign().to_string() };
+    let current_call = (*settings).aprs_callsign().to_string();
     if !current_call.is_empty() {
         aprs_call_entry.set_text(&current_call);
     }
@@ -1597,9 +1803,9 @@ fn create_ui(
     aprs_call_row.add_suffix(&aprs_call_entry);
     aprs_call_row.set_activatable_widget(Some(&aprs_call_entry));
     
-    let settings_ssid = settings as *const SettingsManager as *mut SettingsManager;
+    let _settings_ssid = settings as *const SettingsManager as *mut SettingsManager;
     let ssid_adj = gtk::Adjustment::new(0.0, 0.0, 15.0, 1.0, 0.0, 0.0);
-    let current_ssid = unsafe { (*settings).aprs_ssid() };
+    let current_ssid = (*settings).aprs_ssid();
     ssid_adj.set_value(current_ssid as f64);
     let aprs_ssid_spin = adw::SpinRow::builder()
         .title("SSID")
@@ -1622,8 +1828,8 @@ fn create_ui(
     let symbol_model = gtk::StringList::new(&symbol_labels.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     
     // Find current symbol index
-    let current_symbol_table = unsafe { (*settings).aprs_symbol_table() };
-    let current_symbol_code = unsafe { (*settings).aprs_symbol_code() };
+    let current_symbol_table = (*settings).aprs_symbol_table();
+    let current_symbol_code = (*settings).aprs_symbol_code();
     let current_symbol_idx = aprs_symbols.iter().position(|(_, t, c)| *t == current_symbol_table && *c == current_symbol_code).unwrap_or(0) as u32;
     
     let aprs_symbol_row = adw::ComboRow::builder()
@@ -1636,11 +1842,11 @@ fn create_ui(
     aprs_symbol_row.set_selected(current_symbol_idx);
     
     // Comment input
-    let settings_aprs_comment = settings as *const SettingsManager as *mut SettingsManager;
+    let _settings_aprs_comment = settings as *const SettingsManager as *mut SettingsManager;
     let aprs_comment_entry = gtk::Entry::new();
     aprs_comment_entry.set_placeholder_text(Some("PocketModem on KV4P"));
     aprs_comment_entry.set_hexpand(true);
-    let current_comment = unsafe { (*settings).aprs_comment().to_string() };
+    let current_comment = (*settings).aprs_comment().to_string();
     if !current_comment.is_empty() {
         aprs_comment_entry.set_text(&current_comment);
     }
@@ -1653,12 +1859,12 @@ fn create_ui(
     aprs_comment_row.set_activatable_widget(Some(&aprs_comment_entry));
     
     // Beacon destination input
-    let settings_aprs_dest = settings as *const SettingsManager as *mut SettingsManager;
+    let _settings_aprs_dest = settings as *const SettingsManager as *mut SettingsManager;
     let aprs_dest_entry = gtk::Entry::new();
     aprs_dest_entry.set_placeholder_text(Some("APRS"));
     aprs_dest_entry.set_hexpand(true);
     aprs_dest_entry.set_max_length(9);
-    let current_dest = unsafe { (*settings).aprs_beacon_dest().to_string() };
+    let current_dest = (*settings).aprs_beacon_dest().to_string();
     aprs_dest_entry.set_text(&current_dest);
     
     let aprs_dest_row = adw::ActionRow::builder()
@@ -1669,8 +1875,8 @@ fn create_ui(
     aprs_dest_row.set_activatable_widget(Some(&aprs_dest_entry));
     
     // TX enable switch
-    let settings_tx = settings as *const SettingsManager as *mut SettingsManager;
-    let current_tx_enabled = unsafe { (*settings).aprs_tx_enabled() };
+    let _settings_tx = settings as *const SettingsManager as *mut SettingsManager;
+    let current_tx_enabled = (*settings).aprs_tx_enabled();
     let aprs_tx_row = adw::SwitchRow::builder()
         .title("Enable APRS TX")
         .subtitle("Allow beacon transmission")
@@ -1775,7 +1981,7 @@ fn create_ui(
         }
     });
     
-    let aprs_comment_for_handler = aprs_comment_entry.clone();
+    let _aprs_comment_for_handler = aprs_comment_entry.clone();
     let settings_aprs_4 = settings as *const SettingsManager as *mut SettingsManager;
     aprs_comment_entry.connect_changed(move |entry| {
         let text = entry.text().to_string();
@@ -1996,9 +2202,17 @@ fn create_ui(
     
     let audio_codec_row = adw::ActionRow::new();
     audio_codec_row.set_title("Codec");
-    let audio_codec_value = gtk::Label::new(Some("ADPCM"));
+    let codec_mode_text = if (*settings).codec_mode() == settings::CodecMode::Radaev2 { "RADAEv2" } else { "FM (ADPCM)" };
+    let audio_codec_value = gtk::Label::new(Some(codec_mode_text));
     audio_codec_value.add_css_class("status-text");
     audio_codec_row.add_suffix(&audio_codec_value);
+    
+    let audio_transport_row = adw::ActionRow::new();
+    audio_transport_row.set_title("Transport");
+    let transport_text = if (*settings).codec_mode() == settings::CodecMode::Radaev2 { "PCM8 (8kHz)" } else { "ADPCM (8kHz)" };
+    let audio_transport_value = gtk::Label::new(Some(transport_text));
+    audio_transport_value.add_css_class("status-text");
+    audio_transport_row.add_suffix(&audio_transport_value);
     
     let audio_buf_row = adw::ActionRow::new();
     audio_buf_row.set_title("Buffer Size");
@@ -2014,6 +2228,7 @@ fn create_ui(
     
     let audio_detail_group = adw::PreferencesGroup::new();
     audio_detail_group.add(&audio_codec_row);
+    audio_detail_group.add(&audio_transport_row);
     audio_detail_group.add(&audio_buf_row);
     audio_detail_group.add(&audio_latency_row);
     
@@ -2103,8 +2318,8 @@ fn create_ui(
                         let sender = msg.from_callsign.clone();
                         let ack_id = msg_id.clone();
                         let ack_call = my_call.clone();
-                        let from_for_storage = msg.from_callsign.clone();
-                        let body_for_storage = msg.msg_body.clone();
+                        let _from_for_storage = msg.from_callsign.clone();
+                        let _body_for_storage = msg.msg_body.clone();
                         let settings_ack = Arc::clone(&acks_received);
                         
                         let radio_ack = Arc::clone(&radio_aprs);
@@ -2155,11 +2370,11 @@ fn create_ui(
     let settings_beacon = settings as *const SettingsManager as *mut SettingsManager;
     let gps_for_beacon = Arc::clone(gps);
     let radio_for_beacon = Arc::clone(radio);
-    let beacon_btn_clone = beacon_btn.clone();
+    let _beacon_btn_clone = beacon_btn.clone();
     let beacon_status_clone = beacon_status.clone();
     let toast_overlay_for_beacon = toast_overlay.clone();
     let beacon_state_clone = Arc::clone(&beacon_state);
-    let aprs_messages_for_beacon = Arc::clone(&aprs_messages);
+    let _aprs_messages_for_beacon = Arc::clone(&aprs_messages);
     let aprs_list_for_beacon = aprs_list_box.clone();
     let aprs_empty_for_beacon = aprs_empty_label.clone();
     let gps_for_aprs = Arc::clone(gps);
@@ -2357,9 +2572,9 @@ fn create_ui(
     let aprs_storage_row_clone = aprs_storage_row.clone();
     
     let map_manager_clone = Arc::clone(&map_manager);
-    let window_clone = window.clone();
-    let map_page_clone = map_page.clone();
-    let map_clamp_clone = map_clamp.clone();
+    let _window_clone = window.clone();
+    let _map_page_clone = map_page.clone();
+    let _map_clamp_clone = map_clamp.clone();
     let dark_mode_state_clone = Arc::clone(&dark_mode_state);
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -2705,7 +2920,7 @@ fn create_ui(
                 let mut msgs = received_messages.lock().unwrap();
                 std::mem::take(&mut *msgs)
             };
-            for (from, body, thread_id, msg_id) in msgs_to_process {
+            for (from, body, _thread_id, msg_id) in msgs_to_process {
                 let my_call = unsafe { (*settings_update).aprs_full_callsign() };
                 let uuid = unsafe { (*settings_update).generate_message_uuid() };
                 let dm = aprs::DirectMessage::new_received(
@@ -3109,7 +3324,7 @@ fn create_ui(
         // Enter key handler
         let entry_enter = message_entry.clone();
         let scroll_enter = messages_scroll.clone();
-        let scroll_helper_enter = messages_scroll.clone();
+        let _scroll_helper_enter = messages_scroll.clone();
         let messages_enter = messages_box.clone();
         let settings_enter = settings;
         let recipient_enter = recipient.to_string();
@@ -3517,7 +3732,7 @@ fn create_ui(
     // CSS Styling
     // =========================================================================
     let css_provider = gtk::CssProvider::new();
-    css_provider.load_from_data(r#"
+    css_provider.load_from_data(r#"/* app styles v2 */
         .freq-display { font-size: 60px; font-family: monospace; font-weight: bold; color: #FFB000; background: #1E1E1E; border: 3px solid #444; border-radius: 12px; text-shadow: 0 0 8px rgba(255, 176, 0, 0.5); box-shadow: inset 0 0 16px rgba(0, 0, 0, 0.8); caret-color: #FFB000; }
         .freq-display:focus { border-color: #FFB000; }
         .tx-frequency { color: #ff4444; border-color: #ff4444; }
@@ -3587,12 +3802,12 @@ fn create_ui(
         .beacon-label { font-size: 14px; font-weight: bold; color: #888; }
         .beacon-button:active .beacon-label { color: #FFB000; }
         .beacon-status { font-size: 12px; color: #666; min-height: 20px; }
-        .chat-bubble { border-radius: 16px; max-width: 260px; padding: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.8); }
+        .chat-bubble { border-radius: 16px; padding: 6px; }
         .chat-bubble-sent { background: #4a4228; border: 1px solid #FFB000; border-bottom-right-radius: 4px; }
         .chat-bubble-received { background: #454545; border: 1px solid #888; border-bottom-left-radius: 4px; }
-        .chat-timestamp { font-size: 9px !important; color: #555555 !important; font-weight: lighter; }
+        .chat-timestamp { font-size: 9px; color: #555555; font-weight: lighter; }
         .chat-messages-box { background: transparent; }
-        .chat-scroll-frame { background: #1a1a1a; border-radius: 8px; box-shadow: inset 0 0 20px rgba(0,0,0,0.5); }
+        .chat-scroll-frame { background: #1a1a1a; border-radius: 8px; box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.5); }
     "#);
     
     gtk::style_context_add_provider_for_display(
